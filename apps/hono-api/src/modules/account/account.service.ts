@@ -17,6 +17,75 @@ import {
 	deleteOwnedPublishedWorkRow,
 } from "./account.repo";
 import { grantTeamCreditsInTransaction } from "../team/team-credit-batch.service";
+import {
+	createPasswordRecord,
+	hasPasswordConfigured,
+	verifyPasswordRecord,
+} from "../auth/password";
+
+const MIN_PASSWORD_LENGTH = 8;
+
+function assertPasswordStrength(password: string): void {
+	if (typeof password !== "string" || password.length < MIN_PASSWORD_LENGTH) {
+		throw new AppError(`密码至少 ${MIN_PASSWORD_LENGTH} 位`, { status: 400, code: "password_too_short" });
+	}
+}
+
+export async function setAccountPassword(userId: string, password: string): Promise<void> {
+	assertPasswordStrength(password);
+	const user = await getPrismaClient().users.findUnique({
+		where: { id: userId },
+		select: { id: true, password_hash: true, password_salt: true },
+	});
+	if (!user) throw new AppError("用户不存在", { status: 404, code: "user_not_found" });
+	if (hasPasswordConfigured(user.password_hash)) {
+		throw new AppError("密码已设置，请使用修改密码", { status: 409, code: "password_already_set" });
+	}
+	const record = await createPasswordRecord(password);
+	const nowIso = new Date().toISOString();
+	await getPrismaClient().users.update({
+		where: { id: userId },
+		data: {
+			password_hash: record.hash,
+			password_salt: record.salt,
+			password_updated_at: nowIso,
+			updated_at: nowIso,
+		},
+	});
+}
+
+export async function changeAccountPassword(
+	userId: string,
+	currentPassword: string,
+	password: string,
+): Promise<void> {
+	assertPasswordStrength(password);
+	const user = await getPrismaClient().users.findUnique({
+		where: { id: userId },
+		select: { id: true, password_hash: true, password_salt: true },
+	});
+	if (!user) throw new AppError("用户不存在", { status: 404, code: "user_not_found" });
+	if (!hasPasswordConfigured(user.password_hash) || !user.password_salt) {
+		throw new AppError("尚未设置密码，请先设置密码", { status: 409, code: "password_not_set" });
+	}
+	const ok = await verifyPasswordRecord({
+		password: currentPassword,
+		hash: user.password_hash,
+		salt: user.password_salt,
+	});
+	if (!ok) throw new AppError("当前密码不正确", { status: 401, code: "password_mismatch" });
+	const record = await createPasswordRecord(password);
+	const nowIso = new Date().toISOString();
+	await getPrismaClient().users.update({
+		where: { id: userId },
+		data: {
+			password_hash: record.hash,
+			password_salt: record.salt,
+			password_updated_at: nowIso,
+			updated_at: nowIso,
+		},
+	});
+}
 
 function requireMember(auth: unknown): void {
 	if (auth && typeof auth === "object" && "guest" in auth && auth.guest === true) {
@@ -105,6 +174,7 @@ export async function getProfile(userId: string) {
 		phone: row.phone,
 		guest: row.guest !== 0,
 		createdAt: row.created_at,
+		hasPassword: hasPasswordConfigured(row.password_hash),
 	};
 }
 

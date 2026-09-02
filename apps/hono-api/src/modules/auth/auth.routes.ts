@@ -9,6 +9,8 @@ import {
 import {
 	exchangeGithubCode,
 	loginWithCredentials,
+	requestEmailLoginCode,
+	verifyEmailLoginCode,
 } from "./auth.service";
 import { getConfig } from "../../config";
 import { authMiddleware, resolveAuth } from "../../middleware/auth";
@@ -19,6 +21,7 @@ import {
 	sanitizeUserGenerationPrefs,
 } from "./generation-prefs";
 import { agentsCliAuthRouter } from "./agents-cli-auth.routes";
+import { isWechatOfficialEnabled } from "./wechat-official.service";
 import { attachAuthCookies, clearAuthCookies } from "./auth.cookies";
 import { refreshBrowserAuthSession } from "./auth-token.service";
 import { AppError } from "../../middleware/error";
@@ -184,26 +187,36 @@ authRouter.post("/guest", async (c) => {
 	);
 });
 
+const EMAIL_FORMAT = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// 登录面板探测微信扫码是否可用（未配置 WECHAT_OFFICIAL_* 时 available=false，前端隐藏 Tab）
+authRouter.get("/wechat-official/config", async (c) => {
+	return c.json({ available: isWechatOfficialEnabled(c.env) });
+});
+
 authRouter.post("/email/request", async (c) => {
-	return c.json(
-		{
-			success: false,
-			error: "邮箱登录已下线，请使用管理员账号登录",
-			code: "email_login_disabled",
-		},
-		410,
-	);
+	const body = (await c.req.json().catch(() => ({}))) ?? {};
+	const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+	if (!EMAIL_FORMAT.test(email)) {
+		return c.json({ success: false, error: "邮箱格式不正确" }, 400);
+	}
+	const result = await requestEmailLoginCode(c, email);
+	if (result instanceof Response) return result;
+	return c.json({ success: true, sent: true, expiresInSeconds: result.expiresInSeconds });
 });
 
 authRouter.post("/email/verify", async (c) => {
-	return c.json(
-		{
-			success: false,
-			error: "邮箱登录已下线，请使用管理员账号登录",
-			code: "email_login_disabled",
-		},
-		410,
-	);
+	const body = (await c.req.json().catch(() => ({}))) ?? {};
+	const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+	const code = typeof body.code === "string" ? body.code.trim() : "";
+	if (!EMAIL_FORMAT.test(email) || !/^\d{6}$/.test(code)) {
+		return c.json({ success: false, error: "邮箱或验证码格式不正确" }, 400);
+	}
+	const result = await verifyEmailLoginCode(c, email, code);
+	if (result instanceof Response) return result;
+	const validated = AuthResponseSchema.parse(result);
+	attachValidatedAuthCookies(c, validated);
+	return c.json(browserAuthResponse(validated));
 });
 
 authRouter.post("/login", async (c) => {

@@ -1,6 +1,8 @@
 import { Hono } from "hono";
+import { z } from "zod";
 import type { AppContext, AppEnv } from "../../types";
 import { authMiddleware } from "../../middleware/auth";
+import { AppError } from "../../middleware/error";
 import { clearAuthCookies } from "../auth/auth.cookies";
 import { isAdminRequest } from "../team/team.service";
 import {
@@ -33,6 +35,8 @@ import {
 	revokeUserSession,
 	updateProfile,
 	updateWorkPublication,
+	setAccountPassword,
+	changeAccountPassword,
 	deleteWork,
 } from "./account.service";
 
@@ -41,6 +45,39 @@ export const accountAdminRouter = new Hono<AppEnv>();
 
 accountRouter.use("*", authMiddleware);
 accountAdminRouter.use("*", authMiddleware);
+
+const PasswordSetSchema = z.object({ password: z.string() });
+const PasswordChangeSchema = z.object({ currentPassword: z.string(), password: z.string() });
+
+accountRouter.post("/password", async (c) => {
+	const userId = requireUserId(c);
+	const parsed = PasswordSetSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) return c.json({ success: false, error: "请求参数不合法" }, 400);
+	try {
+		await setAccountPassword(userId, parsed.data.password);
+	} catch (error) {
+		if (error instanceof AppError) {
+			return c.json({ success: false, error: error.message, code: error.code }, error.status);
+		}
+		throw error;
+	}
+	return c.json({ success: true });
+});
+
+accountRouter.put("/password", async (c) => {
+	const userId = requireUserId(c);
+	const parsed = PasswordChangeSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) return c.json({ success: false, error: "请求参数不合法" }, 400);
+	try {
+		await changeAccountPassword(userId, parsed.data.currentPassword, parsed.data.password);
+	} catch (error) {
+		if (error instanceof AppError) {
+			return c.json({ success: false, error: error.message, code: error.code }, error.status);
+		}
+		throw error;
+	}
+	return c.json({ success: true });
+});
 
 function requireUserId(c: AppContext): string {
 	const userId = c.get("userId");

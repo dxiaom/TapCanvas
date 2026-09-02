@@ -5,6 +5,12 @@ import { issueBrowserAuthTokens } from "./auth-token.service";
 import { resolveLocalDevRole } from "./local-admin";
 import { fetchWithHttpDebugLog } from "../../httpDebugLog";
 import { getPrismaClient } from "../../platform/node/prisma";
+import { getSharedRedis } from "../../platform/redis-shared";
+import {
+	checkOtpSendLimit,
+	recordOtpVerifyResult,
+	OtpRateLimitError,
+} from "./otp-rate-limit";
 import type { UserPayload } from "./auth.schemas";
 import { ensurePersonalBillingTeamOnLogin } from "../team/team.service";
 import {
@@ -485,6 +491,25 @@ export async function requestEmailLoginCode(c: AppContext, email: string) {
 	const salt = crypto.randomUUID();
 	const codeHash = await sha256Hex(`${salt}:${code}`);
 
+	const emailHash = await sha256Hex(email);
+	const clientIp =
+		c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? null;
+	const redis = getSharedRedis();
+	if (!redis) {
+		return c.json(
+			{ success: false, error: "限流服务暂不可用，请稍后再试", code: "rate_limit_unavailable" },
+			503,
+		);
+	}
+	try {
+		await checkOtpSendLimit({ redis, emailHash, clientIp });
+	} catch (err) {
+		if (err instanceof OtpRateLimitError) {
+			return c.json({ success: false, error: err.message }, 429);
+		}
+		throw err;
+	}
+
 	try {
 		await getPrismaClient().email_login_codes.create({
 			data: {
@@ -529,6 +554,15 @@ export async function verifyEmailLoginCode(
 ) {
 	const nowIso = new Date().toISOString();
 
+	const emailHash = await sha256Hex(email);
+	const verifyRedis = getSharedRedis();
+	if (!verifyRedis) {
+		return c.json(
+			{ success: false, error: "限流服务暂不可用，请稍后再试", code: "rate_limit_unavailable" },
+			503,
+		);
+	}
+
 	const row = await getPrismaClient().email_login_codes.findFirst({
 		where: {
 			email,
@@ -545,6 +579,14 @@ export async function verifyEmailLoginCode(
 	});
 
 	if (!row) {
+		try {
+			await recordOtpVerifyResult({ redis: verifyRedis, emailHash, ok: false });
+		} catch (err) {
+			if (err instanceof OtpRateLimitError) {
+				return c.json({ success: false, error: err.message }, 429);
+			}
+			throw err;
+		}
 		return c.json({ success: false, error: "验证码不正确或已过期" }, 401);
 	}
 
@@ -553,6 +595,14 @@ export async function verifyEmailLoginCode(
 	const actual = await sha256Hex(`${salt}:${code}`);
 
 	if (!expected || expected !== actual) {
+		try {
+			await recordOtpVerifyResult({ redis: verifyRedis, emailHash, ok: false });
+		} catch (err) {
+			if (err instanceof OtpRateLimitError) {
+				return c.json({ success: false, error: err.message }, 429);
+			}
+			throw err;
+		}
 		return c.json({ success: false, error: "验证码不正确或已过期" }, 401);
 	}
 
@@ -563,6 +613,12 @@ export async function verifyEmailLoginCode(
 		});
 	} catch {
 		// Best-effort; even if it fails, token is already issued below.
+	}
+
+	try {
+		await recordOtpVerifyResult({ redis: verifyRedis, emailHash, ok: true });
+	} catch {
+		// 成功路径清理失败计数失败不影响登录
 	}
 
 	const userId = `email_${await sha256Hex(email)}`;

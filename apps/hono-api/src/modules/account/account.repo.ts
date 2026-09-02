@@ -30,6 +30,7 @@ export async function getAccountProfileRow(userId: string) {
 			phone: true,
 			guest: true,
 			created_at: true,
+			password_hash: true,
 			},
 		}),
 		getPrismaClient().user_profiles.findUnique({ where: { user_id: userId } }),
