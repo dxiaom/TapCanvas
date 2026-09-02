@@ -71,6 +71,7 @@ const ADMIN_PATCH_KEYS = [
 	"body",
 	"cta_text",
 	"invitee_welcome_credits",
+	"registration_welcome_credits",
 	"anti_self_check",
 	"anti_self_window_days",
 ] as const satisfies ReadonlyArray<keyof ReferralConfigRow>;

@@ -11,6 +11,7 @@ export type ReferralConfigRow = {
 	anti_self_check: number;
 	anti_self_window_days: number;
 	invitee_welcome_credits: number;
+	registration_welcome_credits: number;
 	updated_at: string;
 };
 

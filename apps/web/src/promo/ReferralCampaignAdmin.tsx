@@ -132,6 +132,11 @@ export default function ReferralCampaignAdmin(): React.ReactElement {
           value={config.invitee_welcome_credits}
           onChange={(v) => update({ invitee_welcome_credits: Number(v) || 0 })}
         />
+        <NumberInput
+          label="普通注册奖励（积分，0=关闭）"
+          value={config.registration_welcome_credits}
+          onChange={(v) => update({ registration_welcome_credits: Number(v) || 0 })}
+        />
         <Switch
           label="启用防自邀检测"
           checked={!!config.anti_self_check}

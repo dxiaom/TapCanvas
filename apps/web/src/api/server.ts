@@ -11074,6 +11074,7 @@ export type AdminReferralConfigDto = {
   cta_text: string
   image_url: string | null
   invitee_welcome_credits: number
+  registration_welcome_credits: number
   anti_self_check: number
   anti_self_window_days: number
   updated_at: string

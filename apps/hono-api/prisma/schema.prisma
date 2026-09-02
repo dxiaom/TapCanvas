@@ -1311,6 +1311,7 @@ model referral_config {
   anti_self_check                Int     @default(1)
   anti_self_window_days          Int     @default(30)
   invitee_welcome_credits        Int     @default(1000)
+  registration_welcome_credits   Int     @default(100)
   updated_at                     String
 }
 
