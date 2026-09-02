@@ -4905,7 +4905,7 @@ export async function createGuestSession(nickname?: string): Promise<AuthRespons
   return r.json()
 }
 
-export async function requestEmailLoginCode(email: string): Promise<{ sent: boolean; expiresInSeconds?: number }> {
+export async function requestEmailLoginCode(email: string): Promise<{ sent: boolean; expiresInSeconds?: number; devCode?: string }> {
   const r = await apiFetch(`${API_BASE}/auth/email/request`, {
     method: 'POST',
     credentials: 'include',
@@ -4925,6 +4925,7 @@ export async function requestEmailLoginCode(email: string): Promise<{ sent: bool
   return {
     sent: Boolean(body?.sent),
     expiresInSeconds: typeof body?.expiresInSeconds === 'number' ? body.expiresInSeconds : undefined,
+    devCode: typeof body?.devCode === 'string' ? body.devCode : undefined,
   }
 }
 
@@ -6604,7 +6605,6 @@ export type NewApiGatewayReadinessDto = z.infer<typeof NewApiGatewayReadinessSch
 export async function getNewApiGatewayReadiness(): Promise<NewApiGatewayReadinessDto> {
   const r = await apiFetch(`${API_BASE}/new-api-models/readiness`, withAuth({
     method: 'GET',
-    headers: { 'Cache-Control': 'no-cache' },
   }))
   if (!r.ok) {
     await throwApiError(r, `get new-api readiness failed: ${r.status}`)

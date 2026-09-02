@@ -544,6 +544,11 @@ export async function requestEmailLoginCode(c: AppContext, email: string) {
 		return c.json({ success: false, error: "验证码发送失败，请稍后再试" }, 502);
 	}
 
+	// 本地/调试模式且未配置邮件服务时，把验证码带回给调用方，否则本地流程无法拿到验证码。
+	if (canReturnDevCode && mail.skipped) {
+		return { sent: true, expiresInSeconds: 10 * 60, devCode: code };
+	}
+
 	return { sent: true, expiresInSeconds: 10 * 60 };
 }
 

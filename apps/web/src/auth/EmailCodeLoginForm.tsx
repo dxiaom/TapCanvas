@@ -35,7 +35,12 @@ export function EmailCodeLoginForm({ onLoginSuccess }: EmailCodeLoginFormProps):
     try {
       const result = await requestEmailLoginCode(normalizedEmail)
       setCountdown(60)
-      toast(result.expiresInSeconds ? `验证码已发送，${Math.round(result.expiresInSeconds / 60)} 分钟内有效` : '验证码已发送', 'success')
+      // 后端仅在 localhost/调试模式下返回 devCode（未配置邮件服务时）；生产环境永远不会有该字段
+      if (result.devCode) {
+        toast(`本地开发验证码：${result.devCode}`, 'success')
+      } else {
+        toast(result.expiresInSeconds ? `验证码已发送，${Math.round(result.expiresInSeconds / 60)} 分钟内有效` : '验证码已发送', 'success')
+      }
     } catch (error) {
       console.error('Send email code failed', error)
       toast(getErrorMessage(error, '验证码发送失败，请稍后再试'), 'error')

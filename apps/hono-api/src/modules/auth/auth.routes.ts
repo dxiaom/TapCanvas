@@ -202,7 +202,12 @@ authRouter.post("/email/request", async (c) => {
 	}
 	const result = await requestEmailLoginCode(c, email);
 	if (result instanceof Response) return result;
-	return c.json({ success: true, sent: true, expiresInSeconds: result.expiresInSeconds });
+	return c.json({
+		success: true,
+		sent: true,
+		expiresInSeconds: result.expiresInSeconds,
+		...(typeof result.devCode === "string" ? { devCode: result.devCode } : {}),
+	});
 });
 
 authRouter.post("/email/verify", async (c) => {
