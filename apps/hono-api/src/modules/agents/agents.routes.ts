@@ -643,6 +643,9 @@ adminAgentsRouter.get("/diagnostics", async (c) => {
 adminAgentsRouter.get("/diagnostics/workflows/:runId/nodes/:nodeId/events", async (c) => {
 	const userId = c.get("userId");
 	if (!userId) return c.json({ error: "Unauthorized" }, 401);
+	// 该端点无 owner 过滤（按 runId+nodeId 全局查询），必须限定 admin，否则登录用户可跨用户读取事件。
+	const auth = c.get("auth") as { role?: string | null } | null;
+	if (auth?.role !== "admin") return c.json({ error: "Forbidden", code: "admin_required" }, 403);
 	try {
 		const query = parseProductionWorkflowEventPageQuery({
 			beforeSeq: c.req.query("beforeSeq"),

@@ -111,24 +111,9 @@ async function computePromptEvolutionMetrics(
 	return { total, succeeded, failed, successRate, avgDurationMs };
 }
 
-function isLocalDevRequest(c: any): boolean {
-	try {
-		const url = new URL(c.req.url);
-		const host = url.hostname;
-		return (
-			host === "localhost" ||
-			host === "127.0.0.1" ||
-			host === "0.0.0.0" ||
-			host === "::1"
-		);
-	} catch {
-		return false;
-	}
-}
-
 function isAdmin(c: any): boolean {
-	if (isLocalDevRequest(c)) return true;
-	const auth = c.get("auth") as any;
+	// 管理端点只认显式 admin role；localhost 主机名不再是放行条件（隧道/反代下可被伪造，零隐式兜底）。
+	const auth = c.get("auth") as { role?: string | null } | null;
 	return auth?.role === "admin";
 }
 
