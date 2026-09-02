@@ -21,23 +21,15 @@ export type SavedAccount = {
 }
 
 const SESSION_MARKER = 'cookie-session'
-const SESSION_COOKIE_NAME = 'tap_session_present'
+// 会话存在性标记只做 UI 初始态提示（真实会话以 HttpOnly Cookie + 服务端 /auth/session 校验为准）。
+// 必须放 localStorage：API 与前端分属两个域名（huabu-api.wavee.cn / huabu.wavee.cn），
+// document.cookie 读不到 API 域名下的 Cookie，跨域 Cookie 标记会导致每次刷新都弹登录页。
+const SESSION_MARKER_KEY = 'tap_session_present'
 const USER_CACHE_KEY = 'tap_user'
 
-function readCookie(name: string): string | null {
-  if (typeof document === 'undefined') return null
-  const prefix = `${name}=`
-  const entry = document.cookie
-    .split(';')
-    .map((part) => part.trim())
-    .find((part) => part.startsWith(prefix))
-  return entry ? decodeURIComponent(entry.slice(prefix.length)) : null
-}
-
-function clearReadableSessionMarker(): void {
-  if (typeof document !== 'undefined') {
-    document.cookie = `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax`
-  }
+function readSessionMarker(): boolean {
+  if (typeof localStorage === 'undefined') return false
+  try { return localStorage.getItem(SESSION_MARKER_KEY) === '1' } catch { return false }
 }
 
 function readCachedUser(): User | null {
@@ -77,7 +69,7 @@ function savedAccountFor(user: User | null): SavedAccount[] {
   }]
 }
 
-const markerPresent = readCookie(SESSION_COOKIE_NAME) === '1'
+const markerPresent = readSessionMarker()
 const cachedUser = markerPresent ? readCachedUser() : null
 
 type AuthState = {
@@ -105,6 +97,7 @@ export const useAuth = create<AuthState>((set, get) => ({
       const { getBrowserSession } = await import('../api/server')
       const session = await getBrowserSession()
       cacheUser(session.user)
+      try { if (typeof localStorage !== 'undefined') localStorage.setItem(SESSION_MARKER_KEY, '1') } catch { /* storage optional */ }
       set({
         token: SESSION_MARKER,
         user: session.user,
@@ -136,11 +129,12 @@ export const useAuth = create<AuthState>((set, get) => ({
   },
   setAuth: (user) => {
     cacheUser(user)
+    try { if (typeof localStorage !== 'undefined') localStorage.setItem(SESSION_MARKER_KEY, '1') } catch { /* storage optional */ }
     set({ token: SESSION_MARKER, user, loading: false, savedAccounts: savedAccountFor(user) })
   },
   clear: () => {
     cacheUser(null)
-    clearReadableSessionMarker()
+    try { if (typeof localStorage !== 'undefined') localStorage.removeItem(SESSION_MARKER_KEY) } catch { /* storage optional */ }
     set({ token: null, user: null, savedAccounts: [] })
     taskHubRuntime.clear()
   },
