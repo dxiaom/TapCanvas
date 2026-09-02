@@ -126,6 +126,10 @@ export async function persistLoginUser(
 				"../referral/referral.service"
 			);
 			await bindReferrerOnRegister(c, input.id, refCode, clientIp, null);
+			const { grantRegistrationWelcomeCredits } = await import(
+				"../referral/referral.service"
+			);
+			await grantRegistrationWelcomeCredits(c, input.id, refCode);
 		}
 		return { created: true, role: input.role };
 	} catch (error) {

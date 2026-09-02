@@ -386,3 +386,45 @@ async function uploadCampaignImageToObjectStorage(
 
 	return publicBase ? `${publicBase}/${key}` : `/${key}`;
 }
+
+const INVITE_CODE_FORMAT = /^[A-HJ-NP-Z2-9]{6}$/;
+
+/**
+ * 无邀请码注册的欢迎积分（与邀请奖励互斥：请求携带合法格式邀请码时，
+ * 积分由 bindReferrerOnRegister 的 referral-welcome 链路负责，这里直接跳过）。
+ * 幂等依赖 topUpTeamCredits 的 taskId 去重（registration-welcome:${userId}）。
+ */
+export async function grantRegistrationWelcomeCredits(
+	c: AppContext,
+	userId: string,
+	refCode: string | null,
+): Promise<void> {
+	const trimmed = typeof refCode === "string" ? refCode.trim().toUpperCase() : "";
+	if (INVITE_CODE_FORMAT.test(trimmed)) return;
+	const taskId = `registration-welcome:${userId}`;
+	let credit: Awaited<ReturnType<typeof topUpTeamCredits>>;
+	try {
+		const config = await repo.getReferralConfig(c.env.DB);
+		const amount = Number(config?.registration_welcome_credits ?? 100) || 0;
+		if (amount <= 0) return;
+		const nowIso = new Date().toISOString();
+		credit = await topUpTeamCredits(c.env.DB, {
+			teamId: `personal_${userId}`,
+			amount,
+			actorUserId: userId,
+			note: JSON.stringify({ kind: "registration_welcome" }),
+			nowIso,
+			entryType: "registration_welcome",
+			taskId,
+			taskKind: "registration_welcome",
+			sourceType: "registration_welcome",
+			sourceKey: taskId,
+		});
+	} catch (err) {
+		console.error("[referral] grantRegistrationWelcomeCredits failed", err);
+		return;
+	}
+	if (!credit.ledgerEntryId) {
+		throw new Error(`registration welcome credit ledger missing: ${taskId}`);
+	}
+}

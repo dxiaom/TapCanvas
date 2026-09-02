@@ -84,7 +84,8 @@ export type TeamCreditLedgerEntryType =
 	| "migration"
 	| "membership_expire"
 	| "referral_bonus"
-	| "referral_welcome";
+	| "referral_welcome"
+	| "registration_welcome";
 
 export type TeamCreditLedgerRow = {
 	id: string;
