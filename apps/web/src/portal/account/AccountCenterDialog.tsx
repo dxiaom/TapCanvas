@@ -1,5 +1,5 @@
 import React from 'react'
-import { ActionIcon, Button, Loader, Modal, SegmentedControl, TextInput, Textarea, Tooltip } from '@mantine/core'
+import { ActionIcon, Button, Loader, Modal, PasswordInput, SegmentedControl, TextInput, Textarea, Tooltip } from '@mantine/core'
 import {
   IconBell,
   IconChevronRight,
@@ -40,6 +40,8 @@ import {
   readAccountNotification,
   readAllAccountNotifications,
   revokeAccountSession,
+  setAccountPassword,
+  changeAccountPassword,
   updateAccountProfile,
   updateAccountWorkPublication,
   type AccountCheckIn,
@@ -90,6 +92,49 @@ function StateView({ loading, error, empty, emptyMessage = '暂无数据', onRet
   )
   if (empty) return <div className="account-center-state"><span className="account-center-state__message">{emptyMessage}</span></div>
   return null
+}
+
+function AccountPasswordSection({ hasPassword, onChanged }: { hasPassword: boolean; onChanged: (profile: AccountProfile) => void }): JSX.Element {
+  const [currentPassword, setCurrentPassword] = React.useState('')
+  const [password, setPassword] = React.useState('')
+  const [confirm, setConfirm] = React.useState('')
+  const [saving, setSaving] = React.useState(false)
+
+  const submit = React.useCallback(async () => {
+    if (password !== confirm) { toast('两次输入的新密码不一致', 'error'); return }
+    setSaving(true)
+    try {
+      if (hasPassword) {
+        await changeAccountPassword(currentPassword, password)
+      } else {
+        await setAccountPassword(password)
+      }
+      toast('密码已保存', 'success')
+      setCurrentPassword('')
+      setPassword('')
+      setConfirm('')
+      const data = await getAccountProfile()
+      onChanged(data)
+    } catch (reason: unknown) {
+      toast(reason instanceof Error ? reason.message : '密码保存失败', 'error')
+    } finally {
+      setSaving(false)
+    }
+  }, [confirm, currentPassword, hasPassword, onChanged, password])
+
+  const canSubmit = password.length >= 8 && password === confirm && (!hasPassword || currentPassword.length > 0)
+
+  return (
+    <div className="account-profile-view__password">
+      <div className="account-profile-view__password-title">{hasPassword ? '修改密码' : '设置密码'}</div>
+      {hasPassword ? (
+        <PasswordInput className="account-profile-view__password-field" label="当前密码" value={currentPassword} onChange={(event) => setCurrentPassword(event.currentTarget.value)} autoComplete="current-password" />
+      ) : null}
+      <PasswordInput className="account-profile-view__password-field" label="新密码（至少 8 位）" value={password} onChange={(event) => setPassword(event.currentTarget.value)} autoComplete="new-password" />
+      <PasswordInput className="account-profile-view__password-field" label="确认新密码" value={confirm} onChange={(event) => setConfirm(event.currentTarget.value)} autoComplete="new-password" />
+      <Button className="account-profile-view__password-save" variant="light" loading={saving} disabled={!canSubmit} onClick={() => void submit()}>{hasPassword ? '修改密码' : '设置密码'}</Button>
+    </div>
+  )
 }
 
 function ProfileView({ onChanged }: { onChanged: (profile: AccountProfile) => void }): JSX.Element {
@@ -184,6 +229,7 @@ function ProfileView({ onChanged }: { onChanged: (profile: AccountProfile) => vo
         <div className="account-profile-view__readonly"><span className="account-profile-view__readonly-label">登录账号</span><span className="account-profile-view__readonly-value">{profile.phone || profile.email || profile.login}</span></div>
         <Button className="account-profile-view__save" loading={saving} disabled={!name.trim()} onClick={() => void save()}>保存</Button>
       </div>
+      <AccountPasswordSection hasPassword={profile.hasPassword} onChanged={onChanged} />
     </div>
   )
 }

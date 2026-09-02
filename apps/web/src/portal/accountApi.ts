@@ -10,6 +10,7 @@ export type AccountProfile = {
   phone: string | null
   guest: boolean
   createdAt: string
+  hasPassword: boolean
 }
 
 export type AccountProject = {
@@ -233,6 +234,10 @@ export async function validateSavedAccount(): Promise<SavedAccountValidation> {
   return { valid: true, overview: await response.json() as AccountOverview }
 }
 export const getAccountProfile = (): Promise<AccountProfile> => accountRequest('/account/profile')
+export const setAccountPassword = (password: string): Promise<{ success: boolean }> =>
+  accountRequest('/account/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) })
+export const changeAccountPassword = (currentPassword: string, password: string): Promise<{ success: boolean }> =>
+  accountRequest('/account/password', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ currentPassword, password }) })
 export const updateAccountProfile = (payload: { name?: string; bio?: string | null; avatarUrl?: string | null }): Promise<AccountProfile> =>
   accountRequest('/account/profile', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
 export const getAccountCheckIn = (): Promise<AccountCheckIn> => accountRequest('/account/check-in')

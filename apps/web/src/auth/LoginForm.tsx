@@ -1,15 +1,17 @@
 import React from 'react'
-import { Anchor, Button, Group, PasswordInput, Stack, Text, TextInput } from '@mantine/core'
-import { loginWithCredentials } from '../api/server'
-import { toast } from '../ui/toast'
-import { DEFAULT_PLATFORM_CREDENTIALS } from './defaultCredentials'
+import { Anchor, Group, Stack, Tabs, Text } from '@mantine/core'
+import { IconBrandGithub } from '@tabler/icons-react'
+import { API_BASE, apiFetch } from '../api/server'
+import { GITHUB_OAUTH_CALLBACK_PATH } from '../utils/appRoutes'
+import { EmailCodeLoginForm } from './EmailCodeLoginForm'
+import { WechatQrLoginForm } from './WechatQrLoginForm'
+import { PasswordLoginForm } from './PasswordLoginForm'
 import type { User } from './store'
 
 const GUIDE_URL = 'https://ai.feishu.cn/wiki/YZWhw4w2FiO02LkqYosc4NY5nSh'
 
-function getErrorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message ? error.message : fallback
-}
+type ViteEnvShape = ImportMeta & { env?: { VITE_GITHUB_CLIENT_ID?: string } }
+const GITHUB_CLIENT_ID = ((import.meta as ViteEnvShape).env?.VITE_GITHUB_CLIENT_ID || '').trim()
 
 export interface LoginFormProps {
   /** Called after the server establishes the HttpOnly session cookie. */
@@ -19,33 +21,37 @@ export interface LoginFormProps {
 }
 
 export function LoginForm({ onLoginSuccess, showTitle = true }: LoginFormProps): JSX.Element {
-  const [username, setUsername] = React.useState('')
-  const [password, setPassword] = React.useState('')
-  const [loading, setLoading] = React.useState(false)
+  const [wechatAvailable, setWechatAvailable] = React.useState<boolean | null>(null)
 
-  const handleLogin = React.useCallback(async () => {
-    const normalizedUsername = username.trim()
-    if (!normalizedUsername) { toast('请输入账号', 'error'); return }
-    if (!password) { toast('请输入密码', 'error'); return }
-    if (loading) return
-    setLoading(true)
+  // 探测微信扫码是否可用（后端未配置 WECHAT_OFFICIAL_* 时 available=false，隐藏 Tab）
+  React.useEffect(() => {
+    let alive = true
+    void apiFetch(`${API_BASE}/auth/wechat-official/config`)
+      .then(async (r) => {
+        const body = (await r.json().catch(() => null)) as { available?: boolean } | null
+        if (alive) setWechatAvailable(Boolean(r.ok && body?.available))
+      })
+      .catch(() => { if (alive) setWechatAvailable(false) })
+    return () => { alive = false }
+  }, [])
+
+  const handleGithubLogin = React.useCallback(() => {
+    if (!GITHUB_CLIENT_ID) return
     try {
-      const { user } = await loginWithCredentials(normalizedUsername, password)
-      onLoginSuccess(user)
+      const callbackUrl = new URL(GITHUB_OAUTH_CALLBACK_PATH, window.location.origin).toString()
+      const state = btoa(JSON.stringify({ redirect: window.location.pathname + window.location.search }))
+      const authorizeUrl = `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(GITHUB_CLIENT_ID)}&redirect_uri=${encodeURIComponent(callbackUrl)}&state=${encodeURIComponent(state)}&scope=read:user`
+      window.location.href = authorizeUrl
     } catch (error) {
-      console.error('Credential login failed', error)
-      toast(getErrorMessage(error, '账号密码登录失败，请稍后再试'), 'error')
-    } finally {
-      setLoading(false)
+      console.error('Build github authorize url failed', error)
     }
-  }, [loading, onLoginSuccess, password, username])
+  }, [])
 
   return (
     <Stack className="tc-login-form" gap="md">
       {showTitle ? (
         <Stack className="tc-login-form__heading" gap={2}>
           <Text className="tc-login-form__title" fw={600} size="md" ta="center">登录 TapCanvas</Text>
-          <Text className="tc-login-form__subtitle" c="dimmed" size="sm" ta="center">使用管理员账号登录</Text>
           <Group className="tc-login-form__guide" justify="center" gap={6}>
             <Text className="tc-login-form__guide-label" size="xs" c="dimmed">不知道怎么用？</Text>
             <Anchor className="tc-login-form__guide-link" size="xs" href={GUIDE_URL} target="_blank" rel="noreferrer">查看使用指引</Anchor>
@@ -53,55 +59,36 @@ export function LoginForm({ onLoginSuccess, showTitle = true }: LoginFormProps):
         </Stack>
       ) : null}
 
-      <div className="tc-login-form__default-credentials">
-        <Text className="tc-login-form__default-credentials-title" size="xs" fw={650}>
-          本地默认登录账号
-        </Text>
-        <div className="tc-login-form__default-credentials-list">
-          {DEFAULT_PLATFORM_CREDENTIALS.map((credential) => (
-            <div className="tc-login-form__default-credential" key={credential.platform}>
-              <span className="tc-login-form__default-credential-platform">{credential.platform}</span>
-              <code className="tc-login-form__default-credential-value">
-                {credential.username} / {credential.password}
-              </code>
-            </div>
-          ))}
-        </div>
-        <Text className="tc-login-form__default-credentials-note" size="xs" c="dimmed">
-          仅适用于未覆盖部署变量的首次启动；生产环境请立即修改默认密码。
-        </Text>
-      </div>
+      <Tabs className="tc-login-form__tabs" defaultValue="email" keepMounted={false}>
+        <Tabs.List className="tc-login-form__tab-list" justify="center">
+          <Tabs.Tab className="tc-login-form__tab" value="email">验证码登录</Tabs.Tab>
+          {wechatAvailable ? (
+            <Tabs.Tab className="tc-login-form__tab" value="wechat">微信扫码</Tabs.Tab>
+          ) : null}
+        </Tabs.List>
 
-      <Stack className="tc-login-form__credentials" gap="sm">
-        <TextInput
-          className="tc-login-form__username-input"
-          label="账号"
-          placeholder="请输入管理员账号"
-          value={username}
-          onChange={(event) => setUsername(event.currentTarget.value)}
-          autoComplete="username"
-          autoFocus
-        />
-        <PasswordInput
-          className="tc-login-form__password-input"
-          label="密码"
-          placeholder="请输入管理员密码"
-          value={password}
-          onChange={(event) => setPassword(event.currentTarget.value)}
-          autoComplete="current-password"
-          onKeyDown={(event) => { if (event.key === 'Enter') void handleLogin() }}
-        />
-        <Button
-          className="tc-login-form__submit"
-          color="blue"
-          fullWidth
-          loading={loading}
-          disabled={!username.trim() || !password || loading}
-          onClick={() => void handleLogin()}
+        <Tabs.Panel className="tc-login-form__tab-panel" value="email" pt="sm">
+          <EmailCodeLoginForm onLoginSuccess={onLoginSuccess} />
+        </Tabs.Panel>
+        {wechatAvailable ? (
+          <Tabs.Panel className="tc-login-form__tab-panel" value="wechat" pt="sm">
+            <WechatQrLoginForm active onLoginSuccess={onLoginSuccess} />
+          </Tabs.Panel>
+        ) : null}
+      </Tabs>
+
+      {GITHUB_CLIENT_ID ? (
+        <Anchor
+          className="tc-login-form__github"
+          onClick={(event) => { event.preventDefault(); handleGithubLogin() }}
+          aria-label="使用 GitHub 登录"
+          style={{ display: 'flex', justifyContent: 'center' }}
         >
-          登录
-        </Button>
-      </Stack>
+          <IconBrandGithub size={22} />
+        </Anchor>
+      ) : null}
+
+      <PasswordLoginForm onLoginSuccess={onLoginSuccess} />
     </Stack>
   )
 }

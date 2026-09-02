@@ -479,3 +479,15 @@
   .account-cli-skill-action { align-items: stretch; flex-direction: column; }
   .account-cli-skill-action__button { align-self: flex-start; }
 }
+
+/* 账号中心：设置/修改密码区块 */
+.account-profile-view__password {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+.account-profile-view__password-title { font-size: 14px; font-weight: 650; }
+.account-profile-view__password-save { align-self: flex-start; }
