@@ -3449,6 +3449,9 @@ async function runTaskViaNewApi(
 	const v = normalizeVendorKey(vendorKey);
 	const newApiVendorTag = v === "newapi" || v === "auto" ? "newapi" : `newapi:${v}`;
 	const model = await resolveExecutableNewApiTaskModel(c, v, req);
+	// Agnes 视频 API 不接受 response_format 字段（官方文档未列入允许字段），
+	// new-api 的 task 视频协议链路不应用渠道 param_override，因此在源头构造请求时剔除。
+	const isAgnesVideoModel = /^agnes-video/i.test(model);
 	const isImageTask = req.kind === "text_to_image" || req.kind === "image_edit";
 	const requestExtras = (req.extras || {}) as Record<string, unknown>;
 	const imageOptions = isImageTask ? await resolveNewApiImageOptions(c, v, model) : null;
@@ -4046,9 +4049,10 @@ async function runTaskViaNewApi(
 		let requestInit: RequestInit;
 		let requestPayload: Record<string, unknown>;
 
-		// ── Agnes 视频专用契约（https://www.agnes-ai.cn/zh-Hans/docs/agnes-video-25-flash）──
-		// 只接受 mode/seconds/size/aspect_ratio（及首尾帧、参考图/音频、seed）；
-		// 通用 OpenAI 视频 body 的 response_format/duration/resolution/metadata 会被上游拒绝。
+		// Agnes 视频 2.5 Flash：OpenAI Videos 兼容但只接受文档列出的字段
+		// （model/prompt/mode/seconds/size/aspect_ratio/seed/n，keyframe 用 first_frame/last_frame，
+		// reference 用 images/audios）。response_format、duration、resolution、metadata 均被上游拒绝，
+		// 且 mode 为必填——因此按文档构造专用请求体，不走通用 OpenAI 视频分支。
 		if (isAgnesVideoModel(model)) {
 			const agnesFirstFrameUrl =
 				typeof extras.firstFrameUrl === "string" ? extras.firstFrameUrl.trim() : "";
@@ -4070,7 +4074,7 @@ async function runTaskViaNewApi(
 			const agnesBody: Record<string, unknown> = {
 				model,
 				prompt: req.prompt,
-				mode: agnesMode,
+			mode: agnesMode,
 				seconds: agnesSeconds,
 				size: "720P",
 				aspect_ratio: agnesAspectRatio,
