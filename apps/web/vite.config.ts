@@ -1,7 +1,8 @@
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig, loadEnv, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 import { resolve } from 'path';
+import { existsSync, rmSync } from 'node:fs';
 import { tablerDirectImports } from './vite/tablerDirectImports';
 
 const imagePromptSpecEntry = resolve(__dirname, '../../packages/schemas/image-prompt-spec/index.js');
@@ -21,6 +22,24 @@ function requireStoragePublicBase(value: string | undefined, envKey: string): st
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ffmpeg-core.wasm 30MB+，超过 EdgeOne Pages 单文件 25MiB 上限。生产通过
+// VITE_FFMPEG_WASM_URL 外置托管（如 API 的 /assets/local/ffmpeg/ffmpeg-core.wasm），
+// 构建产物中的同源副本属冗余，closeBundle 时自动剔除，避免每次部署前手动删除。
+// 未配置外置地址的构建（前端默认仍走同源 /ffmpeg/ffmpeg-core.wasm）则保留。
+function createFfmpegWasmStripper(env: Record<string, string>): Plugin {
+  return {
+    name: 'tapcanvas:strip-ffmpeg-wasm',
+    closeBundle() {
+      const externalWasmUrl = (env.VITE_FFMPEG_WASM_URL || '').trim();
+      if (!externalWasmUrl) return;
+      const wasmPath = resolve(__dirname, 'dist', 'ffmpeg', 'ffmpeg-core.wasm');
+      if (!existsSync(wasmPath)) return;
+      rmSync(wasmPath);
+      console.log(`[tapcanvas] stripped ffmpeg-core.wasm from build output (hosted at ${externalWasmUrl})`);
+    },
+  };
 }
 
 function createManualChunks(id: string): string | undefined {
@@ -193,6 +212,7 @@ export default defineConfig(({ command, mode }) => {
           enabled: false,
         },
       }),
+      createFfmpegWasmStripper(env),
     ],
 	    resolve: {
 	      extensions: ['.ts', '.tsx', '.mjs', '.js', '.mts', '.jsx', '.json'],

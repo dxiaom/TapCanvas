@@ -4,6 +4,30 @@ import { MantineProvider } from '@mantine/core'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+// Mantine 在 jsdom 下需要 matchMedia（useColorScheme/媒体查询）。
+if (!window.matchMedia) {
+  window.matchMedia = ((query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => undefined,
+    removeListener: () => undefined,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia
+}
+
+// Mantine ScrollArea/Select 需要 ResizeObserver。
+if (typeof window.ResizeObserver === 'undefined') {
+  class ResizeObserverStub {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  window.ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserver
+}
+
 import type { AdminKnowledgeListResponseDto } from '../../../api/server'
 import StatsKnowledgeManagement from './StatsKnowledgeManagement'
 

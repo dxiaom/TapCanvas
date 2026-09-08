@@ -1,12 +1,22 @@
 import React from 'react'
 import { ActionIcon, Badge, Tooltip, useMantineColorScheme } from '@mantine/core'
-import { IconActivity, IconCpu, IconHistory, IconPalette, IconPlus, IconTopologyStar3, IconUsersGroup } from '@tabler/icons-react'
+import {
+  IconActivity,
+  IconBinaryTree,
+  IconCpu,
+  IconHistory,
+  IconPalette,
+  IconTopologyStar3,
+  IconUsersGroup,
+} from '@tabler/icons-react'
 
 import { useUIStore } from './uiStore'
+import { useRFStore } from '../canvas/store'
+import { CREATION_NODE_ITEMS } from './creationNodeItems'
 import { PanelCard } from './PanelCard'
 import { KeyboardShortcutsButton } from './KeyboardShortcutsButton'
 import { $ } from '../canvas/i18n'
-import { BOTTOM_BAR_LAYOUT_CENTER } from './utils/panelPosition'
+import { floatingBarPositionStyle } from './utils/panelPosition'
 import { useAuth } from '../auth/store'
 import { useTaskInbox } from './useTaskInbox'
 
@@ -15,6 +25,9 @@ const CapabilityBayDialog = React.lazy(async () => {
   return { default: module.CapabilityBayDialog }
 })
 
+// 工具栏内提示文字的方向：底部停靠时在上方，左右停靠时分别朝画布内侧。
+export type FloatingNavTooltipPosition = 'top' | 'right' | 'left'
+
 type FloatingNavItemProps = {
   label: string
   icon: React.ReactNode
@@ -22,8 +35,10 @@ type FloatingNavItemProps = {
   onClick?: (x: number) => void
   badge?: string
   tooltipLabel?: string
+  tooltipPosition?: FloatingNavTooltipPosition
   active?: boolean
   activeStyle?: React.CSSProperties
+  dataTour?: string
 }
 
 const FloatingNavItem = React.memo(function FloatingNavItem({
@@ -32,8 +47,10 @@ const FloatingNavItem = React.memo(function FloatingNavItem({
   onClick,
   badge,
   tooltipLabel,
+  tooltipPosition = 'top',
   active = false,
   activeStyle,
+  dataTour,
 }: FloatingNavItemProps): JSX.Element {
   return (
     <div
@@ -44,7 +61,8 @@ const FloatingNavItem = React.memo(function FloatingNavItem({
       <Tooltip
         className="floating-nav-item-tooltip"
         label={tooltipLabel}
-        position="top"
+        position={tooltipPosition}
+        offset={10}
         withArrow
         disabled={!tooltipLabel}
       >
@@ -54,6 +72,7 @@ const FloatingNavItem = React.memo(function FloatingNavItem({
           size={28}
           radius="md"
           aria-label={label}
+          data-tour={dataTour}
           onClick={(e) => {
             const r = e.currentTarget.getBoundingClientRect()
             onClick?.(r.left + r.width / 2)
@@ -85,6 +104,9 @@ export default function FloatingNav({ className }: { className?: string }): JSX.
   const activePanel = useUIStore((state) => state.activePanel)
   const setActivePanel = useUIStore((state) => state.setActivePanel)
   const setPanelAnchorX = useUIStore((state) => state.setPanelAnchorX)
+  const canvasToolbarPosition = useUIStore((state) => state.canvasToolbarPosition)
+  const addNode = useRFStore((state) => state.addNode)
+  const addDirectorConsoleNode = useRFStore((state) => state.addDirectorConsoleNode)
   const userId = useAuth((state) => state.user?.sub == null ? null : String(state.user.sub))
   const currentProjectId = useUIStore((state) => state.currentProject?.id ?? '')
   const taskInbox = useTaskInbox(userId, Boolean(userId))
@@ -111,38 +133,53 @@ export default function FloatingNav({ className }: { className?: string }): JSX.
     clearCapabilityBayOpenRequest()
   }, [clearCapabilityBayOpenRequest])
 
-  // 记录触发项的水平中心，供上方弹出的面板居中对齐（点击时设置）。
-  const anchorFrom = React.useCallback((e: React.MouseEvent<HTMLElement>) => {
-    const r = e.currentTarget.getBoundingClientRect()
-    setPanelAnchorX(r.left + r.width / 2)
-  }, [setPanelAnchorX])
+  // 创作节点一键添加：添加成功后关闭任何已打开的面板。
+  const addCreationNode = React.useCallback((kind: string) => {
+    if (kind === 'directorConsole') {
+      addDirectorConsoleNode()
+    } else {
+      addNode('taskNode', undefined, { kind })
+    }
+    setActivePanel(null)
+  }, [addNode, addDirectorConsoleNode, setActivePanel])
 
-  const navClassName = ['floating-nav', 'floating-nav--bottom', className].filter(Boolean).join(' ')
+  const isSide = canvasToolbarPosition !== 'bottom'
+  // 提示文字方向：底部停靠在按钮上方；左停靠朝右、右停靠朝左（画布内侧）。
+  const tooltipPosition: FloatingNavTooltipPosition = canvasToolbarPosition === 'left'
+    ? 'right'
+    : canvasToolbarPosition === 'right'
+      ? 'left'
+      : 'top'
+  const navClassName = [
+    'floating-nav',
+    isSide ? 'floating-nav--side' : 'floating-nav--bottom',
+    className,
+  ].filter(Boolean).join(' ')
 
   return (
-    <div className={navClassName} style={{ position: 'fixed', bottom: 18, left: BOTTOM_BAR_LAYOUT_CENTER, transform: 'translateX(-50%)', zIndex: 300, transition: 'left 220ms ease' }} data-ux-floating data-tour="floating-nav">
-      <PanelCard className="floating-nav-card" padding="compact" data-ux-floating>
+    <div
+      className={navClassName}
+      style={floatingBarPositionStyle(canvasToolbarPosition)}
+      data-ux-floating
+      data-tour="floating-nav"
+    >
+      <PanelCard className="floating-nav-card glass" padding="compact" data-ux-floating>
         <div className="floating-nav-stack">
-          <ActionIcon
-            className="floating-nav-add"
-            size={42}
-            radius={999}
-            aria-label={$('添加节点')}
-            variant="subtle"
-            data-active={activePanel === 'add' ? 'true' : 'false'}
-            onClick={(e) => {
-              anchorFrom(e)
-              setActivePanel(activePanel === 'add' ? null : 'add')
-            }}
-            data-ux-floating
-            data-tour="add-button">
-            <IconPlus className="floating-nav-add-icon" size={22} stroke={2.2} />
-          </ActionIcon>
-          <div className="floating-nav-divider" />
+          {CREATION_NODE_ITEMS.map((item) => (
+            <FloatingNavItem
+              key={item.kind}
+              label={$(item.label)}
+              icon={<item.Icon className="floating-nav-item-icon" size={18} />}
+              tooltipLabel={item.badge ? `${$(item.label)} · ${item.badge}` : $(item.label)}
+              tooltipPosition={tooltipPosition}
+              onClick={() => addCreationNode(item.kind)}
+            />
+          ))}
           <FloatingNavItem
             label="风格库"
             icon={<IconPalette className="floating-nav-item-icon" size={18} />}
             tooltipLabel="风格库"
+            tooltipPosition={tooltipPosition}
             onClick={(x) => {
               setPanelAnchorX(x)
               setActivePanel(activePanel === 'style-library' ? null : 'style-library')
@@ -154,6 +191,7 @@ export default function FloatingNav({ className }: { className?: string }): JSX.
             label="角色库"
             icon={<IconUsersGroup className="floating-nav-item-icon" size={18} />}
             tooltipLabel="角色库"
+            tooltipPosition={tooltipPosition}
             onClick={(x) => {
               setPanelAnchorX(x)
               setActivePanel(activePanel === 'character-library' ? null : 'character-library')
@@ -165,6 +203,7 @@ export default function FloatingNav({ className }: { className?: string }): JSX.
             label="Agent 配置"
             icon={<IconCpu className="floating-nav-item-icon" size={18} />}
             tooltipLabel="Agent 配置"
+            tooltipPosition={tooltipPosition}
             onClick={() => {
               clearCapabilityBayOpenRequest()
               setCapabilityBayOpened(true)
@@ -172,11 +211,25 @@ export default function FloatingNav({ className }: { className?: string }): JSX.
             active={capabilityBayOpened}
             activeStyle={activeItemStyle}
           />
+          <FloatingNavItem
+            label="AI 编排"
+            icon={<IconBinaryTree className="floating-nav-item-icon" size={18} />}
+            tooltipLabel="AI 编排 · 触发器、Agent 与工作流"
+            tooltipPosition={tooltipPosition}
+            dataTour="orchestration-button"
+            onClick={(x) => {
+              setPanelAnchorX(x)
+              setActivePanel(activePanel === 'add' ? null : 'add')
+            }}
+            active={activePanel === 'add'}
+            activeStyle={activeItemStyle}
+          />
           <div className="floating-nav-divider" />
           <FloatingNavItem
             label={$('工作流')}
             icon={<IconTopologyStar3 className="floating-nav-item-icon" size={18} />}
             tooltipLabel="工作流 · 历史记录"
+            tooltipPosition={tooltipPosition}
             onClick={(x) => {
               setPanelAnchorX(x)
               const inGroup = activePanel === 'template' || activePanel === 'history'
@@ -189,6 +242,7 @@ export default function FloatingNav({ className }: { className?: string }): JSX.
             label="生成历史"
             icon={<IconHistory className="floating-nav-item-icon" size={18} />}
             tooltipLabel="生成历史"
+            tooltipPosition={tooltipPosition}
             onClick={(x) => {
               setPanelAnchorX(x)
               setActivePanel(activePanel === 'generation-history' ? null : 'generation-history')
@@ -200,6 +254,7 @@ export default function FloatingNav({ className }: { className?: string }): JSX.
             label="创作动态"
             icon={<IconActivity className="floating-nav-item-icon" size={18} />}
             tooltipLabel="创作动态 · 记忆"
+            tooltipPosition={tooltipPosition}
             badge={taskInbox.unreadCount > 0
               ? (taskInbox.unreadCount > 99 ? '99+' : String(taskInbox.unreadCount))
               : undefined}
@@ -212,7 +267,7 @@ export default function FloatingNav({ className }: { className?: string }): JSX.
           />
           <div className="floating-nav-divider floating-nav-divider--bottom" />
           {/* 键盘快捷键「?」：从 CanvasBottomControls 独立浮动按钮合并至此。 */}
-          <KeyboardShortcutsButton />
+          <KeyboardShortcutsButton tooltipPosition={tooltipPosition} />
         </div>
       </PanelCard>
       {capabilityBayOpened ? (

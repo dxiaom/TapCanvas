@@ -473,27 +473,6 @@ export async function listPublicChatTurnRuns(
 	return rows.reverse();
 }
 
-export async function listPublicChatTurnRunsByWorkflow(
-	db: PrismaClient,
-	input: { userId: string; workflowKey: string; limit?: number },
-): Promise<PublicChatTurnRunRow[]> {
-	await ensurePublicChatSessionSchema(db);
-	const userId = String(input.userId || "").trim();
-	const workflowKey = String(input.workflowKey || "").trim().toLowerCase();
-	if (!userId || !workflowKey) return [];
-	const limit = Number.isFinite(input.limit)
-		? Math.max(1, Math.min(200, Math.trunc(Number(input.limit))))
-		: 50;
-	return queryAll<PublicChatTurnRunRow>(
-		db,
-		`SELECT * FROM public_chat_turn_runs
-     WHERE user_id = ? AND workflow_key = ?
-     ORDER BY created_at DESC
-     LIMIT ?`,
-		[userId, workflowKey, limit],
-	);
-}
-
 export async function listRecentPublicChatTurnRuns(
 	db: PrismaClient,
 	input: {

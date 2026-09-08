@@ -20,7 +20,38 @@ import {
 import {
 	hasPasswordConfigured,
 	verifyPasswordRecord,
+	createPasswordRecord,
 } from "./password";
+import {
+	checkSmsVerifyCode,
+	isAliyunSmsAuthConfigured,
+	sendSmsVerifyCode,
+	type AliyunSmsAuthConfig,
+} from "./aliyun-sms-auth";
+
+export function isChinaMobilePhone(value: unknown): boolean {
+	if (typeof value !== "string") return false;
+	const trimmed = value.trim();
+	return /^1[3-9]\d{9}$/.test(trimmed);
+}
+
+export function normalizeChinaMobilePhone(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	return isChinaMobilePhone(trimmed) ? trimmed : null;
+}
+
+export function resolveAliyunSmsConfig(env: AppContext["env"]): AliyunSmsAuthConfig | null {
+	const config = getConfig(env);
+	if (!isAliyunSmsAuthConfigured(config)) return null;
+	return {
+		accessKeyId: config.aliyunSmsAccessKeyId!,
+		accessKeySecret: config.aliyunSmsAccessKeySecret!,
+		schemeName: config.aliyunSmsSchemeName ?? null,
+		signName: config.aliyunSmsSignName!,
+		templateCode: config.aliyunSmsTemplateCode!,
+	};
+}
 
 function normalizeEmailLocalPart(email: string): string {
 	const at = email.indexOf("@");
@@ -658,10 +689,16 @@ export async function loginWithCredentials(
 	username: string,
 	password: string,
 ) {
-	const normalizedUsername = username.trim();
+	const normalizedPhone = normalizeChinaMobilePhone(username);
+	if (!normalizedPhone) {
+		return c.json(
+			{ success: false, error: "请输入正确的手机号" },
+			400,
+		);
+	}
 	const matchingUsers = await getPrismaClient().users.findMany({
 		where: {
-			login: normalizedUsername,
+			phone: normalizedPhone,
 			deleted_at: null,
 		},
 		select: {
@@ -722,5 +759,142 @@ export async function loginWithCredentials(
 		email: userRow.email ?? null,
 		phone: userRow.phone ?? null,
 		guest: Number(userRow.guest ?? 0) !== 0,
+	});
+}
+
+/**
+ * 发送手机号注册验证码（阿里云短信认证服务）。
+ * 验证码由阿里云托管生成/核验，本服务不落库验证码明文。
+ */
+export async function sendPhoneVerifyCode(
+	c: AppContext,
+	phone: string,
+): Promise<
+	| { kind: "sent"; expiresInSeconds: number; devCode?: string }
+	| { kind: "not_configured" }
+	| { kind: "error"; code: string; message: string }
+> {
+	const config = resolveAliyunSmsConfig(c.env);
+	if (!config) {
+		return { kind: "not_configured" };
+	}
+
+	const isDebug = getConfig(c.env).emailLoginDebug;
+
+	const result = await sendSmsVerifyCode({
+		config,
+		phoneNumber: phone,
+		countryCode: "86",
+		validTimeSeconds: 300,
+		codeLength: 6,
+		...(isDebug ? { returnVerifyCode: true } : {}),
+	});
+
+	if (!result.ok) {
+		return {
+			kind: "error",
+			code: result.code,
+			message: result.message || result.code || "验证码发送失败",
+		};
+	}
+	return {
+		kind: "sent",
+		expiresInSeconds: 300,
+		...(result.devCode ? { devCode: result.devCode } : {}),
+	};
+}
+
+/**
+ * 手机号注册：核验短信验证码 + 设置密码 + 创建用户。
+ * 已存在同手机号账号时拒绝重复注册。
+ */
+export async function registerWithPhoneAndPassword(
+	c: AppContext,
+	phone: string,
+	verifyCode: string,
+	password: string,
+) {
+	const config = resolveAliyunSmsConfig(c.env);
+	if (!config) {
+		return c.json(
+			{ success: false, error: "短信服务未配置" },
+			501,
+		);
+	}
+
+	const checkResult = await checkSmsVerifyCode({
+		config,
+		phoneNumber: phone,
+		verifyCode,
+		countryCode: "86",
+	});
+	if (!checkResult.verified) {
+		return c.json(
+			{ success: false, error: "验证码不正确或已过期" },
+			401,
+		);
+	}
+
+	const prisma = getPrismaClient();
+	const existing = await prisma.users.findFirst({
+		where: { phone, deleted_at: null },
+		select: { id: true },
+	});
+	if (existing) {
+		return c.json(
+			{ success: false, error: "该手机号已注册，请直接登录" },
+			409,
+		);
+	}
+
+	const passwordRecord = await createPasswordRecord(password);
+	const nowIso = new Date().toISOString();
+	const userId = `phone_${await sha256Hex(phone)}`;
+
+	try {
+		await prisma.users.create({
+			data: {
+				id: userId,
+				login: phone,
+				name: `用户${phone.slice(-4)}`,
+				phone,
+				password_hash: passwordRecord.hash,
+				password_salt: passwordRecord.salt,
+				password_updated_at: nowIso,
+				guest: 0,
+				last_seen_at: nowIso,
+				created_at: nowIso,
+				updated_at: nowIso,
+			},
+		});
+		await ensurePersonalBillingTeamOnLogin(c, userId);
+		const { bindReferrerOnRegister } = await import(
+			"../referral/referral.service"
+		);
+		const refCode = c.req.header("x-tapcanvas-ref-code") ?? null;
+		await bindReferrerOnRegister(c, userId, refCode, null, null);
+		const { grantRegistrationWelcomeCredits } = await import(
+			"../referral/referral.service"
+		);
+		await grantRegistrationWelcomeCredits(c, userId, refCode);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (/unique|constraint|duplicate/i.test(message)) {
+			return c.json(
+				{ success: false, error: "该手机号已注册，请直接登录" },
+				409,
+			);
+		}
+		throw error;
+	}
+
+	return issueAuthPayload(c, {
+		userId,
+		login: phone,
+		name: `用户${phone.slice(-4)}`,
+		avatarUrl: null,
+		email: null,
+		phone,
+		guest: false,
 	});
 }

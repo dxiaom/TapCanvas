@@ -4,6 +4,7 @@ export const loadCanvasHubPage = () => import('./CanvasHubPage')
 export const loadSkillPortalPage = () => import('./SkillPortalPage')
 export const loadPromptLibraryPage = () => import('./PromptLibraryPage')
 export const loadPromptDetailPage = () => import('./PromptDetailPage')
+export const loadPricingPage = () => import('./PricingPage')
 
 export type PortalModuleRoute = 'home' | 'neo-tv' | 'prompts' | 'projects' | 'skills'
 

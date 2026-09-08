@@ -118,7 +118,7 @@ export function VideoProfileConfirmCard(props: {
 
   return (
     <NodeToolbar nodeId={props.groupId} position={Position.Top} align="center" isVisible>
-      <Paper p="md" radius="md" withBorder shadow="md" style={{ width: 'min(92vw, 460px)' }}>
+      <Paper className="glass" p="md" radius="md" withBorder shadow="md" style={{ width: 'min(92vw, 460px)' }}>
         <Group justify="space-between" wrap="nowrap" mb="xs">
           <Group gap={8} wrap="nowrap">
             <Text size="sm" fw={700}>识别视频领域</Text>

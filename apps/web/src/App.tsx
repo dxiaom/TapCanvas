@@ -1,7 +1,7 @@
 import React from 'react'
-import { AppShell, ActionIcon, Group, Box, Button, Badge, Text, Tooltip, UnstyledButton } from '@mantine/core'
+import { AppShell, ActionIcon, Group, Box, Button, Badge, Text, Tooltip, UnstyledButton, Menu } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
-import { IconCoins, IconChartBar, IconBooks } from '@tabler/icons-react'
+import { IconCoins, IconChartBar, IconBooks, IconLayoutBottombar, IconLayoutSidebar, IconLayoutSidebarRight, IconCheck, IconPointer } from '@tabler/icons-react'
 import Canvas from './canvas/Canvas'
 import GithubGate from './auth/GithubGate'
 import { isCanvasNodeDragActive, sanitizeGraphForCanvas, useRFStore } from './canvas/store'
@@ -43,6 +43,7 @@ import SubflowEditor from './subflow/Editor'
 import LibraryEditor from './flows/LibraryEditor'
 import { listFlows, saveFlow, deleteFlow as deleteLibraryFlow, renameFlow, scanCycles } from './flows/registry'
 import FloatingNav from './ui/FloatingNav'
+import { applyCanvasCursor } from './ui/canvasCursor'
 import { ProjectConfigChip } from './ui/projectConfig/ProjectConfigChip'
 import BodyPortal from './ui/BodyPortal'
 import { CanvasLoadingScreen } from './ui/CanvasLoadingScreen'
@@ -292,6 +293,14 @@ function CanvasApp({
   })[0] ?? '')
   const [execStarting, setExecStarting] = React.useState(false)
   const setActivePanel = useUIStore(s => s.setActivePanel)
+  const canvasToolbarPosition = useUIStore(s => s.canvasToolbarPosition)
+  const setCanvasToolbarPosition = useUIStore(s => s.setCanvasToolbarPosition)
+  const canvasCursor = useUIStore(s => s.canvasCursor)
+  const setCanvasCursor = useUIStore(s => s.setCanvasCursor)
+  // 初始/切换时应用画布光标（B/C 写入内联覆盖，A 清除回退 styles.css 默认值）
+  React.useEffect(() => {
+    applyCanvasCursor(canvasCursor)
+  }, [canvasCursor])
   const currentFlow = useUIStore(s => s.currentFlow)
   // 上次由服务端确认的完整快照。409 时只把此基线之后的真实本地变化重放到最新服务端图，
   // 避免多标签或 agent 并发写入时覆盖对方，也不会把服务端已删除的旧节点复活。
@@ -1418,13 +1427,13 @@ function CanvasApp({
         id: 'floating-nav',
         target: 'floating-nav',
         title: $('浮动菜单'),
-        description: $('底部是主要入口：把鼠标移到图标上会在上方展开对应面板。点击“+”可以快速添加节点。'),
+        description: $('底部是主要入口：文本、图像等创作节点点击即添加到画布，图标悬停可查看名称。'),
       },
       {
         id: 'add-node',
-        target: 'add-button',
-        title: $('添加节点'),
-        description: $('悬停“+”打开添加面板，先加 image / 视频等节点，然后在画布上连线组合成工作流。'),
+        target: 'orchestration-button',
+        title: $('AI 编排'),
+        description: $('点击「AI 编排」展开节点面板，可添加触发器、Agent 与工作流模板节点。'),
       },
       {
         id: 'canvas',
@@ -1742,6 +1751,87 @@ function CanvasApp({
                   <IconBooks size={16} />
                 </ActionIcon>
               </Tooltip>
+              <Menu className="app-toolbar-position-menu" withinPortal shadow="md" radius="md" position="bottom-end">
+                <Menu.Target>
+                  <ActionIcon
+                    className="app-toolbar-position-entry"
+                    size="sm"
+                    variant="subtle"
+                    aria-label="切换画布工具栏位置"
+                    data-tour="toolbar-position"
+                  >
+                    {canvasToolbarPosition === 'left'
+                      ? <IconLayoutSidebar size={16} />
+                      : canvasToolbarPosition === 'right'
+                        ? <IconLayoutSidebarRight size={16} />
+                        : <IconLayoutBottombar size={16} />}
+                  </ActionIcon>
+                </Menu.Target>
+                <Menu.Dropdown>
+                  <Menu.Item
+                    className="app-toolbar-position-item"
+                    leftSection={<IconLayoutSidebar size={14} />}
+                    rightSection={canvasToolbarPosition === 'left' ? <IconCheck size={14} /> : null}
+                    onClick={() => setCanvasToolbarPosition('left')}
+                  >
+                    {$('左侧')}
+                  </Menu.Item>
+                  <Menu.Item
+                    className="app-toolbar-position-item"
+                    leftSection={<IconLayoutBottombar size={14} />}
+                    rightSection={canvasToolbarPosition === 'bottom' ? <IconCheck size={14} /> : null}
+                    onClick={() => setCanvasToolbarPosition('bottom')}
+                  >
+                    {$('底部')}
+                  </Menu.Item>
+                  <Menu.Item
+                    className="app-toolbar-position-item"
+                    leftSection={<IconLayoutSidebarRight size={14} />}
+                    rightSection={canvasToolbarPosition === 'right' ? <IconCheck size={14} /> : null}
+                    onClick={() => setCanvasToolbarPosition('right')}
+                  >
+                    {$('右侧')}
+                  </Menu.Item>
+                </Menu.Dropdown>
+              </Menu>
+              <Menu className="app-canvas-cursor-menu" withinPortal shadow="md" radius="md" position="bottom-end">
+                <Menu.Target>
+                  <ActionIcon
+                    className="app-canvas-cursor-entry"
+                    size="sm"
+                    variant="subtle"
+                    aria-label="切换画布光标"
+                  >
+                    <IconPointer size={16} />
+                  </ActionIcon>
+                </Menu.Target>
+                <Menu.Dropdown>
+                  <Menu.Item
+                    className="app-canvas-cursor-item"
+                    leftSection={<IconPointer size={14} />}
+                    rightSection={canvasCursor === 'arrow-a' ? <IconCheck size={14} /> : null}
+                    onClick={() => setCanvasCursor('arrow-a')}
+                  >
+                    {$('A · 经典黑箭头')}
+                  </Menu.Item>
+                  <Menu.Item
+                    className="app-canvas-cursor-item"
+                    leftSection={<IconPointer size={14} />}
+                    rightSection={canvasCursor === 'arrow-b' ? <IconCheck size={14} /> : null}
+                    onClick={() => setCanvasCursor('arrow-b')}
+                  >
+                    {$('B · 白色箭头')}
+                  </Menu.Item>
+                  <Menu.Item
+                    className="app-canvas-cursor-item"
+                    leftSection={<IconPointer size={14} />}
+                    rightSection={canvasCursor === 'arrow-c' ? <IconCheck size={14} /> : null}
+                    onClick={() => setCanvasCursor('arrow-c')}
+                  >
+                    {$('C · 浅灰箭头')}
+                  </Menu.Item>
+                </Menu.Dropdown>
+              </Menu>
               <Tooltip label="按文本 / 图片 / 视频等节点类型自动分列；工作流组按执行链对齐" withArrow>
                 <Button
                   className="app-tidy-button"

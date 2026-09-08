@@ -100,6 +100,7 @@ import { CanvasRenderContext } from './CanvasRenderContext'
 import { EdgeInteractionContext } from './edges/EdgeInteractionContext'
 import { PanelCard } from '../ui/PanelCard'
 import { InlinePanel } from '../ui/InlinePanel'
+import { CREATION_NODE_ITEMS } from '../ui/creationNodeItems'
 import { buildCanvasNodeFilmChatText, CANVAS_NODE_FILM_CHAT_DISPLAY_TEXT } from './filmChatCommand'
 import { buildOneClickFilmChatText, ONE_CLICK_FILM_CHAT_DISPLAY_TEXT } from './oneClickFilmChatCommand'
 import { emitDirectorPersonaChanged } from '../ui/DirectorPersonaChip'
@@ -376,16 +377,6 @@ type CanvasMiniMapProps = React.ComponentProps<typeof MiniMap>
 type CanvasMiniMapClick = NonNullable<CanvasMiniMapProps['onClick']>
 type CanvasMiniMapNodeClick = NonNullable<CanvasMiniMapProps['onNodeClick']>
 
-const CANVAS_CONTEXT_ADDABLE_KINDS = [
-  'text',
-  'image',
-  'storyboard',
-  'video',
-  'videoAnalysis',
-  'shotTable',
-  'audio',
-  'videoCompose',
-] as const
 const HEAVY_SELECTION_DRAG_THRESHOLD = 6
 
 type WorkflowNameDialogState = {
@@ -1540,7 +1531,6 @@ function CanvasInner({
   }
 
   const suppressContextMenuRef = useRef(false)
-  const rightDragRef = useRef<{ startX: number; startY: number } | null>(null)
   const snapTargetRef = useRef<SnapTarget | null>(null)
   const snapHandleElRef = useRef<HTMLElement | null>(null)
   const [snapTarget, setSnapTarget] = useState<SnapTarget | null>(null)
@@ -1811,14 +1801,34 @@ function CanvasInner({
 
   // removed pane mouse handlers (not supported by current reactflow typings). Root listeners are used instead.
 
-  const onPaneContextMenu = useCallback((evt: MouseEvent | React.MouseEvent<Element, MouseEvent>) => {
-    evt.preventDefault()
+  // 空白区右键菜单：在根节点 capture 阶段直接接管，不依赖 React Flow 的
+  // onPaneContextMenu——RF 会把"按下后有 1~2px 抖动"的右键判定为平移手势并吞掉
+  // contextmenu，导致菜单几乎无法触发。这里只用 suppressContextMenuRef（右键
+  // 拖拽 ≥6px 时置位）区分"右键平移"与"右键点击"。
+  const onCanvasContextMenu = useCallback((e: React.MouseEvent) => {
+    if (viewOnly) return
+    const target = e.target as HTMLElement | null
+    // 右键落在菜单内部：仅抑制浏览器原生菜单，不重开菜单
+    if (target?.closest('.tc-canvas__context-menu')) {
+      e.preventDefault()
+      return
+    }
+    const onPaneArea = Boolean(
+      target?.closest('.react-flow__pane')
+      && !target?.closest('.react-flow__node')
+      && !target?.closest('.react-flow__edge')
+      && !target?.closest('.react-flow__panel')
+      && !target?.closest('.tc-canvas__context-menu'),
+    )
+    if (!onPaneArea) return
+    e.preventDefault()
+    e.stopPropagation()
     if (suppressContextMenuRef.current) {
       suppressContextMenuRef.current = false
       return
     }
-    setMenu({ show: true, x: evt.clientX, y: evt.clientY, type: 'canvas' })
-  }, [])
+    setMenu({ show: true, x: e.clientX, y: e.clientY, type: 'canvas' })
+  }, [viewOnly])
 
   const onPaneClick = useCallback(() => {
     setTapConnectSource(null)
@@ -1854,13 +1864,34 @@ function CanvasInner({
   const createTaskNodeAtMenu = useCallback((kind: string) => {
     const menuState = menu
     if (!menuState || menuState.type !== 'canvas') return
-    const normalizedKind = kind === 'character' ? 'image' : kind
-    useRFStore.getState().addNode('taskNode', undefined, {
-      kind: normalizedKind,
-      position: screenToFlow({ x: menuState.x, y: menuState.y }),
-    })
+    const position = screenToFlow({ x: menuState.x, y: menuState.y })
+    if (kind === 'directorConsole') {
+      useRFStore.getState().addDirectorConsoleNode({ position })
+    } else {
+      useRFStore.getState().addNode('taskNode', undefined, { kind, position })
+    }
     setMenu(null)
   }, [menu, screenToFlow])
+
+  // 右键菜单关闭逻辑：点击菜单外部（capture，先于画布交互）或按 Escape 关闭；
+  // 不再用 mouseleave——鼠标只是路过菜单时误关，体验不合理。
+  useEffect(() => {
+    if (!menu?.show) return undefined
+    const onPointerDownOutside = (ev: MouseEvent) => {
+      const target = ev.target as HTMLElement | null
+      if (target?.closest('.tc-canvas__context-menu')) return
+      setMenu(null)
+    }
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') setMenu(null)
+    }
+    window.addEventListener('mousedown', onPointerDownOutside, true)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('mousedown', onPointerDownOutside, true)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [menu?.show])
 
   const insertMenuRef = useRef<HTMLDivElement | null>(null)
 
@@ -3757,24 +3788,47 @@ function CanvasInner({
   }, [focusNodeFromMiniMap])
 
   // Right-button drag: use as pan gesture and suppress context menu when dragging.
+  // Tracked at window capture phase because d3-zoom (attached to .react-flow__renderer)
+  // calls stopImmediatePropagation on the mousedown, which blocks React's bubble-phase
+  // onMouseDown from ever firing — so the old rightDragRef approach never armed the
+  // suppress flag and the context menu opened after every right-drag pan.
+  // Capture listeners run before any library/React handler and cannot be blocked.
   useEffect(() => {
     const threshold = 6
+    let startX = 0
+    let startY = 0
+    let active = false
+    const onDown = (ev: MouseEvent) => {
+      if (ev.button !== 2) return
+      // A fresh right press always starts unsuppressed: clears any stale flag left
+      // by a previous drag whose contextmenu was never consumed by a canvas handler.
+      suppressContextMenuRef.current = false
+      active = true
+      startX = ev.clientX
+      startY = ev.clientY
+    }
     const onMove = (ev: MouseEvent) => {
-      if (!rightDragRef.current) return
-      const dx = ev.clientX - rightDragRef.current.startX
-      const dy = ev.clientY - rightDragRef.current.startY
-      if (Math.hypot(dx, dy) >= threshold) {
+      if (!active) return
+      if (Math.hypot(ev.clientX - startX, ev.clientY - startY) >= threshold) {
         suppressContextMenuRef.current = true
       }
     }
     const onUp = () => {
-      rightDragRef.current = null
+      active = false
     }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
+    const onBlur = () => {
+      // Mouse released outside the window: no contextmenu will follow, drop the gesture.
+      active = false
+    }
+    window.addEventListener('mousedown', onDown, true)
+    window.addEventListener('mousemove', onMove, true)
+    window.addEventListener('mouseup', onUp, true)
+    window.addEventListener('blur', onBlur)
     return () => {
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
+      window.removeEventListener('mousedown', onDown, true)
+      window.removeEventListener('mousemove', onMove, true)
+      window.removeEventListener('mouseup', onUp, true)
+      window.removeEventListener('blur', onBlur)
     }
   }, [])
 
@@ -3909,11 +3963,7 @@ function CanvasInner({
         }}
         onDrop={viewOnly ? undefined : onDrop}
         onDragOver={viewOnly ? undefined : onDragOver}
-        onMouseDown={viewOnly ? undefined : (e) => {
-          if (e.button === 2) {
-            rightDragRef.current = { startX: e.clientX, startY: e.clientY }
-          }
-        }}
+        onContextMenuCapture={viewOnly ? undefined : onCanvasContextMenu}
         onKeyDown={(e) => {
           if (viewOnly) return
           const focusTarget = document.activeElement as HTMLElement | null
@@ -4028,7 +4078,6 @@ function CanvasInner({
         onConnectStart={viewOnly ? undefined : onConnectStart}
         onConnectEnd={viewOnly ? undefined : onConnectEnd}
         onNodeDragStart={viewOnly ? undefined : onNodeDragStart}
-        onPaneContextMenu={viewOnly ? undefined : onPaneContextMenu}
         onPaneClick={viewOnly ? undefined : onPaneClick}
         onNodeContextMenu={viewOnly ? undefined : onNodeContextMenu}
         onEdgeContextMenu={viewOnly ? undefined : onEdgeContextMenu}
@@ -4405,47 +4454,34 @@ function CanvasInner({
       )}
       {menu?.show && (
         <PanelCard
-          className="tc-canvas__context-menu"
+          className="tc-canvas__context-menu glass"
           padding="compact"
-          onMouseLeave={() => setMenu(null)}
           style={{
             position: 'fixed',
-            left: Math.max(8, Math.min(menu.x, Math.max(8, window.innerWidth - 280))),
+            left: Math.max(8, Math.min(menu.x, Math.max(8, window.innerWidth - 200))),
             top: Math.max(8, Math.min(menu.y, Math.max(8, window.innerHeight - 420))),
             zIndex: 60,
-            minWidth: 220,
+            width: 'max-content',
+            minWidth: 170,
+            maxWidth: 'min(92vw, 420px)',
             maxHeight: 'min(72vh, 520px)',
             overflowY: 'auto',
           }}
         >
-          <Stack className="tc-canvas__context-menu-stack" gap={4} p="xs">
+          <Stack className="tc-canvas__context-menu-stack" gap={4}>
             {menu.type === 'canvas' && (
               <>
-                {CANVAS_CONTEXT_ADDABLE_KINDS.map((kind) => {
-                  const schema = getTaskNodeSchema(kind)
-                  return (
-                    <Button
-                      key={kind}
-                      className="tc-canvas__context-menu-action"
-                      variant="subtle"
-                      onClick={() => createTaskNodeAtMenu(kind)}
-                    >
-                      新建{schema.label || kind}
-                    </Button>
-                  )
-                })}
-                <Button
-                  className="tc-canvas__context-menu-action"
-                  variant="subtle"
-                  onClick={() => {
-                    const menuState = menu
-                    if (!menuState || menuState.type !== 'canvas') return
-                    useRFStore.getState().addDirectorConsoleNode({ position: screenToFlow({ x: menuState.x, y: menuState.y }) })
-                    setMenu(null)
-                  }}
-                >
-                  新建导演台
-                </Button>
+                {CREATION_NODE_ITEMS.map((item) => (
+                  <Button
+                    key={item.kind}
+                    className="tc-canvas__context-menu-action"
+                    variant="subtle"
+                    leftSection={<item.Icon size={16} />}
+                    onClick={() => createTaskNodeAtMenu(item.kind)}
+                  >
+                    {item.label}
+                  </Button>
+                ))}
                 {clipboard && clipboard.nodes.length > 0 && (
                   <Button
                     className="tc-canvas__context-menu-action"

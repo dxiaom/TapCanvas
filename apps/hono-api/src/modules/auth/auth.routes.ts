@@ -11,6 +11,10 @@ import {
 	loginWithCredentials,
 	requestEmailLoginCode,
 	verifyEmailLoginCode,
+	isChinaMobilePhone,
+	normalizeChinaMobilePhone,
+	sendPhoneVerifyCode,
+	registerWithPhoneAndPassword,
 } from "./auth.service";
 import { getConfig } from "../../config";
 import { authMiddleware, resolveAuth } from "../../middleware/auth";
@@ -21,6 +25,7 @@ import {
 	sanitizeUserGenerationPrefs,
 } from "./generation-prefs";
 import { agentsCliAuthRouter } from "./agents-cli-auth.routes";
+import { wechatOfficialRouter } from "./wechat-official.routes";
 import { isWechatOfficialEnabled } from "./wechat-official.service";
 import { attachAuthCookies, clearAuthCookies } from "./auth.cookies";
 import { refreshBrowserAuthSession } from "./auth-token.service";
@@ -29,6 +34,8 @@ import { AppError } from "../../middleware/error";
 export const authRouter = new Hono<AppEnv>();
 
 authRouter.route("/agents-cli", agentsCliAuthRouter);
+// 公众号扫码登录：凭证未配置时端点返回 501（前端据此隐藏入口），配置后立即生效。
+authRouter.route("/wechat-official", wechatOfficialRouter);
 
 function normalizeRedirectTarget(
 	raw: string | null,
@@ -239,6 +246,70 @@ authRouter.post("/login", async (c) => {
 		parsed.data.username,
 		parsed.data.password,
 	);
+	if (result instanceof Response) return result;
+
+	const validated = AuthResponseSchema.parse(result);
+	attachValidatedAuthCookies(c, validated);
+	return c.json(browserAuthResponse(validated));
+});
+
+authRouter.post("/sms/send", async (c) => {
+	const body = (await c.req.json().catch(() => ({}))) ?? {};
+	const rawPhone = typeof body.phone === "string" ? body.phone.trim() : "";
+	const phone = normalizeChinaMobilePhone(rawPhone);
+	if (!phone) {
+		return c.json({ success: false, error: "请输入正确的手机号" }, 400);
+	}
+
+	const result = await sendPhoneVerifyCode(c, phone);
+	if (result.kind === "not_configured") {
+		return c.json({ success: false, error: "短信服务未配置" }, 501);
+	}
+	if (result.kind === "error") {
+		// 阿里云官方错误码 + 实测出现的业务码 → 面向用户的中文文案（确定性映射，非语义判断）
+		const friendlyByCode: Record<string, string> = {
+			"biz.FREQUENCY": "发送过于频繁，请 1 分钟后再试",
+			FREQUENCY_FAIL: "发送过于频繁，请 1 分钟后再试",
+			MOBILE_NUMBER_ILLEGAL: "手机号格式不正确",
+			BUSINESS_LIMIT_CONTROL: "该手机号今日发送次数已达上限，请明天再试",
+			INVALID_PARAMETERS: "验证码发送参数异常，请联系客服",
+			FUNCTION_NOT_OPENED: "短信服务未开通，请联系管理员",
+			UNKNOWN: "短信下发失败，请稍后重试；若持续失败请联系客服",
+		};
+		return c.json(
+			{
+				success: false,
+				error: friendlyByCode[result.code] ?? result.message,
+			},
+			result.code === "biz.FREQUENCY" || result.code === "FREQUENCY_FAIL" ? 429 : 502,
+		);
+	}
+	return c.json({
+		success: true,
+		sent: true,
+		expiresInSeconds: result.expiresInSeconds,
+		...(result.devCode ? { devCode: result.devCode } : {}),
+	});
+});
+
+authRouter.post("/sms/register", async (c) => {
+	const body = (await c.req.json().catch(() => ({}))) ?? {};
+	const rawPhone = typeof body.phone === "string" ? body.phone.trim() : "";
+	const phone = normalizeChinaMobilePhone(rawPhone);
+	const code = typeof body.code === "string" ? body.code.trim() : "";
+	const password = typeof body.password === "string" ? body.password : "";
+
+	if (!phone) {
+		return c.json({ success: false, error: "请输入正确的手机号" }, 400);
+	}
+	if (!/^\d{6}$/.test(code)) {
+		return c.json({ success: false, error: "验证码格式不正确" }, 400);
+	}
+	if (password.length < 6 || password.length > 128) {
+		return c.json({ success: false, error: "密码长度须为 6-128 位" }, 400);
+	}
+
+	const result = await registerWithPhoneAndPassword(c, phone, code, password);
 	if (result instanceof Response) return result;
 
 	const validated = AuthResponseSchema.parse(result);

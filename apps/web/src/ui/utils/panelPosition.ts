@@ -1,12 +1,65 @@
 import type { CSSProperties } from 'react'
 
+import { useUIStore, type CanvasToolbarPosition } from '../uiStore'
+
 // ── 底部居中工具栏（FloatingNav 横向化）上方弹出面板的定位 ──────────────
 // 面板锚定在触发项的水平中心 anchorX 正上方，向上生长；底边固定在工具栏之上。
 export const FLOATING_BAR_BOTTOM = 18   // 工具栏距视窗底部
 export const FLOATING_BAR_HEIGHT = 58   // 工具栏自身高度（pill）
 export const FLOATING_BAR_GAP = 12      // 面板底边与工具栏顶部的间隙
+// 工具栏停靠在左侧/右侧时，弹出面板与视窗边缘的间距 = 工具栏厚度 + 间隙。
+const SIDE_PANEL_INSET = 60
 export const BOTTOM_BAR_PANEL_HEIGHT_SCALE = 2 / 3
 export const BOTTOM_BAR_PANEL_VIEWPORT_MARGIN = 24
+
+/** 当前画布工具栏停靠位置（uiStore 单例，运行时可切换并持久化）。 */
+export function currentCanvasToolbarPosition(): CanvasToolbarPosition {
+  return useUIStore.getState().canvasToolbarPosition ?? 'bottom'
+}
+
+/** 工具栏容器在三种停靠位置下的 fixed 定位样式。 */
+export function floatingBarPositionStyle(position: CanvasToolbarPosition): CSSProperties {
+  if (position === 'left') {
+    return {
+      position: 'fixed',
+      left: 'calc(12px + var(--tc-asset-drawer-width, 0px))',
+      top: '50%',
+      transform: 'translateY(-50%)',
+      zIndex: 300,
+      transition: 'left 220ms ease',
+    }
+  }
+  if (position === 'right') {
+    return {
+      position: 'fixed',
+      right: 'calc(12px + var(--tc-ai-chat-reserved-width, 0px))',
+      top: '50%',
+      transform: 'translateY(-50%)',
+      zIndex: 300,
+      transition: 'right 220ms ease',
+    }
+  }
+  return {
+    position: 'fixed',
+    bottom: FLOATING_BAR_BOTTOM,
+    left: BOTTOM_BAR_LAYOUT_CENTER,
+    transform: 'translateX(-50%)',
+    zIndex: 300,
+    transition: 'left 220ms ease',
+  }
+}
+
+/** 工具栏在左右两侧时，弹出面板贴着工具栏内侧、垂直居中展开。 */
+function sideBarPanelStyle(position: 'left' | 'right', zIndex?: number): CSSProperties {
+  const inset = `calc(${SIDE_PANEL_INSET}px + var(${position === 'left' ? '--tc-asset-drawer-width' : '--tc-ai-chat-reserved-width'}, 0px))`
+  return {
+    position: 'fixed',
+    top: '50%',
+    ...(position === 'left' ? { left: inset } : { right: inset }),
+    transform: 'translateY(-50%)',
+    zIndex: zIndex ?? 200,
+  }
+}
 
 /**
  * 底部工具栏在可用画布区域内的实时中心。
@@ -65,11 +118,13 @@ export function bottomBarPanelMetrics(
   }
 }
 
-/** 返回锚定在 anchorX 正上方、向上生长的 fixed 定位样式 */
+/** 返回锚定在 anchorX 正上方、向上生长的 fixed 定位样式；工具栏在左右两侧时改为贴边弹出。 */
 export function bottomBarPanelStyle(
   anchorX?: number | null,
   opts?: { zIndex?: number; halfWidth?: number },
 ): CSSProperties {
+  const position = currentCanvasToolbarPosition()
+  if (position !== 'bottom') return sideBarPanelStyle(position, opts?.zIndex)
   const half = typeof opts?.halfWidth === 'number' ? opts.halfWidth : 180
   const viewportW = typeof window !== 'undefined' ? window.innerWidth : 1280
   let left = typeof anchorX === 'number' && Number.isFinite(anchorX) ? anchorX : viewportW / 2
@@ -94,6 +149,8 @@ export function bottomBarPanelStyle(
 export function bottomBarCenteredPanelStyle(
   opts?: { zIndex?: number; halfWidth?: number },
 ): CSSProperties {
+  const position = currentCanvasToolbarPosition()
+  if (position !== 'bottom') return sideBarPanelStyle(position, opts?.zIndex)
   const half = typeof opts?.halfWidth === 'number' ? opts.halfWidth : 180
   const margin = 12
   const safeInset = `min(${half + margin}px, 50vw)`

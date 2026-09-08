@@ -13,8 +13,10 @@ import {
   IconVolume,
   IconVolumeOff,
 } from '@tabler/icons-react'
-import type { PublicAssetDto } from '../api/server'
+import type { CommerceProductDto, PublicAssetDto } from '../api/server'
+import { apiFetch, API_BASE } from '../api/server'
 import { useAuth } from '../auth/store'
+import { buildMembershipPlanCards } from './account/membershipPlanViewModel'
 import { hostedAssetUrl } from '../config/objectStorageAssets'
 import { ManagedImage } from '../domain/resource-runtime/components/ManagedImage'
 import { createMediaPlaybackRequestController } from '../utils/mediaPlayback'
@@ -28,7 +30,7 @@ import { useHomepagePreviewSnapshot } from './homepagePreviewSnapshot'
 import './portal.css'
 import './NeoHomePage.css'
 
-const HERO_VIDEO_URL = hostedAssetUrl('gen/videos/phone_11dd9f14a3c25ed8947cd76e12fdc0123ea17f972ad99cf25d4d4abcdfda2272/20260521/24ff1d29-89df-4e95-b4f5-c9e8e895c715.mp4')
+const HERO_VIDEO_URL = 'https://neoai-online.neodomain.cn/dify/prod/2080546083299860480/workflow/videos/a8d13252eddb32f7021ec00753f560ad.mp4'
 const HERO_POSTER_URL = hostedAssetUrl('static/portal/tc-home-hero-v2-20260722.webp')
 
 const PRODUCTION_VISUALS = [
@@ -155,6 +157,7 @@ export function NeoHomePageSurface({
   const rootRef = React.useRef<HTMLDivElement | null>(null)
   const videoRef = React.useRef<HTMLVideoElement | null>(null)
   const shouldPlayRef = React.useRef(true)
+  const auth = useAuth()
   const playbackController = React.useMemo(() => createMediaPlaybackRequestController(), [])
   const [immersive, setImmersive] = React.useState(false)
   const [playing, setPlaying] = React.useState(true)
@@ -163,6 +166,7 @@ export function NeoHomePageSurface({
   const [videoError, setVideoError] = React.useState('')
   const [activeVideoIndex, setActiveVideoIndex] = React.useState(0)
   const [progress, setProgress] = React.useState(0)
+  const [membershipPlans, setMembershipPlans] = React.useState<CommerceProductDto[] | null>(null)
   const heroWorks = React.useMemo<HeroWork[]>(() => {
     const published = showcase.map(toHeroWork).filter((item): item is HeroWork => Boolean(item))
     if (published.length > 0) return published.slice(0, 7)
@@ -182,6 +186,30 @@ export function NeoHomePageSurface({
   React.useEffect(() => {
     if (activeVideoIndex >= heroWorks.length) setActiveVideoIndex(0)
   }, [activeVideoIndex, heroWorks.length])
+
+  React.useEffect(() => {
+    let active = true
+    void apiFetch(`${API_BASE}/public/membership/plans`)
+      .then(async (response) => {
+        if (!active) return
+        if (!response.ok) {
+          setMembershipPlans(null)
+          return
+        }
+        const body: unknown = await response.json().catch(() => null)
+        const items = body && typeof body === 'object' && !Array.isArray(body)
+          ? (body as { items?: unknown }).items
+          : null
+        setMembershipPlans(Array.isArray(items) ? items as CommerceProductDto[] : null)
+      })
+      .catch(() => { if (active) setMembershipPlans(null) })
+    return () => { active = false }
+  }, [])
+
+  const membershipPlanCards = React.useMemo(
+    () => buildMembershipPlanCards(membershipPlans ?? [], 'monthly').cards,
+    [membershipPlans],
+  )
 
   const playHeroVideo = React.useCallback((video: HTMLVideoElement): void => {
     void playbackController.play(video).then((result) => {
@@ -222,6 +250,14 @@ export function NeoHomePageSurface({
     }
     spaNavigate(href)
   }, [onNavigate])
+
+  const startMembership = React.useCallback((): void => {
+    if (!auth.token && onRequestLogin) {
+      onRequestLogin()
+      return
+    }
+    navigate('/pricing')
+  }, [auth.token, navigate, onRequestLogin])
 
   const scrollToSection = React.useCallback((sectionId: string): void => {
     const root = rootRef.current
@@ -483,6 +519,43 @@ export function NeoHomePageSurface({
             ) : null}
           </div>
         </section>
+
+        {membershipPlanCards.length > 0 ? (
+          <section className="neo-home-pricing" id="neo-home-pricing" aria-labelledby="neo-home-pricing-title">
+            <div className="neo-home-section-heading">
+              <span className="neo-home-section-heading__index">Pricing</span>
+              <h2 className="neo-home-section-heading__title" id="neo-home-pricing-title">选择你的创作套餐</h2>
+              <p className="neo-home-section-heading__subtitle">开通即得本月积分，会员期内每日赠送积分，当日有效；年付套餐在账户中心切换查看。</p>
+            </div>
+            <div className="neo-home-pricing__grid">
+              {membershipPlanCards.map((card) => {
+                const variant = card.variants[0]
+                return (
+                  <article className={`neo-home-pricing__card${card.featured ? ' is-featured' : ''}`} key={card.product.id}>
+                    <div className="neo-home-pricing__card-head">
+                      <strong className="neo-home-pricing__card-title">{card.product.title}</strong>
+                      {card.badge ? <span className="neo-home-pricing__card-badge">{card.badge}</span> : null}
+                    </div>
+                    {variant ? (
+                      <div className="neo-home-pricing__card-price">
+                        <strong>¥{Math.round(variant.priceCents / 100).toLocaleString('zh-CN')}</strong>
+                        <span>/ 月</span>
+                      </div>
+                    ) : null}
+                    {card.product.subtitle ? <p className="neo-home-pricing__card-summary">{card.product.subtitle}</p> : null}
+                    <ul className="neo-home-pricing__card-features">
+                      {card.features.slice(0, 4).map((feature) => <li key={feature}>{feature}</li>)}
+                    </ul>
+                    <button className="neo-home-pricing__card-cta" type="button" onClick={startMembership}>
+                      立即开通
+                      <IconArrowRight className="neo-home-pricing__card-cta-icon" size={14} stroke={1.8} />
+                    </button>
+                  </article>
+                )
+              })}
+            </div>
+          </section>
+        ) : null}
 
         <section className="neo-home-community" aria-labelledby="neo-home-community-title">
           <div className="neo-home-section-heading">

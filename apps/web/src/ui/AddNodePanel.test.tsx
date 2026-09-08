@@ -31,14 +31,12 @@ describe('AddNodePanel admin workflow catalog', () => {
     vi.stubGlobal('crypto', { randomUUID: () => 'dynamic-workflow-test-id' })
   })
 
-  it('expands templates and every atomic workflow node in the second-level category', () => {
+  it('expands templates and every atomic workflow node in the orchestration catalog', () => {
     render(
       <MantineProvider>
         <AddNodePanel className="add-node-panel-test" />
       </MantineProvider>,
     )
-
-    fireEvent.click(screen.getByRole('button', { name: /AI 编排/ }))
 
     expect(screen.getByRole('button', { name: /空白智能体工作流/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /文档 → 动态 15 秒视频/ })).toBeInTheDocument()
@@ -62,19 +60,18 @@ describe('AddNodePanel admin workflow catalog', () => {
     expect(screen.getByRole('button', { name: /空白智能体工作流/ })).toHaveClass('add-node-panel-button')
   })
 
-  it('merges creation and media nodes into one creation category', () => {
+  it('no longer lists creation nodes after they moved to the floating nav toolbar', () => {
     render(<MantineProvider><AddNodePanel /></MantineProvider>)
 
-    expect(screen.getByRole('button', { name: /^创作\s*9$/ })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /创作素材/ })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /媒体处理/ })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /^(文本|Text)$/ })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /^(图像|Image)$/ })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /^(视频|Video)$/ })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /^(音频|Audio) Beta$/ })).toBeInTheDocument()
+    expect(screen.getByText('AI 编排')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^(文本|Text)$/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^(图像|Image)$/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^(视频|Video)$/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^(音频|Audio) Beta$/ })).not.toBeInTheDocument()
+    expect(screen.queryByText('创作')).not.toBeInTheDocument()
   })
 
-  it('keeps the shell size stable while category content scrolls internally', () => {
+  it('keeps the shell size stable while catalog content scrolls internally', () => {
     const expectedMetrics = bottomBarPanelMetrics(BOTTOM_BAR_PANEL_WIDTH.regular)
     const { container } = render(
       <MantineProvider>
@@ -90,17 +87,10 @@ describe('AddNodePanel admin workflow catalog', () => {
     expect(shell?.style.height).toBe(`${expectedMetrics.height}px`)
     expect(shell?.style.maxHeight).toBe(`${expectedMetrics.height}px`)
     expect(actions?.hasAttribute('data-panel-scroll')).toBe(true)
-
-    fireEvent.click(screen.getByRole('button', { name: /AI 编排/ }))
-
-    expect(shell?.style.width).toBe(`${expectedMetrics.width}px`)
-    expect(shell?.style.height).toBe(`${expectedMetrics.height}px`)
-    expect(shell?.style.maxHeight).toBe(`${expectedMetrics.height}px`)
   })
 
   it('creates the unified dynamic document video workflow from the catalog action', () => {
     render(<MantineProvider><AddNodePanel /></MantineProvider>)
-    fireEvent.click(screen.getByRole('button', { name: /AI 编排/ }))
     fireEvent.click(screen.getByRole('button', { name: /文档 → 动态 15 秒视频/ }))
 
     const workflowNodes = useRFStore.getState().nodes.filter((node) => (
@@ -119,7 +109,6 @@ describe('AddNodePanel admin workflow catalog', () => {
 
   it('creates the canonical one-click film workflow instead of the legacy document prompt graph', () => {
     render(<MantineProvider><AddNodePanel /></MantineProvider>)
-    fireEvent.click(screen.getByRole('button', { name: /AI 编排/ }))
     fireEvent.click(screen.getByRole('button', { name: /一键成片 · 完整成片/ }))
 
     const workflowNodes = useRFStore.getState().nodes.filter((node) => (

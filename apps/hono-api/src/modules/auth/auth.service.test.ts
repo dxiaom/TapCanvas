@@ -235,15 +235,15 @@ describe("auth login bonus wiring", () => {
 		});
 	});
 
-	it("supports username password login when password is configured", async () => {
+	it("supports phone password login when password is configured", async () => {
 		const passwordRecord = await createPasswordRecord("123456");
 		prisma.users.findMany.mockResolvedValue([{
-			id: "tapcanvas_admin",
-			login: "admin",
-			name: "TapCanvas Admin",
+			id: "phone_user_1",
+			login: "13800138000",
+			name: "用户8000",
 			avatar_url: null,
 			email: null,
-			phone: "+8613800138000",
+			phone: "13800138000",
 			guest: 0,
 			disabled: 0,
 			password_hash: passwordRecord.hash,
@@ -253,14 +253,14 @@ describe("auth login bonus wiring", () => {
 
 		const result = await loginWithCredentials(
 			createContext(),
-			"admin",
+			"13800138000",
 			"123456",
 		);
 
 		expect(prisma.users.update).toHaveBeenCalled();
 		expect(result).toMatchObject({
 			token: "mock-token",
-			user: expect.objectContaining({ login: "admin", hasPassword: true, role: "admin" }),
+			user: expect.objectContaining({ login: "13800138000", hasPassword: true, role: "admin" }),
 		});
 	});
 

@@ -864,6 +864,9 @@ func RelayTask(c *gin.Context) {
 		task.PrivateData.BillingSource = relayInfo.BillingSource
 		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 		task.PrivateData.TokenId = relayInfo.TokenId
+		// 持久化本次实际使用的渠道 key（多 key 渠道轮询时需要用它查询上游，
+		// 否则轮询会回落到原始 Key 串，多 key 场景会产生非法 Authorization 头）。
+		task.PrivateData.Key = relayInfo.ApiKey
 		task.PrivateData.BillingContext = &model.TaskBillingContext{
 			ModelPrice:      relayInfo.PriceData.ModelPrice,
 			GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,

@@ -53,13 +53,15 @@ import {
 } from '../accountApi'
 import { AccountRewardsView } from './AccountRewardsView'
 import { AccountCreditsView } from './AccountCreditsView'
+import { MembershipPlansView } from './MembershipPlansView'
 import { McpIntegrationView } from './McpIntegrationView'
 import './account-center.css'
 
-export type AccountCenterTabKey = 'profile' | 'rewards' | 'works' | 'likes' | 'messages' | 'credits' | 'mcp' | 'devices' | 'accounts'
+export type AccountCenterTabKey = 'profile' | 'plans' | 'rewards' | 'works' | 'likes' | 'messages' | 'credits' | 'mcp' | 'devices' | 'accounts'
 
 const TABS: Array<{ key: AccountCenterTabKey; label: string; icon: typeof IconUser }> = [
   { key: 'profile', label: '个人信息', icon: IconUser },
+  { key: 'plans', label: '会员套餐', icon: IconCrown },
   { key: 'rewards', label: '赚取积分', icon: IconGift },
   { key: 'works', label: '我的作品', icon: IconFolder },
   { key: 'likes', label: '我的点赞', icon: IconHeart },
@@ -645,11 +647,12 @@ export default function AccountCenterDialog({
             </header>
             <div className="account-center-content__body">
               {tab === 'profile' ? <ProfileView onChanged={() => void refreshOverview()} /> : null}
+              {tab === 'plans' ? <MembershipPlansView overview={overview} onPurchased={refreshOverview} /> : null}
               {tab === 'rewards' ? <AccountRewardsView guestRestricted={guestRestricted} initialCheckIn={overview?.checkIn ?? null} onCheckInChanged={updateCheckIn} /> : null}
               {tab === 'works' ? <WorksGrid /> : null}
               {tab === 'likes' ? <LikesGrid /> : null}
               {tab === 'messages' ? <MessagesView onUnreadChange={updateUnreadCount} /> : null}
-              {tab === 'credits' ? <AccountCreditsView /> : null}
+              {tab === 'credits' ? <AccountCreditsView membership={overview?.membership ?? null} /> : null}
               {tab === 'mcp' ? <McpIntegrationView /> : null}
               {tab === 'devices' ? <DevicesView onCurrentRevoked={finishLogout} /> : null}
               {tab === 'accounts' ? <AccountsView onAddAccount={onAddAccount} /> : null}

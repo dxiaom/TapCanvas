@@ -40,6 +40,11 @@ export type WorkerEnv = Record<string, unknown> & {
 	ALIYUN_EMAIL_ACCESS_KEY_SECRET?: string;
 	ALIYUN_EMAIL_FROM?: string;
 	ALIYUN_EMAIL_FROM_ALIAS?: string;
+	ALIYUN_SMS_ACCESS_KEY_ID?: string;
+	ALIYUN_SMS_ACCESS_KEY_SECRET?: string;
+	ALIYUN_SMS_SCHEME_NAME?: string;
+	ALIYUN_SMS_SIGN_NAME?: string;
+	ALIYUN_SMS_TEMPLATE_CODE?: string;
 	SORA_UNWATERMARK_ENDPOINT?: string;
 	// Object storage. Both provider contracts may be present; this switch selects one.
 	OBJECT_STORAGE_PROVIDER?: "tos" | "r2";
@@ -84,8 +89,6 @@ export type WorkerEnv = Record<string, unknown> & {
 	VIDEO_AUTHORING_DRIVE_STALE_MS?: string;
 	AGENT_TRACE_CAPTURE_POLICY?: "structural" | "diagnostic" | "full";
 	NEW_API_INTERNAL_BASE_URL?: string;
-	NEW_API_PUBLIC_BASE_URL?: string;
-	NEW_API_RECOMMENDED_PROVIDER_BASE_URL?: string;
 	NEW_API_INTERNAL_TOKEN?: string;
 	NEW_API_USD_EXCHANGE_RATE?: string;
 	NEW_API_SQL_DSN?: string;
@@ -138,6 +141,29 @@ export type WorkerEnv = Record<string, unknown> & {
 	WECOM_TICKET_FEISHU_MENTION_MOBILES?: string;
 	WECOM_TICKET_BRAND_NAME?: string;
 	COMMERCE_PLATFORM_OWNER_ID?: string;
+	// 微信支付 V3（商家直连）。由 node-env.ts 从 process.env 显式投影，未配置时支付接口显式报错。
+	WECHAT_PAY_MCH_ID?: string;
+	WECHAT_PAY_APP_ID?: string;
+	WECHAT_PAY_MCH_SERIAL_NO?: string;
+	WECHAT_PAY_API_V3_KEY?: string;
+	WECHAT_PAY_NOTIFY_URL?: string;
+	// PEM 凭据：优先内嵌 PEM，其次文件路径（wechat-pay.service resolvePemMaterial）。
+	WECHAT_PAY_PRIVATE_KEY?: string;
+	WECHAT_PAY_PRIVATE_KEY_FILE?: string;
+	WECHAT_PAY_PLATFORM_PUBLIC_KEY?: string;
+	WECHAT_PAY_PLATFORM_PUBLIC_KEY_FILE?: string;
+	WECHAT_PAY_MCH_CERT_PEM?: string;
+	WECHAT_PAY_MCH_CERT_FILE?: string;
+	// 支付宝当面付（公钥模式 RSA2）。由 node-env.ts 从 process.env 显式投影，未配置时支付接口显式报错。
+	ALIPAY_APP_ID?: string;
+	// 应用私钥（PKCS8，支持单行裸 base64 或完整 PEM）。
+	ALIPAY_PRIVATE_KEY?: string;
+	// 支付宝公钥（异步通知与网关响应验签用）。
+	ALIPAY_ALIPAY_PUBLIC_KEY?: string;
+	// 网关地址，缺省 https://openapi.alipay.com/gateway.do。
+	ALIPAY_GATEWAY?: string;
+	// 异步通知地址，必须 HTTPS 公网可达。
+	ALIPAY_NOTIFY_URL?: string;
 };
 
 export type AppEnv = {

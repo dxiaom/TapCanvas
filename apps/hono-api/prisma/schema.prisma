@@ -429,6 +429,7 @@ model merchants {
   created_at   String
   updated_at   String
   users        users          @relation(fields: [owner_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  orders       orders[]
   product_skus product_skus[]
   products     products[]
 
@@ -682,6 +683,7 @@ model product_skus {
   status      String        @default("active")
   created_at  String
   updated_at  String
+  order_items order_items[]
   merchants   merchants     @relation(fields: [merchant_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
   users       users         @relation(fields: [owner_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
   products    products      @relation(fields: [product_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
@@ -704,6 +706,8 @@ model products {
   cover_image_url      String?
   created_at           String
   updated_at           String
+  order_entitlements   order_entitlements[]
+  order_items          order_items[]
   product_entitlements product_entitlements[]
   product_images       product_images[]
   product_skus         product_skus[]
@@ -867,6 +871,7 @@ model subscriptions {
   id                        String                      @id
   owner_id                  String
   plan_code                 String
+  source_order_id           String?
   status                    String                      @default("active")
   start_at                  String
   end_at                    String
@@ -889,6 +894,7 @@ model subscriptions {
   subscription_quota_events subscription_quota_events[]
   membership_credit_grants  membership_credit_grants[]
   users                     users                       @relation(fields: [owner_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  orders                    orders?                     @relation(fields: [source_order_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@index([owner_id, status, start_at, end_at], map: "idx_subscriptions_owner_status_time")
   @@index([status, next_credit_grant_at], map: "idx_subscriptions_membership_credit_due")
@@ -1231,6 +1237,10 @@ model users {
   model_profiles                                    model_profiles[]
   model_providers                                   model_providers[]
   model_tokens                                      model_tokens[]
+  order_entitlements                                order_entitlements[]
+  order_status_events                               order_status_events[]
+  orders                                            orders[]
+  payments                                          payments[]
   points_accounts                                   points_accounts?
   points_ledger                                     points_ledger[]
   product_entitlements                              product_entitlements[]
@@ -1987,4 +1997,145 @@ model prompt_library_crawl_targets {
 
   @@unique([run_id, source_url], map: "idx_prompt_library_crawl_targets_run_url")
   @@index([run_id, status, created_at], map: "idx_prompt_library_crawl_targets_run_status")
+}
+
+// ---- 支付域（微信 Native 扫码第一期；结构对齐历史设计，发货记录驱动个人会员开通） ----
+
+model orders {
+  id                  String                @id
+  owner_id            String
+  merchant_id         String
+  order_no            String                @unique
+  status              String                @default("pending_payment")
+  payment_status      String                @default("unpaid")
+  currency            String                @default("CNY")
+  total_amount_cents  Int                   @default(0)
+  paid_amount_cents   Int                   @default(0)
+  refund_amount_cents Int                   @default(0)
+  refund_status       String?
+  refund_reason       String?
+  buyer_note          String?
+  paid_at             String?
+  canceled_at         String?
+  created_at          String
+  updated_at          String
+  order_entitlements  order_entitlements[]
+  order_items         order_items[]
+  order_status_events order_status_events[]
+  payments            payments[]
+  subscriptions       subscriptions[]
+  merchants           merchants             @relation(fields: [merchant_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  users               users                 @relation(fields: [owner_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([merchant_id, created_at(sort: Desc)], map: "idx_orders_merchant_created")
+  @@index([owner_id, created_at(sort: Desc)], map: "idx_orders_owner_created")
+  @@index([owner_id, payment_status, created_at(sort: Desc)], map: "idx_orders_owner_payment_status")
+  @@index([owner_id, status, created_at(sort: Desc)], map: "idx_orders_owner_status")
+}
+
+model order_items {
+  id                       String               @id
+  order_id                 String
+  product_id               String
+  sku_id                   String?
+  title_snapshot           String
+  sku_name_snapshot        String?
+  unit_price_cents         Int                  @default(0)
+  quantity                 Int                  @default(1)
+  total_price_cents        Int                  @default(0)
+  cover_image_url_snapshot String?
+  created_at               String
+  updated_at               String
+  order_entitlements       order_entitlements[]
+  orders                   orders               @relation(fields: [order_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  products                 products             @relation(fields: [product_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  product_skus             product_skus?        @relation(fields: [sku_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([order_id], map: "idx_order_items_order")
+  @@index([product_id], map: "idx_order_items_product")
+}
+
+model order_entitlements {
+  id               String      @id
+  owner_id         String
+  order_id         String
+  order_item_id    String
+  product_id       String
+  entitlement_type String
+  status           String
+  result_json      String?
+  created_at       String
+  updated_at       String
+  orders           orders      @relation(fields: [order_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  order_items      order_items @relation(fields: [order_item_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users            users       @relation(fields: [owner_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  products         products    @relation(fields: [product_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([order_item_id, entitlement_type], map: "uk_order_entitlements_item_type")
+  @@index([owner_id, created_at(sort: Desc)], map: "idx_order_entitlements_owner_created")
+}
+
+model order_status_events {
+  id           String  @id
+  order_id     String
+  owner_id     String
+  from_status  String?
+  to_status    String
+  event_type   String
+  reason       String?
+  payload_json String?
+  created_at   String
+  orders       orders  @relation(fields: [order_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users        users   @relation(fields: [owner_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([order_id, created_at], map: "idx_order_status_events_order_created")
+  @@index([owner_id, created_at(sort: Desc)], map: "idx_order_status_events_owner_created")
+}
+
+model payments {
+  id                  String              @id
+  owner_id            String
+  order_id            String
+  provider            String
+  trade_type          String
+  out_trade_no        String              @unique
+  prepay_id           String?
+  transaction_id      String?
+  status              String              @default("created")
+  total_amount_cents  Int                 @default(0)
+  currency            String              @default("CNY")
+  refund_amount_cents Int                 @default(0)
+  refund_status       String?
+  refund_reason       String?
+  raw_request_json    String?
+  raw_response_json   String?
+  created_at          String
+  updated_at          String
+  succeeded_at        String?
+  closed_at           String?
+  payment_callbacks   payment_callbacks[]
+  orders              orders              @relation(fields: [order_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  users               users               @relation(fields: [owner_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([order_id, created_at(sort: Desc)], map: "idx_payments_order_created")
+  @@index([owner_id, status, created_at(sort: Desc)], map: "idx_payments_owner_status_created")
+  @@index([transaction_id], map: "idx_payments_transaction_id")
+}
+
+model payment_callbacks {
+  id              String    @id
+  payment_id      String?
+  provider        String
+  event_type      String
+  out_trade_no    String?
+  transaction_id  String?
+  signature_valid Int       @default(0)
+  payload_json    String
+  headers_json    String?
+  error_message   String?
+  created_at      String
+  payments        payments? @relation(fields: [payment_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([out_trade_no, created_at(sort: Desc)], map: "idx_payment_callbacks_out_trade_created")
+  @@index([payment_id, created_at(sort: Desc)], map: "idx_payment_callbacks_payment_created")
 }

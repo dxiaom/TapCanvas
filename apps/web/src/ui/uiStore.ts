@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { ChapterCreativeOverride } from '../api/server'
+import { applyCanvasCursor, type CanvasCursorId } from './canvasCursor'
 
 const PUBLIC_API_KEY_STORAGE_KEY = 'tapcanvas_public_api_key'
 const PUBLIC_VENDOR_CANDIDATES_STORAGE_KEY = 'tapcanvas_public_vendor_candidates'
@@ -213,6 +214,51 @@ export type ActivePanel =
   | 'project-materials'
   | null
 
+// 画布工具栏（FloatingNav）停靠位置：默认底部，可切到画布左侧/右侧（纵向排列）。
+export type CanvasToolbarPosition = 'bottom' | 'left' | 'right'
+
+const CANVAS_TOOLBAR_POSITION_STORAGE_KEY = 'tapcanvas_canvas_toolbar_position'
+
+function readStoredCanvasToolbarPosition(): CanvasToolbarPosition {
+  if (typeof window === 'undefined') return 'bottom'
+  try {
+    const raw = String(window.localStorage.getItem(CANVAS_TOOLBAR_POSITION_STORAGE_KEY) || '').trim().toLowerCase()
+    return raw === 'left' || raw === 'right' ? raw : 'bottom'
+  } catch {
+    return 'bottom'
+  }
+}
+
+function writeStoredCanvasToolbarPosition(next: CanvasToolbarPosition) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(CANVAS_TOOLBAR_POSITION_STORAGE_KEY, next)
+  } catch {
+    // ignore
+  }
+}
+
+const CANVAS_CURSOR_STORAGE_KEY = 'tapcanvas_canvas_cursor'
+
+function readStoredCanvasCursor(): CanvasCursorId {
+  if (typeof window === 'undefined') return 'arrow-a'
+  try {
+    const raw = String(window.localStorage.getItem(CANVAS_CURSOR_STORAGE_KEY) || '').trim()
+    return raw === 'arrow-b' || raw === 'arrow-c' ? raw : 'arrow-a'
+  } catch {
+    return 'arrow-a'
+  }
+}
+
+function writeStoredCanvasCursor(next: CanvasCursorId) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(CANVAS_CURSOR_STORAGE_KEY, next)
+  } catch {
+    // ignore
+  }
+}
+
 export type AssetPanelMaterialCategory = 'docs' | 'texts' | 'all'
 
 export type AssetPanelFocusRequest = {
@@ -320,6 +366,12 @@ type UIState = {
   // 底部居中工具栏（FloatingNav 横向化）上方弹出面板时，记录触发项的水平中心，面板据此居中。
   panelAnchorX: number | null
   setPanelAnchorX: (x: number | null) => void
+  // 画布工具栏停靠位置（持久化到 localStorage，供 FloatingNav 与弹出面板定位共用）。
+  canvasToolbarPosition: CanvasToolbarPosition
+  setCanvasToolbarPosition: (p: CanvasToolbarPosition) => void
+  // 画布光标预设（持久化到 localStorage，默认 A 经典黑箭头）。
+  canvasCursor: CanvasCursorId
+  setCanvasCursor: (id: CanvasCursorId) => void
   paramNodeId: string | null
   openParamFor: (id: string) => void
   closeParam: () => void
@@ -556,6 +608,19 @@ export const useUIStore = create<UIState>((set, get) => ({
   setPanelAnchorX: (x) => set((state) => {
     const next = typeof x === 'number' && Number.isFinite(x) ? x : null
     return state.panelAnchorX === next ? state : { panelAnchorX: next }
+  }),
+  canvasToolbarPosition: readStoredCanvasToolbarPosition(),
+  setCanvasToolbarPosition: (p) => set((state) => {
+    if (state.canvasToolbarPosition === p) return state
+    writeStoredCanvasToolbarPosition(p)
+    return { canvasToolbarPosition: p }
+  }),
+  canvasCursor: readStoredCanvasCursor(),
+  setCanvasCursor: (id) => set((state) => {
+    if (state.canvasCursor === id) return state
+    writeStoredCanvasCursor(id)
+    applyCanvasCursor(id)
+    return { canvasCursor: id }
   }),
   paramNodeId: null,
   openParamFor: (id) => set({ paramNodeId: id }),

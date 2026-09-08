@@ -167,7 +167,7 @@ export function VideoToolEditorPanel({
             })
           } : undefined}
         >
-          <video src={videoUrl} preload="metadata" controls={!selectionRequired} playsInline />
+          <video src={videoUrl} crossOrigin="anonymous" preload="metadata" controls={!selectionRequired} playsInline />
           {[...rects, ...(draft ? [draft] : [])].map((rect, index) => (
             <span
               key={rect.id}

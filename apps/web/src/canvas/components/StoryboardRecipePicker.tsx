@@ -71,7 +71,7 @@ export function StoryboardRecipePicker(props: {
 
   return (
     <NodeToolbar nodeId={props.groupId} position={Position.Top} align="center" isVisible>
-      <Paper p="sm" radius="md" withBorder shadow="md" style={{ maxWidth: 'min(94vw, 1180px)' }}>
+      <Paper className="glass" p="sm" radius="md" withBorder shadow="md" style={{ maxWidth: 'min(94vw, 1180px)' }}>
         {/* 顶部控件：智能创作（一键出片，含视频）/ 时长 / 估算 */}
         <Group justify="space-between" wrap="nowrap" gap="md" mb="sm">
           <Group gap="md" wrap="nowrap">

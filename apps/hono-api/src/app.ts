@@ -32,7 +32,11 @@ import { billingRouter } from "./modules/billing/billing.routes";
 import { userAdminRouter } from "./modules/user-admin/user-admin.routes";
 import { projectAdminRouter } from "./modules/project-admin/project-admin.routes";
 import { productRouter } from "./modules/product/product.routes";
+import { membershipPublicRouter } from "./modules/product/membership-public.routes";
 import { commerceRouter } from "./modules/commerce/commerce.routes";
+import { orderRouter } from "./modules/order/order.routes";
+import { wechatPayRouter } from "./modules/wechat-pay/wechat-pay.routes";
+import { alipayRouter } from "./modules/alipay/alipay.routes";
 import { materialRouter } from "./modules/material/material.routes";
 import { memoryRouter } from "./modules/memory/memory.routes";
 import { dreaminaRouter } from "./modules/dreamina/dreamina.routes";
@@ -139,6 +143,7 @@ export async function createTapCanvasApp(): Promise<OpenAPIHono<AppEnv>> {
 					"Authorization",
 					"Accept",
 					"Range",
+					"Cache-Control",
 					"X-API-Key",
 					"tenant-id",
 					"terminal",
@@ -331,6 +336,11 @@ export async function createTapCanvasApp(): Promise<OpenAPIHono<AppEnv>> {
 	// External API keys & public endpoints
 	app.route("/api-keys", apiKeyRouter);
 	// One-time bootstrap route precedes the API-key-protected /public router.
+	// 免登录套餐目录必须先于 /public 前缀路由挂载：
+	// publicApiRouter 对 /public/* 全量挂 apiKeyAuthMiddleware，后注册会被前缀路由先捕获并强制鉴权。
+	app.route("/public/membership", membershipPublicRouter);
+
+	// 公开 API（/public/*，统一 apiKey 鉴权，用于第三方/API Key 调用）
 	app.route("/public/codex/pairings", codexPairingPublicRouter);
 	app.route("/public", publicApiRouter);
 
@@ -401,6 +411,9 @@ export async function createTapCanvasApp(): Promise<OpenAPIHono<AppEnv>> {
 	// Commerce routes
 	app.route("/products", productRouter);
 	app.route("/commerce", commerceRouter);
+	app.route("/orders", orderRouter);
+	app.route("/wechat-pay", wechatPayRouter);
+	app.route("/alipay", alipayRouter);
 	app.route("/materials", materialRouter);
 	app.route("/memory", memoryRouter);
 	app.route("/dreamina", dreaminaRouter);

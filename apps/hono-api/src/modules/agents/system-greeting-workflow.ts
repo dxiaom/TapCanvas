@@ -145,6 +145,17 @@ function assertReservedIdentity(currentOwnerId: string | null | undefined, owner
 }
 
 export async function syncBuiltInGreetingWorkflow(db: PrismaClient, ownerId: string): Promise<void> {
+	// 用户删除内置工作流时会在 agent_builtin_capability_settings 落一条
+	// enabled=0 的墓碑（capability_id=内置工作流 id）。删除属于用户明确意图，
+	// 启动同步必须尊重该意图，不得用保留 ID 复活被删的内置工作流。
+	const tombstone = await db.agent_builtin_capability_settings.findUnique({
+		where: { capability_id: BUILTIN_GREETING_WORKFLOW.id },
+		select: { enabled: true },
+	});
+	if (tombstone && tombstone.enabled !== 1) {
+		console.log(`[startup] built-in greeting workflow skipped (deleted by user): ${BUILTIN_GREETING_WORKFLOW.flowId}`);
+		return;
+	}
 	const definition = createBuiltInGreetingWorkflowDefinition();
 	const [existingProject, existingFlow, existingVersion, existingAttachment] = await Promise.all([
 		db.projects.findUnique({

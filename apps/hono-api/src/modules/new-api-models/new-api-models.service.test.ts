@@ -26,7 +26,6 @@ const env = {
 	DB: {},
 	JWT_SECRET: "test-secret",
 	NEW_API_INTERNAL_BASE_URL: "http://new-api.test",
-	NEW_API_PUBLIC_BASE_URL: "http://gateway.test:4455",
 	NEW_API_INTERNAL_TOKEN: "test-token",
 } as unknown as WorkerEnv;
 
@@ -86,14 +85,6 @@ describe("new-api model catalog", () => {
 			configuredChannelCount: 0,
 			executableModelCount: 0,
 			reasons: ["no_configured_channels"],
-			setupUrl: "http://gateway.test:4455/console/channel",
-			recommendedProvider: {
-				name: "鲁班 API",
-				baseUrl: "https://tt-api.lluban.com/",
-				registerUrl: "https://tt-api.lluban.com/register",
-				topupUrl: "https://tt-api.lluban.com/console/topup",
-				tokenUrl: "https://tt-api.lluban.com/console/token",
-			},
 		});
 		expect(fetchWithHttpDebugLog).toHaveBeenCalledWith(
 			expect.anything(),

@@ -38,6 +38,10 @@ function createVideoElement(): HTMLVideoElement {
   element.preload = 'metadata'
   element.loop = true
   element.playsInline = true
+  // 与 videoFrameExtractor（截图帧工具）保持同一 CORS 模式：crossOrigin=anonymous。
+  // 否则播放器以 no-cors 拉流的 opaque 缓存会被截图器的 cors 请求命中，导致
+  // “截取首帧/尾帧/当前帧”报 CORS 错误（即使资产域响应头本身正常）。
+  element.crossOrigin = 'anonymous'
   element.setAttribute('aria-hidden', 'true')
   element.style.position = 'absolute'
   element.style.inset = '0'

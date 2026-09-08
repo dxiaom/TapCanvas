@@ -4,14 +4,21 @@ import { loadStoryboardRecipes } from "./storyboard-recipes.service";
 
 export function registerStoryboardRecipeRoutes(router: OpenAPIHono<AppEnv>) {
   router.get("/storyboard/recipes", async (c) => {
+    // 零隐式兜底：recipes.json 缺失/损坏属于部署不完整，必须显式失败暴露根因，
+    // 静默返回 [] 会让"分镜配方"能力以空列表的形式不可见地消失。
     try {
       const recipes = await loadStoryboardRecipes();
       return c.json(recipes, 200);
     } catch (err) {
-      // Degrade gracefully for the picker, but surface the cause so a missing/
-      // unreadable recipes.json (e.g. wrong runtime path) isn't invisible.
       console.error("[storyboard-recipes] failed to load recipes.json:", err);
-      return c.json([], 200);
+      return c.json(
+        {
+          error: "分镜配方数据加载失败（recipes.json 缺失或损坏）",
+          code: "storyboard_recipes_unavailable",
+          details: err instanceof Error ? err.message : String(err),
+        },
+        500,
+      );
     }
   });
 }

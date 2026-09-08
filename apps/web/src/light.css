@@ -59,8 +59,8 @@
   --tc-run-info-border: rgba(59, 130, 246, 0.18);
 
   --tc-asset-card-bg: #f1f5f9;
-  --tc-node-toolbar-bg: rgba(255, 255, 255, 0.97);
-  --tc-node-toolbar-border: rgba(15, 23, 42, 0.08);
+  --tc-node-toolbar-bg: rgba(255, 255, 255, 0.52);
+  --tc-node-toolbar-border: rgba(15, 23, 42, 0.1);
   --tc-node-toolbar-shadow: 0 22px 48px rgba(15, 23, 42, 0.12);
   --tc-node-settings-dropdown-bg: rgba(255, 255, 255, 0.98);
   --tc-node-settings-dropdown-border: rgba(15, 23, 42, 0.08);
@@ -118,7 +118,7 @@
   background: #ffffff !important;
   color: var(--mantine-color-text) !important;
 }
-:root[data-mantine-color-scheme="light"] .mantine-Paper-root[data-with-border]:not(.template-panel-shell):not(.template-panel-card):not(.template-space):not(.template-detail):not(.tc-canvas__selection-action-bar-card) {
+:root[data-mantine-color-scheme="light"] .mantine-Paper-root[data-with-border]:not(.template-panel-shell):not(.template-panel-card):not(.template-space):not(.template-detail):not(.tc-canvas__selection-action-bar-card):not(.glass) {
   border: none !important;
   box-shadow: 0 15px 40px rgba(15, 23, 42, 0.08);
 }
@@ -134,15 +134,16 @@
 }
 
 :root[data-mantine-color-scheme="light"] .glass {
-  background: rgba(255, 255, 255, 0.9) !important;
-  border: none !important;
-  box-shadow: 0 25px 60px rgba(15, 23, 42, 0.12);
-  backdrop-filter: blur(10px) !important;
-  -webkit-backdrop-filter: blur(10px) !important;
+  /* Apple 玻璃（浅色）：半透明白 + 高斯模糊 + 饱和度提升 + 发丝描边 + 顶部高光 */
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0.46)) !important;
+  border: 1px solid rgba(17, 18, 21, 0.08) !important;
+  box-shadow: 0 16px 48px rgba(15, 23, 42, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(22px) saturate(180%) !important;
+  -webkit-backdrop-filter: blur(22px) saturate(180%) !important;
 }
 
 :root[data-mantine-color-scheme="light"] .mantine-Paper-root[data-with-border].workflow-history-panel-shell.glass {
-  background: #ffffff !important;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.66), rgba(255, 255, 255, 0.55)) !important;
 }
 
 :root[data-mantine-color-scheme="light"] .panel-arrow {
@@ -179,7 +180,8 @@
 
 /* Canvas perf: backdrop blur is expensive while the graph is moving underneath */
 .tc-canvas[data-dragging="true"] .glass,
-.tc-canvas[data-dragging="true"] .react-flow__controls {
+.tc-canvas[data-dragging="true"] .react-flow__controls,
+.tc-canvas[data-dragging="true"] .tc-task-node__toolbar-frame {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
 }

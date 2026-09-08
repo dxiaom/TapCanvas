@@ -18,6 +18,43 @@ import { StatusBadge } from '../StatusBadge'
 import CanvasEntryButton from '../CanvasEntryButton'
 import { getPathnameForStatsSection, parseStatsSectionFromPathname, type StatsSection } from './statsRoutes'
 
+// 各管理分区面板按需加载：仅管理员访问的后台页面，避免把全部面板打进首屏 chunk。
+// 注意：system（运行时诊断）面板依赖的开源版已删除文件（agent-diagnostics/AgentApiExecutionChain）
+// 无法恢复，暂不接入；接入前需先补齐其依赖。
+const StatsAccountManagement = React.lazy(() => import('./account/StatsAccountManagement'))
+const StatsHomepageManagement = React.lazy(() => import('./StatsHomepageManagement'))
+const StatsProjectManagement = React.lazy(() => import('./projects/StatsProjectManagement'))
+const StatsPromptLibraryManagement = React.lazy(() => import('./prompts/StatsPromptLibraryManagement'))
+const StatsAgentsManagement = React.lazy(() => import('./system/agents/StatsAgentsManagement'))
+const StatsKnowledgeManagement = React.lazy(() => import('./knowledge/StatsKnowledgeManagement'))
+const StatsSkillManagement = React.lazy(() => import('./skills/StatsSkillManagement'))
+const StatsTeamManagement = React.lazy(() => import('./team/StatsTeamManagement'))
+
+const ADMIN_SECTION_META: ReadonlyArray<{ value: Exclude<StatsSection, 'overview' | 'users' | 'task-logs'>; label: string }> = [
+  { value: 'account', label: '账号配置' },
+  { value: 'homepage', label: '首页运营' },
+  { value: 'projects', label: '项目管理' },
+  { value: 'prompts', label: '提示词库' },
+  { value: 'agents', label: 'Agents' },
+  { value: 'knowledge', label: '知识库' },
+  { value: 'skills', label: '技能市场' },
+  { value: 'teams', label: '团队套餐' },
+]
+
+function AdminSectionSurface({ section }: { section: StatsSection }): JSX.Element | null {
+  switch (section) {
+    case 'account': return <StatsAccountManagement />
+    case 'homepage': return <StatsHomepageManagement />
+    case 'projects': return <StatsProjectManagement />
+    case 'prompts': return <StatsPromptLibraryManagement />
+    case 'agents': return <StatsAgentsManagement />
+    case 'knowledge': return <StatsKnowledgeManagement />
+    case 'skills': return <StatsSkillManagement />
+    case 'teams': return <StatsTeamManagement />
+    default: return null
+  }
+}
+
 type DauWindow = '7' | '30'
 type VendorWindow = '7' | '15' | '30'
 function Sparkline({ values }: { values: number[] }): JSX.Element | null {
@@ -236,6 +273,7 @@ export default function StatsFullPage(): JSX.Element {
                 { value: 'overview', label: '概览' },
                 { value: 'users', label: '用户管理' },
                 { value: 'task-logs', label: '任务日志' },
+                ...ADMIN_SECTION_META,
               ]}
             />
           </Stack>
@@ -249,6 +287,18 @@ export default function StatsFullPage(): JSX.Element {
           <Stack className="stats-page-task-logs" gap="md" pb="xl">
             <StatsTaskLogs className="stats-page-task-logs-management" />
           </Stack>
+        ) : section !== 'overview' ? (
+          <React.Suspense
+            fallback={
+              <Center className="stats-page-loading" mih={260}>
+                <StatePanel className="stats-page-loading-stack" title={$('加载中…')} tone="loading" />
+              </Center>
+            }
+          >
+            <Stack className="stats-page-admin-section" gap="md" pb="xl">
+              <AdminSectionSurface section={section} />
+            </Stack>
+          </React.Suspense>
         ) : loading && !stats ? (
           <Center className="stats-page-loading" mih={260}>
             <StatePanel className="stats-page-loading-stack" title={$('加载中…')} tone="loading" />

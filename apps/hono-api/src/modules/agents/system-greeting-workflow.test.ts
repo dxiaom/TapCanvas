@@ -22,6 +22,7 @@ describe("built-in greeting workflow", () => {
 			agent_capability_attachments: { create: attachmentCreate, update: vi.fn() },
 		};
 		const database = {
+			agent_builtin_capability_settings: { findUnique: vi.fn().mockResolvedValue(null) },
 			projects: { findUnique: vi.fn().mockResolvedValue(null) },
 			flows: { findUnique: vi.fn().mockResolvedValue(null) },
 			flow_versions: { findUnique: vi.fn().mockResolvedValue(null) },
@@ -53,6 +54,30 @@ describe("built-in greeting workflow", () => {
 				route_decisions_json: "[]",
 			}),
 		}));
+	});
+
+	it("skips recreation when the user deleted the built-in workflow (tombstone enabled=0)", async () => {
+		const projectCreate = vi.fn();
+		const flowCreate = vi.fn();
+		const attachmentCreate = vi.fn();
+		const database = {
+			agent_builtin_capability_settings: {
+				findUnique: vi.fn().mockResolvedValue({ enabled: 0 }),
+			},
+			projects: { findUnique: vi.fn() },
+			flows: { findUnique: vi.fn() },
+			flow_versions: { findUnique: vi.fn() },
+			agent_capability_attachments: { findUnique: vi.fn() },
+			$transaction: vi.fn(),
+		};
+
+		await syncBuiltInGreetingWorkflow(database as unknown as PrismaClient, "bootstrap-admin");
+
+		expect(database.projects.findUnique).not.toHaveBeenCalled();
+		expect(database.$transaction).not.toHaveBeenCalled();
+		expect(projectCreate).not.toHaveBeenCalled();
+		expect(flowCreate).not.toHaveBeenCalled();
+		expect(attachmentCreate).not.toHaveBeenCalled();
 	});
 
 	it("materializes a deterministic text artifact and standard workflow output", () => {

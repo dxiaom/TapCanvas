@@ -12,6 +12,11 @@ export type AppConfig = {
 	aliyunEmailAccessKeySecret: string | null;
 	aliyunEmailFrom: string | null;
 	aliyunEmailFromAlias: string | null;
+	aliyunSmsAccessKeyId: string | null;
+	aliyunSmsAccessKeySecret: string | null;
+	aliyunSmsSchemeName: string | null;
+	aliyunSmsSignName: string | null;
+	aliyunSmsTemplateCode: string | null;
 };
 
 export function getConfig(env: WorkerEnv): AppConfig {
@@ -27,5 +32,10 @@ export function getConfig(env: WorkerEnv): AppConfig {
 		aliyunEmailAccessKeySecret: env.ALIYUN_EMAIL_ACCESS_KEY_SECRET ?? null,
 		aliyunEmailFrom: env.ALIYUN_EMAIL_FROM ?? null,
 		aliyunEmailFromAlias: env.ALIYUN_EMAIL_FROM_ALIAS ?? "TapCanvas",
+		aliyunSmsAccessKeyId: env.ALIYUN_SMS_ACCESS_KEY_ID ?? null,
+		aliyunSmsAccessKeySecret: env.ALIYUN_SMS_ACCESS_KEY_SECRET ?? null,
+		aliyunSmsSchemeName: env.ALIYUN_SMS_SCHEME_NAME ?? null,
+		aliyunSmsSignName: env.ALIYUN_SMS_SIGN_NAME ?? null,
+		aliyunSmsTemplateCode: env.ALIYUN_SMS_TEMPLATE_CODE ?? null,
 	};
 }

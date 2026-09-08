@@ -4,9 +4,17 @@ import {
   listAccountCredits,
   type AccountCreditEntry,
   type AccountCreditsPage,
+  type AccountOverview,
 } from '../accountApi'
 
 type CreditEntryTone = 'credit' | 'deduct' | 'reserve' | 'release' | 'expire' | 'neutral'
+
+export type AccountMembershipCurrent = NonNullable<AccountOverview['membership']['current']>
+
+export type MembershipEntitlementMetric = {
+  label: string
+  value: string
+}
 
 export type CreditEntryPresentation = {
   label: string
@@ -72,6 +80,37 @@ export function presentCreditEntry(entry: Pick<AccountCreditEntry, 'type' | 'amo
   }
 }
 
+export function presentMembershipEntitlements(current: AccountMembershipCurrent): MembershipEntitlementMetric[] {
+  const metrics: MembershipEntitlementMetric[] = [
+    { label: '每月积分', value: formatCreditAmount(current.monthlyCredits) },
+    { label: '每日赠送', value: formatCreditAmount(current.dailyGiftCredits) },
+  ]
+  if (current.capacityLabel) metrics.push({ label: '动态算力', value: current.capacityLabel })
+  metrics.push({ label: '同时任务', value: creditNumber.format(Math.max(0, Math.trunc(current.concurrencyLimit))) })
+  return metrics
+}
+
+function MembershipPlanSummary({ current }: { current: AccountMembershipCurrent }): JSX.Element {
+  const metrics = presentMembershipEntitlements(current)
+  return (
+    <section className="account-membership-summary" aria-label="当前会员权益">
+      <div className="account-membership-summary__header">
+        <span className="account-membership-summary__label">当前套餐</span>
+        <strong className="account-membership-summary__plan">{current.planName}</strong>
+        <span className="account-membership-summary__validity">有效至 {formatTime(current.endAt)}</span>
+      </div>
+      <div className="account-membership-summary__metrics">
+        {metrics.map((metric) => (
+          <div className="account-membership-summary__metric" key={metric.label}>
+            <span className="account-membership-summary__metric-label">{metric.label}</span>
+            <strong className="account-membership-summary__metric-value">{metric.value}</strong>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function CreditSummary({ page }: { page: AccountCreditsPage }): JSX.Element {
   return (
     <div className="account-credits-summary" aria-label="当前积分余额">
@@ -117,7 +156,7 @@ function CreditLedgerRow({ entry }: { entry: AccountCreditEntry }): JSX.Element 
   )
 }
 
-export function AccountCreditsView(): JSX.Element {
+export function AccountCreditsView({ membership }: { membership?: AccountOverview['membership'] | null }): JSX.Element {
   const [items, setItems] = React.useState<AccountCreditEntry[]>([])
   const [page, setPage] = React.useState<AccountCreditsPage | null>(null)
   const [cursor, setCursor] = React.useState<string | null>(null)
@@ -171,6 +210,7 @@ export function AccountCreditsView(): JSX.Element {
 
   return (
     <div className="account-credits-view">
+      {membership?.current ? <MembershipPlanSummary current={membership.current} /> : null}
       <CreditSummary page={page} />
       {items.length === 0 ? (
         <div className="account-center-state"><span className="account-center-state__message">暂无积分记录</span></div>

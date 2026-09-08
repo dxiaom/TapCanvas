@@ -65,10 +65,13 @@ export function useTaskNodeTheme(): TaskNodeTheme {
     const quickActionHint = rgba(nodeShellText, 0.55)
     const mediaOverlayBackground = isDarkUi ? 'rgba(4, 7, 16, 0.92)' : 'rgba(246, 248, 255, 0.95)'
     const mediaOverlayText = nodeShellText
-    const toolbarBackground = isDarkUi ? 'rgba(4, 7, 16, 0.97)' : 'rgba(255,255,255,0.98)'
+    // 顶部工具栏：半透明玻璃底，模糊由 CSS backdrop-filter 提供（TopToolbar 内联样式缺省 0.6 白/深色）
+    const toolbarBackground = isDarkUi
+      ? 'linear-gradient(180deg, rgba(32,32,36,0.55), rgba(20,20,23,0.48))'
+      : 'linear-gradient(180deg, rgba(255,255,255,0.6), rgba(255,255,255,0.46))'
     const toolbarShadow = isDarkUi
-      ? '0 22px 45px rgba(0,0,0,0.6)'
-      : '0 22px 50px rgba(17,18,21,0.14)'
+      ? '0 22px 45px rgba(0,0,0,0.4)'
+      : '0 22px 50px rgba(17,18,21,0.12)'
     const subtleOverlayBackground = isDarkUi ? 'rgba(255,255,255,0.04)' : 'rgba(17,18,21,0.05)'
     const mediaFallbackSurface = isDarkUi ? 'rgba(3,6,12,0.92)' : 'rgba(244,247,255,0.95)'
     const mediaFallbackText = isDarkUi

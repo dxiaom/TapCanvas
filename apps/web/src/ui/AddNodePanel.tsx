@@ -11,13 +11,8 @@ import {
   IconCode,
   IconChecklist,
   IconCirclesRelation,
-  IconEye,
-  IconLayoutGrid,
   IconMovie,
-  IconMusic,
   IconPhoto,
-  IconScissors,
-  IconTable,
   IconTypography,
   IconVideo,
   IconSearch,
@@ -70,70 +65,35 @@ type AddNodeOption = Readonly<{
   videoWorkflowVariant?: VideoWorkflowExecutionVariant
 }>
 
-type AddNodeCategory = Readonly<{
-  id: 'creation' | 'orchestration'
-  label: string
-  description: string
-  Icon: typeof IconTypography
-  adminOnly: boolean
-  options: readonly AddNodeOption[]
-}>
-
-const ADD_NODE_CATEGORIES: readonly AddNodeCategory[] = [
-  {
-    id: 'creation',
-    label: '创作',
-    description: '文本、图像、音视频与镜头设计',
-    Icon: IconBoxMultiple,
-    adminOnly: false,
-    options: [
-      { id: 'text', kind: 'text', label: '文本', Icon: IconTypography, badge: null, action: 'node' },
-      { id: 'image', kind: 'image', label: '图像', Icon: IconPhoto, badge: null, action: 'node' },
-      { id: 'storyboard', kind: 'storyboard', label: '分镜编辑', Icon: IconLayoutGrid, badge: null, action: 'node' },
-      { id: 'shotTable', kind: 'shotTable', label: '分镜表', Icon: IconTable, badge: null, action: 'node' },
-      { id: 'directorConsole', kind: 'directorConsole', label: '导演台', Icon: IconMovie, badge: 'Beta', action: 'node' },
-      { id: 'video', kind: 'video', label: '视频', Icon: IconVideo, badge: null, action: 'node' },
-      { id: 'audio', kind: 'audio', label: '音频', Icon: IconMusic, badge: 'Beta', action: 'node' },
-      { id: 'videoAnalysis', kind: 'videoAnalysis', label: '视频分析', Icon: IconEye, badge: null, action: 'node' },
-      { id: 'videoCompose', kind: 'videoCompose', label: '视频合成', Icon: IconScissors, badge: 'Beta', action: 'node' },
-    ],
-  },
-  {
-    id: 'orchestration',
-    label: 'AI 编排',
-    description: '触发器、Agent 与工作流',
-    Icon: IconBinaryTree,
-    adminOnly: false,
-    options: [
-      { id: 'codex', kind: 'codex', label: 'Codex', Icon: IconBrandOpenai, badge: 'Beta', group: '智能体', action: 'node' },
-      { id: 'agentWorkflow', kind: null, label: '空白智能体工作流', Icon: IconSparkles, badge: 'Admin', group: '模板', action: 'agentWorkflow' },
-      { id: 'documentVideosWorkflow', kind: null, label: '文档 → 动态 15 秒视频', Icon: IconMovie, badge: 'Admin', group: '模板', action: 'documentVideosWorkflow' },
-      { id: 'oneClickFilmWorkflow', kind: null, label: '一键成片 · 完整成片', Icon: IconBinaryTree, badge: 'Admin', group: '模板', action: 'videoWorkflow', videoWorkflowScope: 'media_delivery', videoWorkflowVariant: 'full_video' },
-      { id: 'manualTrigger', kind: null, label: '手动触发器', Icon: IconAlarm, badge: 'Admin', group: '触发与输入', action: 'manualTrigger' },
-      { id: 'scheduleTrigger', kind: null, label: '定时触发器', Icon: IconAlarm, badge: 'Admin', group: '触发与输入', action: 'scheduleTrigger' },
-      { id: 'webhookTrigger', kind: null, label: 'Webhook 触发器', Icon: IconApiApp, badge: 'Admin', group: '触发与输入', action: 'webhookTrigger' },
-      { id: 'eventTrigger', kind: null, label: '事件触发器', Icon: IconCirclesRelation, badge: 'Admin', group: '触发与输入', action: 'eventTrigger' },
-      { id: 'workflowSource', kind: null, label: '输入来源', Icon: IconApiApp, badge: 'Admin', group: '触发与输入', action: 'atomicWorkflowNode', atomicPreset: 'source' },
-      { id: 'workflowTextInput', kind: null, label: '文本输入', Icon: IconTypography, badge: 'Admin', group: '触发与输入', action: 'atomicWorkflowNode', atomicPreset: 'textInput' },
-      { id: 'workflowAgent', kind: null, label: 'Agent 任务', Icon: IconBrain, badge: 'Admin', group: '智能体', action: 'atomicWorkflowNode', atomicPreset: 'agent' },
-      { id: 'workflowImageGeneration', kind: null, label: '图片生成', Icon: IconPhoto, badge: 'Admin', group: '媒体', action: 'atomicWorkflowNode', atomicPreset: 'imageGeneration' },
-      { id: 'workflowVideoGeneration', kind: null, label: '视频生成', Icon: IconVideo, badge: 'Admin', group: '媒体', action: 'atomicWorkflowNode', atomicPreset: 'videoGeneration' },
-      { id: 'workflowJavascript', kind: null, label: 'JavaScript 脚本', Icon: IconCode, badge: 'Admin', group: '数据处理', action: 'atomicWorkflowNode', atomicPreset: 'javascript' },
-      { id: 'workflowCollectionSplit', kind: null, label: '拆分为数据项', Icon: IconBoxMultiple, badge: 'Admin', group: '数据处理', action: 'atomicWorkflowNode', atomicPreset: 'collectionSplit' },
-      { id: 'workflowSkill', kind: null, label: 'Skill', Icon: IconSparkles, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'skill' },
-      { id: 'workflowKnowledgeSearch', kind: null, label: '知识检索', Icon: IconSearch, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'knowledgeSearch' },
-      { id: 'workflowKnowledgeRead', kind: null, label: '知识读取', Icon: IconBook2, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'knowledgeRead' },
-      { id: 'workflowToolInvocation', kind: null, label: '工具调用', Icon: IconTool, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'toolInvocation' },
-      { id: 'workflowTool', kind: null, label: '工具授权', Icon: IconTool, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'tool' },
-      { id: 'workflowControl', kind: null, label: '控制节点', Icon: IconCirclesRelation, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'control' },
-      { id: 'workflowCondition', kind: null, label: '条件分支', Icon: IconBinaryTree, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'condition' },
-      { id: 'workflowTerminal', kind: null, label: '明确终态', Icon: IconChecklist, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'terminal' },
-      { id: 'workflowSubworkflow', kind: null, label: '子工作流', Icon: IconCirclesRelation, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'subworkflow' },
-      { id: 'workflowHumanApproval', kind: null, label: '人工审批', Icon: IconUserCheck, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'humanApproval' },
-      { id: 'workflowArtifact', kind: null, label: '产物合同', Icon: IconBraces, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'artifact' },
-      { id: 'workflowDelivery', kind: null, label: '交付验收', Icon: IconChecklist, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'delivery' },
-    ],
-  },
+// 创作节点已直接平铺到底部工具栏（FloatingNav），此面板只承载 AI 编排节点。
+const ORCHESTRATION_NODE_OPTIONS: readonly AddNodeOption[] = [
+  { id: 'codex', kind: 'codex', label: 'Codex', Icon: IconBrandOpenai, badge: 'Beta', group: '智能体', action: 'node' },
+  { id: 'agentWorkflow', kind: null, label: '空白智能体工作流', Icon: IconSparkles, badge: 'Admin', group: '模板', action: 'agentWorkflow' },
+  { id: 'documentVideosWorkflow', kind: null, label: '文档 → 动态 15 秒视频', Icon: IconMovie, badge: 'Admin', group: '模板', action: 'documentVideosWorkflow' },
+  { id: 'oneClickFilmWorkflow', kind: null, label: '一键成片 · 完整成片', Icon: IconBinaryTree, badge: 'Admin', group: '模板', action: 'videoWorkflow', videoWorkflowScope: 'media_delivery', videoWorkflowVariant: 'full_video' },
+  { id: 'manualTrigger', kind: null, label: '手动触发器', Icon: IconAlarm, badge: 'Admin', group: '触发与输入', action: 'manualTrigger' },
+  { id: 'scheduleTrigger', kind: null, label: '定时触发器', Icon: IconAlarm, badge: 'Admin', group: '触发与输入', action: 'scheduleTrigger' },
+  { id: 'webhookTrigger', kind: null, label: 'Webhook 触发器', Icon: IconApiApp, badge: 'Admin', group: '触发与输入', action: 'webhookTrigger' },
+  { id: 'eventTrigger', kind: null, label: '事件触发器', Icon: IconCirclesRelation, badge: 'Admin', group: '触发与输入', action: 'eventTrigger' },
+  { id: 'workflowSource', kind: null, label: '输入来源', Icon: IconApiApp, badge: 'Admin', group: '触发与输入', action: 'atomicWorkflowNode', atomicPreset: 'source' },
+  { id: 'workflowTextInput', kind: null, label: '文本输入', Icon: IconTypography, badge: 'Admin', group: '触发与输入', action: 'atomicWorkflowNode', atomicPreset: 'textInput' },
+  { id: 'workflowAgent', kind: null, label: 'Agent 任务', Icon: IconBrain, badge: 'Admin', group: '智能体', action: 'atomicWorkflowNode', atomicPreset: 'agent' },
+  { id: 'workflowImageGeneration', kind: null, label: '图片生成', Icon: IconPhoto, badge: 'Admin', group: '媒体', action: 'atomicWorkflowNode', atomicPreset: 'imageGeneration' },
+  { id: 'workflowVideoGeneration', kind: null, label: '视频生成', Icon: IconVideo, badge: 'Admin', group: '媒体', action: 'atomicWorkflowNode', atomicPreset: 'videoGeneration' },
+  { id: 'workflowJavascript', kind: null, label: 'JavaScript 脚本', Icon: IconCode, badge: 'Admin', group: '数据处理', action: 'atomicWorkflowNode', atomicPreset: 'javascript' },
+  { id: 'workflowCollectionSplit', kind: null, label: '拆分为数据项', Icon: IconBoxMultiple, badge: 'Admin', group: '数据处理', action: 'atomicWorkflowNode', atomicPreset: 'collectionSplit' },
+  { id: 'workflowSkill', kind: null, label: 'Skill', Icon: IconSparkles, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'skill' },
+  { id: 'workflowKnowledgeSearch', kind: null, label: '知识检索', Icon: IconSearch, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'knowledgeSearch' },
+  { id: 'workflowKnowledgeRead', kind: null, label: '知识读取', Icon: IconBook2, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'knowledgeRead' },
+  { id: 'workflowToolInvocation', kind: null, label: '工具调用', Icon: IconTool, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'toolInvocation' },
+  { id: 'workflowTool', kind: null, label: '工具授权', Icon: IconTool, badge: 'Admin', group: '能力', action: 'atomicWorkflowNode', atomicPreset: 'tool' },
+  { id: 'workflowControl', kind: null, label: '控制节点', Icon: IconCirclesRelation, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'control' },
+  { id: 'workflowCondition', kind: null, label: '条件分支', Icon: IconBinaryTree, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'condition' },
+  { id: 'workflowTerminal', kind: null, label: '明确终态', Icon: IconChecklist, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'terminal' },
+  { id: 'workflowSubworkflow', kind: null, label: '子工作流', Icon: IconCirclesRelation, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'subworkflow' },
+  { id: 'workflowHumanApproval', kind: null, label: '人工审批', Icon: IconUserCheck, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'humanApproval' },
+  { id: 'workflowArtifact', kind: null, label: '产物合同', Icon: IconBraces, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'artifact' },
+  { id: 'workflowDelivery', kind: null, label: '交付验收', Icon: IconChecklist, badge: 'Admin', group: '控制与交付', action: 'atomicWorkflowNode', atomicPreset: 'delivery' },
 ]
 
 export default function AddNodePanel({ className }: { className?: string }): JSX.Element | null {
@@ -143,25 +103,15 @@ export default function AddNodePanel({ className }: { className?: string }): JSX
   const addNode = useRFStore(s => s.addNode)
   const addDirectorConsoleNode = useRFStore(s => s.addDirectorConsoleNode)
   const isAdmin = useIsAdmin()
-  const [activeCategoryId, setActiveCategoryId] = React.useState<AddNodeCategory['id']>('creation')
   const [query, setQuery] = React.useState('')
-  const categories = React.useMemo(
-    () => ADD_NODE_CATEGORIES
-      .filter((category) => !category.adminOnly || isAdmin)
-      .map((category) => ({
-        ...category,
-        options: category.options.filter((option) => isAdmin || option.badge !== 'Admin'),
-      }))
-      .filter((category) => category.options.length > 0),
+  const options = React.useMemo(
+    () => ORCHESTRATION_NODE_OPTIONS.filter((option) => isAdmin || option.badge !== 'Admin'),
     [isAdmin],
   )
-  const activeCategory = categories.find((category) => category.id === activeCategoryId) ?? categories[0]
   const normalizedQuery = query.trim().toLocaleLowerCase()
-  const visibleOptions = normalizedQuery
-    ? categories.flatMap((category) => category.options
-      .filter((option) => $(option.label).toLocaleLowerCase().includes(normalizedQuery))
-      .map((option) => ({ category, option })))
-    : (activeCategory?.options ?? []).map((option) => ({ category: activeCategory, option }))
+  const matchedOptions = normalizedQuery
+    ? options.filter((option) => $(option.label).toLocaleLowerCase().includes(normalizedQuery))
+    : options
 
   const mounted = active === 'add'
   const panelMetrics = bottomBarPanelMetrics(BOTTOM_BAR_PANEL_WIDTH.regular)
@@ -174,12 +124,6 @@ export default function AddNodePanel({ className }: { className?: string }): JSX
     }
     setActivePanel(null)
   }, [addNode, addDirectorConsoleNode, setActivePanel])
-
-  React.useEffect(() => {
-    if (!categories.some((category) => category.id === activeCategoryId)) {
-      setActiveCategoryId(categories[0]?.id ?? 'creation')
-    }
-  }, [activeCategoryId, categories])
 
   const addOneClickFilmWorkflow = React.useCallback((
     executionScope: VideoWorkflowExecutionScope,
@@ -356,73 +300,52 @@ export default function AddNodePanel({ className }: { className?: string }): JSX
                     size="xs"
                   />
                 </div>
-                <div className="add-node-panel-browser">
-                  <nav className="add-node-panel-categories" aria-label="节点分类">
-                    {categories.map((category) => (
-                      <UnstyledButton
-                        key={category.id}
-                        className={`add-node-panel-category${!normalizedQuery && category.id === activeCategory?.id ? ' add-node-panel-category--active' : ''}`}
-                        onClick={() => {
-                          setActiveCategoryId(category.id)
-                          setQuery('')
-                        }}
-                        aria-current={!normalizedQuery && category.id === activeCategory?.id ? 'page' : undefined}
-                      >
-                        <category.Icon className="add-node-panel-category-icon" size={15} aria-hidden="true" />
-                        <span className="add-node-panel-category-copy">
-                          <span className="add-node-panel-category-label">{category.label}</span>
-                          <span className="add-node-panel-category-count">{category.options.length}</span>
-                        </span>
-                      </UnstyledButton>
-                    ))}
-                  </nav>
-                  <section className="add-node-panel-options" aria-label={normalizedQuery ? '搜索结果' : activeCategory?.label}>
-                    <div className="add-node-panel-options-heading">
-                      <span className="add-node-panel-options-title">{normalizedQuery ? '搜索结果' : activeCategory?.label}</span>
-                      <span className="add-node-panel-options-description">
-                        {normalizedQuery ? `${visibleOptions.length} 个节点` : activeCategory?.description}
-                      </span>
-                    </div>
-                    <Stack className="add-node-panel-actions" gap={4} data-panel-scroll>
-                      {visibleOptions.map(({ category, option }, index) => {
-                        const previous = visibleOptions[index - 1]?.option
-                        const showGroup = !normalizedQuery && Boolean(option.group) && option.group !== previous?.group
-                        return (
-                          <React.Fragment key={`${category.id}:${option.id}`}>
-                            {showGroup ? <span className="add-node-panel-option-group">{option.group}</span> : null}
-                            <UnstyledButton
-                              className={`add-node-panel-button${option.action === 'videoWorkflow' ? ' add-node-panel-button--workflow' : ''}`}
-                              onClick={() => activateOption(option)}
-                            >
-                              <span className="add-node-panel-option-side add-node-panel-option-side--icon">
-                                <option.Icon className="add-node-panel-icon" size={16} aria-hidden="true" />
-                              </span>
-                              <span className="add-node-panel-option-copy">
-                                <span className="add-node-panel-option-label">{$(option.label)}</span>
-                                {normalizedQuery ? <span className="add-node-panel-option-category">{category.label}{option.group ? ' · ' + option.group : ''}</span> : null}
-                              </span>
-                              <span className="add-node-panel-option-side add-node-panel-option-side--badge">
-                                {option.badge ? (
-                                  <Badge
-                                    className="add-node-panel-option-badge"
-                                    size="xs"
-                                    variant="light"
-                                    color={option.badge === 'Admin' ? 'gray' : 'orange'}
-                                  >
-                                    {option.badge}
-                                  </Badge>
-                                ) : null}
-                              </span>
-                            </UnstyledButton>
-                          </React.Fragment>
-                        )
-                      })}
-                      {visibleOptions.length === 0 ? (
-                        <span className="add-node-panel-empty">没有匹配的节点</span>
-                      ) : null}
-                    </Stack>
-                  </section>
-                </div>
+                <section className="add-node-panel-options" aria-label={normalizedQuery ? '搜索结果' : 'AI 编排'}>
+                  <div className="add-node-panel-options-heading">
+                    <span className="add-node-panel-options-title">{normalizedQuery ? '搜索结果' : 'AI 编排'}</span>
+                    <span className="add-node-panel-options-description">
+                      {normalizedQuery ? `${matchedOptions.length} 个节点` : '触发器、Agent 与工作流'}
+                    </span>
+                  </div>
+                  <Stack className="add-node-panel-actions" gap={4} data-panel-scroll>
+                    {matchedOptions.map((option, index) => {
+                      const previous = matchedOptions[index - 1]
+                      const showGroup = !normalizedQuery && Boolean(option.group) && option.group !== previous?.group
+                      return (
+                        <React.Fragment key={option.id}>
+                          {showGroup ? <span className="add-node-panel-option-group">{option.group}</span> : null}
+                          <UnstyledButton
+                            className={`add-node-panel-button${option.action === 'videoWorkflow' ? ' add-node-panel-button--workflow' : ''}`}
+                            onClick={() => activateOption(option)}
+                          >
+                            <span className="add-node-panel-option-side add-node-panel-option-side--icon">
+                              <option.Icon className="add-node-panel-icon" size={16} aria-hidden="true" />
+                            </span>
+                            <span className="add-node-panel-option-copy">
+                              <span className="add-node-panel-option-label">{$(option.label)}</span>
+                              {normalizedQuery && option.group ? <span className="add-node-panel-option-category">{option.group}</span> : null}
+                            </span>
+                            <span className="add-node-panel-option-side add-node-panel-option-side--badge">
+                              {option.badge ? (
+                                <Badge
+                                  className="add-node-panel-option-badge"
+                                  size="xs"
+                                  variant="light"
+                                  color={option.badge === 'Admin' ? 'gray' : 'orange'}
+                                >
+                                  {option.badge}
+                                </Badge>
+                              ) : null}
+                            </span>
+                          </UnstyledButton>
+                        </React.Fragment>
+                      )
+                    })}
+                    {matchedOptions.length === 0 ? (
+                      <span className="add-node-panel-empty">没有匹配的节点</span>
+                    ) : null}
+                  </Stack>
+                </section>
               </div>
             </PanelCard>
           </div>

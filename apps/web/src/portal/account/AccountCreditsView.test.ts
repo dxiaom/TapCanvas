@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { presentCreditEntry } from './AccountCreditsView'
+import { presentCreditEntry, presentMembershipEntitlements } from './AccountCreditsView'
 
 describe('account credit ledger presentation', () => {
   it('distinguishes a reservation from an actual deduction', () => {
@@ -31,5 +31,36 @@ describe('account credit ledger presentation', () => {
       amountText: '−30',
       explanation: '直接扣减',
     })
+  })
+})
+
+describe('membership entitlement presentation', () => {
+  const baseCurrent = {
+    planCode: 'membership:sys_membership_plus:sys_membership_plus-membership-monthly',
+    planName: 'PLUS',
+    startAt: '2026-09-01T00:00:00.000Z',
+    endAt: '2026-10-01T00:00:00.000Z',
+    billingCycle: 'monthly' as const,
+    monthlyCredits: 9900,
+    dailyGiftCredits: 350,
+    concurrencyLimit: 6,
+    capacityLabel: '',
+  }
+
+  it('lists monthly and daily credits plus concurrency for fixed-credit plans', () => {
+    expect(presentMembershipEntitlements(baseCurrent)).toEqual([
+      { label: '每月积分', value: '9,900' },
+      { label: '每日赠送', value: '350' },
+      { label: '同时任务', value: '6' },
+    ])
+  })
+
+  it('keeps the dynamic capacity label between credits and concurrency', () => {
+    expect(presentMembershipEntitlements({ ...baseCurrent, capacityLabel: '6.4w' })).toEqual([
+      { label: '每月积分', value: '9,900' },
+      { label: '每日赠送', value: '350' },
+      { label: '动态算力', value: '6.4w' },
+      { label: '同时任务', value: '6' },
+    ])
   })
 })

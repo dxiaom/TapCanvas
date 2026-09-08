@@ -4363,6 +4363,157 @@ export async function setAdminUserMembership(userId: string, payload: {
   return mapAdminUserDto(body)
 }
 
+// ============= Membership purchase (orders + wechat native pay) =============
+
+export type OrderItemDto = {
+  id: string
+  orderId: string
+  productId: string
+  skuId: string | null
+  titleSnapshot: string
+  skuNameSnapshot: string | null
+  unitPriceCents: number
+  quantity: number
+  totalPriceCents: number
+  coverImageUrlSnapshot: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type OrderDto = {
+  id: string
+  ownerId: string
+  merchantId: string
+  orderNo: string
+  status: 'pending_payment' | 'paid' | 'canceled' | 'refund_pending' | 'partially_refunded' | 'refunded'
+  paymentStatus: 'unpaid' | 'paid' | 'refund_pending' | 'partially_refunded' | 'refunded'
+  currency: string
+  totalAmountCents: number
+  paidAmountCents: number
+  refundAmountCents: number
+  refundStatus: string | null
+  refundReason: string | null
+  buyerNote: string | null
+  paidAt: string | null
+  canceledAt: string | null
+  createdAt: string
+  updatedAt: string
+  items: OrderItemDto[]
+}
+
+export type WechatNativePaymentDto = {
+  paymentId: string
+  orderId: string
+  orderNo: string
+  outTradeNo: string
+  prepayId: string | null
+  codeUrl: string
+  expiresAt: string | null
+  createdAt: string
+}
+
+export type OrderPaymentReconcileDto = {
+  orderId: string
+  outTradeNo: string
+  paymentStatus: 'pending' | 'success'
+  orderPaymentStatus: 'unpaid' | 'paid'
+  tradeState: string | null
+  transactionId: string | null
+}
+
+export async function createMembershipOrder(payload: {
+  items: Array<{ productId: string; skuId?: string; quantity?: number }>
+}): Promise<OrderDto> {
+  const r = await apiFetch(`${API_BASE}/orders`, withAuth({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }))
+  const body: unknown = await r.json().catch(() => null)
+  if (!r.ok) {
+    throw new Error(getErrorMessageFromBody(body) || `create order failed: ${r.status}`)
+  }
+  return body as OrderDto
+}
+
+export async function getOrderById(orderId: string): Promise<OrderDto> {
+  const r = await apiFetch(`${API_BASE}/orders/${encodeURIComponent(orderId)}`, withAuth())
+  const body: unknown = await r.json().catch(() => null)
+  if (!r.ok) {
+    throw new Error(getErrorMessageFromBody(body) || `get order failed: ${r.status}`)
+  }
+  return body as OrderDto
+}
+
+export async function createWechatNativePayment(orderId: string): Promise<WechatNativePaymentDto> {
+  const r = await apiFetch(`${API_BASE}/wechat-pay/native/create`, withAuth({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ orderId }),
+  }))
+  const body: unknown = await r.json().catch(() => null)
+  if (!r.ok) {
+    throw new Error(getErrorMessageFromBody(body) || `create wechat payment failed: ${r.status}`)
+  }
+  return body as WechatNativePaymentDto
+}
+
+export async function reconcileOrderPayment(orderId: string): Promise<OrderPaymentReconcileDto> {
+  const r = await apiFetch(`${API_BASE}/wechat-pay/orders/${encodeURIComponent(orderId)}/reconcile`, withAuth({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  }))
+  const body: unknown = await r.json().catch(() => null)
+  if (!r.ok) {
+    throw new Error(getErrorMessageFromBody(body) || `reconcile payment failed: ${r.status}`)
+  }
+  return body as OrderPaymentReconcileDto
+}
+
+export type AlipayPrecreateDto = {
+  paymentId: string
+  orderId: string
+  orderNo: string
+  outTradeNo: string
+  qrCode: string
+  expiresAt: string | null
+  createdAt: string
+}
+
+export async function createAlipayTradePrecreate(orderId: string): Promise<AlipayPrecreateDto> {
+  const r = await apiFetch(`${API_BASE}/alipay/trade/precreate`, withAuth({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ orderId }),
+  }))
+  const body: unknown = await r.json().catch(() => null)
+  if (!r.ok) {
+    throw new Error(getErrorMessageFromBody(body) || `create alipay payment failed: ${r.status}`)
+  }
+  return body as AlipayPrecreateDto
+}
+
+export type AlipayReconcileDto = {
+  orderId: string
+  outTradeNo: string
+  paymentStatus: 'pending' | 'success'
+  orderPaymentStatus: 'unpaid' | 'paid'
+  tradeStatus: string | null
+  transactionId: string | null
+}
+
+export async function reconcileAlipayPayment(orderId: string): Promise<AlipayReconcileDto> {
+  const r = await apiFetch(`${API_BASE}/alipay/orders/${encodeURIComponent(orderId)}/reconcile`, withAuth({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  }))
+  const body: unknown = await r.json().catch(() => null)
+  if (!r.ok) {
+    throw new Error(getErrorMessageFromBody(body) || `reconcile alipay payment failed: ${r.status}`)
+  }
+  return body as AlipayReconcileDto
+}
+
 // ============= User credits / task log (admin) =============
 
 export type AdminUserCreditsOverviewDto = {
@@ -4893,18 +5044,6 @@ export async function exchangeGithub(code: string): Promise<AuthResponseDto> {
   return r.json()
 }
 
-export async function createGuestSession(nickname?: string): Promise<AuthResponseDto> {
-  const body = nickname ? { nickname } : {}
-  const r = await apiFetch(`${API_BASE}/auth/guest`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!r.ok) throw new Error(`guest login failed: ${r.status}`)
-  return r.json()
-}
-
 export async function requestEmailLoginCode(email: string): Promise<{ sent: boolean; expiresInSeconds?: number; devCode?: string }> {
   const r = await apiFetch(`${API_BASE}/auth/email/request`, {
     method: 'POST',
@@ -5011,6 +5150,46 @@ export async function loginWithCredentials(username: string, password: string): 
   const body = await parseAuthErrorBody(r)
   if (!r.ok) {
 		const msg = (body && (body.error || body.message)) || `credential login failed: ${r.status}`
+    throw new Error(msg)
+  }
+  return body as AuthResponseDto
+}
+
+export type SendPhoneVerifyCodeResult = Readonly<{
+  success: boolean
+  sent: boolean
+  expiresInSeconds?: number
+  devCode?: string
+}>
+
+export async function sendPhoneVerifyCode(phone: string): Promise<SendPhoneVerifyCodeResult> {
+  const r = await apiFetch(`${API_BASE}/auth/sms/send`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone }),
+  })
+  const body = (await parseAuthErrorBody(r)) as SendPhoneVerifyCodeResult | null
+  if (!r.ok) {
+    throw new Error((body && (body as { error?: string }).error) || `send sms verify code failed: ${r.status}`)
+  }
+  return body as SendPhoneVerifyCodeResult
+}
+
+export async function registerWithPhoneAndPassword(
+  phone: string,
+  code: string,
+  password: string,
+): Promise<AuthResponseDto> {
+  const r = await apiFetch(`${API_BASE}/auth/sms/register`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone, code, password }),
+  })
+  const body = await parseAuthErrorBody(r)
+  if (!r.ok) {
+    const msg = (body && (body.error || body.message)) || `sms register failed: ${r.status}`
     throw new Error(msg)
   }
   return body as AuthResponseDto
@@ -6590,14 +6769,6 @@ export const NewApiGatewayReadinessSchema = z.object({
     'no_configured_channels',
     'no_executable_models',
   ])),
-  setupUrl: z.string().url(),
-  recommendedProvider: z.object({
-    name: z.string().min(1),
-    baseUrl: z.string().url(),
-    registerUrl: z.string().url(),
-    topupUrl: z.string().url(),
-    tokenUrl: z.string().url(),
-  }),
 })
 
 export type NewApiGatewayReadinessDto = z.infer<typeof NewApiGatewayReadinessSchema>
@@ -9245,6 +9416,9 @@ function shouldUseDirectUpload(file: File): boolean {
   const ct = (file?.type || '').toLowerCase()
   if (ct.startsWith('video/')) return true
   if (ct.startsWith('audio/')) return true
+  // 图片也走 presigned 直传：中转链路（服务器同步转传 R2）跨境波动时
+  // 会顶到 EdgeOne 回源超时导致 524，直传绕开服务器与 CDN 超时限制。
+  if (ct.startsWith('image/')) return true
   if (typeof file.size === 'number' && file.size > DIRECT_UPLOAD_THRESHOLD_BYTES) return true
   return false
 }

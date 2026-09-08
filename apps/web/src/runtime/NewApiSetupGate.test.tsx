@@ -32,14 +32,6 @@ describe('NewApiSetupGate', () => {
       configuredChannelCount: 0,
       executableModelCount: 0,
       reasons: ['no_configured_channels'],
-      setupUrl: 'http://127.0.0.1:14455/console/channel',
-      recommendedProvider: {
-        name: '鲁班 API',
-        baseUrl: 'https://tt-api.lluban.com/',
-        registerUrl: 'https://tt-api.lluban.com/register',
-        topupUrl: 'https://tt-api.lluban.com/console/topup',
-        tokenUrl: 'https://tt-api.lluban.com/console/token',
-      },
     })
 
     render(<NewApiSetupGate />)
@@ -51,10 +43,8 @@ describe('NewApiSetupGate', () => {
     expect(screen.getAllByText('admin')).toHaveLength(2)
     expect(screen.getAllByText('123456')).toHaveLength(2)
     expect(screen.getByText('new-api 已有启用模型，但还没有配置可用的渠道 API Key。')).toBeTruthy()
-    expect(screen.getByRole('link', { name: '第 2 步：打开本机 new-api 渠道配置' }).getAttribute('href'))
-      .toBe('http://127.0.0.1:14455/console/channel')
-    expect(screen.getByRole('link', { name: '兑换额度' }).getAttribute('href'))
-      .toBe('https://tt-api.lluban.com/console/topup')
+    expect(screen.getByText('4')).toBeTruthy()
+    expect(screen.queryByRole('link')).toBeNull()
   })
 
   it('rechecks and releases the gate after configuration becomes executable', async () => {
@@ -65,14 +55,6 @@ describe('NewApiSetupGate', () => {
         configuredChannelCount: 0,
         executableModelCount: 0,
         reasons: ['no_configured_channels'],
-        setupUrl: 'http://127.0.0.1:14455/console/channel',
-        recommendedProvider: {
-          name: '鲁班 API',
-          baseUrl: 'https://tt-api.lluban.com/',
-          registerUrl: 'https://tt-api.lluban.com/register',
-          topupUrl: 'https://tt-api.lluban.com/console/topup',
-          tokenUrl: 'https://tt-api.lluban.com/console/token',
-        },
       })
       .mockResolvedValueOnce({
         ready: true,
@@ -80,14 +62,6 @@ describe('NewApiSetupGate', () => {
         configuredChannelCount: 1,
         executableModelCount: 2,
         reasons: [],
-        setupUrl: 'http://127.0.0.1:14455/console/channel',
-        recommendedProvider: {
-          name: '鲁班 API',
-          baseUrl: 'https://tt-api.lluban.com/',
-          registerUrl: 'https://tt-api.lluban.com/register',
-          topupUrl: 'https://tt-api.lluban.com/console/topup',
-          tokenUrl: 'https://tt-api.lluban.com/console/token',
-        },
       })
 
     render(<NewApiSetupGate />)
@@ -104,14 +78,6 @@ describe('NewApiSetupGate', () => {
       configuredChannelCount: number
       executableModelCount: number
       reasons: string[]
-      setupUrl: string
-      recommendedProvider: {
-        name: string
-        baseUrl: string
-        registerUrl: string
-        topupUrl: string
-        tokenUrl: string
-      }
     }) => void) | undefined
     getNewApiGatewayReadiness.mockReturnValue(new Promise((resolve) => {
       resolveReadiness = resolve
@@ -126,14 +92,6 @@ describe('NewApiSetupGate', () => {
       configuredChannelCount: 1,
       executableModelCount: 20,
       reasons: [],
-      setupUrl: 'http://127.0.0.1:14455/console/channel',
-      recommendedProvider: {
-        name: '鲁班 API',
-        baseUrl: 'https://tt-api.lluban.com/',
-        registerUrl: 'https://tt-api.lluban.com/register',
-        topupUrl: 'https://tt-api.lluban.com/console/topup',
-        tokenUrl: 'https://tt-api.lluban.com/console/token',
-      },
     })
 
     await waitFor(() => expect(getNewApiGatewayReadiness).toHaveBeenCalledTimes(1))

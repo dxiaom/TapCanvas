@@ -1827,10 +1827,13 @@ export function buildNewApiImageRequestShape(input: {
 				: null));
 
 	const rawQuality = normalizeCompactString(extras.quality)?.toLowerCase() ?? null;
+	// quality 是模型声明的可选维度：目录里没有 qualityOptions 的模型（如 agnes-image）
+	// 必须丢弃画布默认值，不能把 quality 透传给上游（否则上游报
+	// "quality is not supported by text image queue"）。
 	const pickedQuality = rawQuality
 		? (supportedQualities.length > 0
 			? (supportedQualities.find((q) => q.toLowerCase() === rawQuality) ?? null)
-			: rawQuality)
+			: null)
 		: (imageOptions?.defaultQuality ?? null);
 
 	const shape: NewApiImageRequestShape = {};
@@ -2143,6 +2146,14 @@ export function resolveTaskMaskUrl(extras: Record<string, unknown>): string | nu
 	return directMaskUrl || assetInputMaskUrl || null;
 }
 
+// ── Agnes 图像专用契约（https://www.agnes-ai.cn/zh-Hans/docs/agnes-image-25-flash）──
+// size=分辨率档位（1K/2K/3K/4K，必填）、ratio=宽高比、image=参考图 URL 数组；
+// 不支持 quality/resolution/n/user/顶层 response_format（响应格式需放 extra_body.response_format）。
+// 注意语义与画布相反：画布 shape.size 是宽高比、shape.resolution 是分辨率档位。
+export function isAgnesImageModel(modelKey: string): boolean {
+	return modelKey.trim().toLowerCase().startsWith("agnes-image");
+}
+
 export function buildNewApiImageGenerationBody(input: {
 	model: string;
 	prompt: string;
@@ -2157,6 +2168,36 @@ export function buildNewApiImageGenerationBody(input: {
 	user?: string;
 	layerDecomposition?: NewApiImageRequestShape["layerDecomposition"];
 }): Record<string, unknown> {
+	if (isAgnesImageModel(input.model)) {
+		const sizeTier = (
+			input.resolution ||
+			(typeof input.metadata?.imageSize === "string" ? input.metadata.imageSize : "") ||
+			""
+		).trim().toUpperCase();
+		const ratio =
+			typeof input.size === "string" && /^[0-9]+:[0-9]+$/.test(input.size.trim())
+				? input.size.trim()
+				: "";
+		const agnesBody: Record<string, unknown> = {
+			model: input.model,
+			prompt: input.prompt,
+		};
+		if (sizeTier) {
+			agnesBody.size = sizeTier;
+		}
+		if (ratio) {
+			agnesBody.ratio = ratio;
+		}
+		if (Array.isArray(input.referenceImages) && input.referenceImages.length > 0) {
+			const images = input.referenceImages
+				.map((imageUrl) => toAgnesUpstreamMediaUrl(imageUrl))
+				.filter((imageUrl) => imageUrl.length > 0);
+			if (images.length > 0) {
+				agnesBody.image = images;
+			}
+		}
+		return agnesBody;
+	}
 	const body: Record<string, unknown> = {
 		model: input.model,
 		prompt: input.prompt,
@@ -2226,6 +2267,26 @@ export function buildNewApiImageGenerationBody(input: {
 export function isGeminiNativeImageModel(modelKey: string): boolean {
 	return /gemini[^a-z0-9]*(?:.*?\b(?:flash|pro)\b.*?image|.*?\bimage\b)/i.test(modelKey)
 		|| /nano[-_]?banana/i.test(modelKey);
+}
+
+// Agnes 视频模型走专用 body 契约（mode/seconds/size/aspect_ratio），见视频分支。
+export function isAgnesVideoModel(modelKey: string): boolean {
+	return modelKey.trim().toLowerCase().startsWith("agnes-video");
+}
+
+// Agnes 上游（境外）下载不了 EdgeOne 国内加速域的媒体 URL（实测报
+// "media URL could not be downloaded"）。发给 agnes 的媒体链接统一改走
+// R2 的 Cloudflare 直连域（全球 anycast，上游必然可达）；画布内展示仍用加速域。
+const AGNES_UPSTREAM_MEDIA_URL_REWRITES: ReadonlyArray<readonly [string, string]> = [
+	["https://mirrorframe-updates.wavee.cn/", "https://mirrorframe-updates-1.wavee.cn/"],
+];
+
+function toAgnesUpstreamMediaUrl(url: string): string {
+	const trimmed = url.trim();
+	for (const [from, to] of AGNES_UPSTREAM_MEDIA_URL_REWRITES) {
+		if (trimmed.startsWith(from)) return to + trimmed.slice(from.length);
+	}
+	return trimmed;
 }
 
 // Extract text from Gemini's generateContent response, which new-api surfaces
@@ -3985,7 +4046,76 @@ async function runTaskViaNewApi(
 		let requestInit: RequestInit;
 		let requestPayload: Record<string, unknown>;
 
-		if (req.kind === "video_enhance") {
+		// ── Agnes 视频专用契约（https://www.agnes-ai.cn/zh-Hans/docs/agnes-video-25-flash）──
+		// 只接受 mode/seconds/size/aspect_ratio（及首尾帧、参考图/音频、seed）；
+		// 通用 OpenAI 视频 body 的 response_format/duration/resolution/metadata 会被上游拒绝。
+		if (isAgnesVideoModel(model)) {
+			const agnesFirstFrameUrl =
+				typeof extras.firstFrameUrl === "string" ? extras.firstFrameUrl.trim() : "";
+			const agnesLastFrameUrl =
+				typeof extras.lastFrameUrl === "string" ? extras.lastFrameUrl.trim() : "";
+			const hasKeyframe = Boolean(agnesFirstFrameUrl || agnesLastFrameUrl);
+			const hasReferenceMedia = refs.length > 0 || referenceAudios.length > 0;
+			const agnesMode = hasKeyframe ? "keyframe" : hasReferenceMedia ? "reference" : "text";
+			const agnesSeconds =
+				typeof seconds === "number" && Number.isFinite(seconds)
+					? String(Math.max(4, Math.min(12, Math.floor(seconds))))
+					: "5";
+			const agnesAspectRatio =
+				(typeof videoRequestShape.aspectRatio === "string" && videoRequestShape.aspectRatio.trim()) ||
+				(typeof videoRequestShape.size === "string" && /^[0-9]+:[0-9]+$/.test(videoRequestShape.size.trim())
+					? videoRequestShape.size.trim()
+					: "") ||
+				"16:9";
+			const agnesBody: Record<string, unknown> = {
+				model,
+				prompt: req.prompt,
+				mode: agnesMode,
+				seconds: agnesSeconds,
+				size: "720P",
+				aspect_ratio: agnesAspectRatio,
+			};
+			if (typeof req.seed === "number" && Number.isFinite(req.seed)) {
+				agnesBody.seed = Math.trunc(req.seed);
+			}
+			if (agnesMode === "keyframe") {
+				if (agnesFirstFrameUrl) agnesBody.first_frame = toAgnesUpstreamMediaUrl(agnesFirstFrameUrl);
+				if (agnesLastFrameUrl) agnesBody.last_frame = toAgnesUpstreamMediaUrl(agnesLastFrameUrl);
+				if (!agnesFirstFrameUrl && !agnesLastFrameUrl) {
+					throw new AppError("agnes keyframe 视频至少需要首帧或尾帧之一", {
+						status: 400,
+						code: "agnes_video_keyframe_missing_frame",
+						details: { upstreamRequestAttempted: false },
+					});
+				}
+			}
+			if (agnesMode === "reference") {
+				const agnesReferenceImages = refs
+					.map((u) => (typeof u === "string" ? u.trim() : ""))
+					.filter((u) => /^https?:\/\//i.test(u))
+					.map((u) => toAgnesUpstreamMediaUrl(u))
+					.slice(0, 5);
+				if (agnesReferenceImages.length > 0) agnesBody.images = agnesReferenceImages;
+				if (referenceAudios.length > 0) agnesBody.audios = referenceAudios.slice(0, 3);
+				if (!agnesBody.images && !agnesBody.audios) {
+					throw new AppError("agnes reference 视频至少需要一张参考图或一段参考音频", {
+						status: 400,
+						code: "agnes_video_reference_missing_media",
+						details: { upstreamRequestAttempted: false },
+					});
+				}
+			}
+			requestInit = {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${relay.token}`,
+					Accept: "application/json",
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(agnesBody),
+			};
+			requestPayload = agnesBody;
+		} else if (req.kind === "video_enhance") {
 			const ex = (extras || {}) as Record<string, any>;
 			const enhanceMetadata: Record<string, unknown> = {
 				video_url: ex.video_url ?? ex.videoUrl,

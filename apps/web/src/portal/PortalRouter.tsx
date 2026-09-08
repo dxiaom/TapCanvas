@@ -1,7 +1,7 @@
 import React from 'react'
 import { CanvasLoadingScreen } from '../ui/CanvasLoadingScreen'
 import { PortalAtmosphere } from './PortalAtmosphere'
-import { loadCanvasHubPage, loadNeoHomePage, loadNeoTvPage, loadPromptDetailPage, loadPromptLibraryPage, loadSkillPortalPage } from './portalRouteModules'
+import { loadCanvasHubPage, loadNeoHomePage, loadNeoTvPage, loadPricingPage, loadPromptDetailPage, loadPromptLibraryPage, loadSkillPortalPage } from './portalRouteModules'
 import './portal.css'
 
 const NeoHomePageLazy = React.lazy(loadNeoHomePage)
@@ -10,11 +10,13 @@ const CanvasHubPageLazy = React.lazy(loadCanvasHubPage)
 const SkillPortalPageLazy = React.lazy(loadSkillPortalPage)
 const PromptLibraryPageLazy = React.lazy(loadPromptLibraryPage)
 const PromptDetailPageLazy = React.lazy(loadPromptDetailPage)
+const PricingPageLazy = React.lazy(loadPricingPage)
 
-export type PortalPageRoute = 'home' | 'neo-tv' | 'prompts' | 'prompt-detail' | 'canvas-hub' | 'skills'
+export type PortalPageRoute = 'home' | 'neo-tv' | 'prompts' | 'prompt-detail' | 'canvas-hub' | 'skills' | 'pricing'
 
 export function resolvePortalPageRoute(pathname: string): PortalPageRoute | null {
   if (pathname === '/' || pathname === '/home' || pathname === '/home/') return 'home'
+  if (pathname === '/pricing' || pathname === '/pricing/') return 'pricing'
   if (pathname === '/skills' || pathname === '/skills/') return 'skills'
   if (pathname === '/prompts' || pathname === '/prompts/') return 'prompts'
   if (/^\/prompts\/[^/]+\/?$/.test(pathname)) return 'prompt-detail'
@@ -42,6 +44,7 @@ export function PortalRouter({ route }: { route: PortalPageRoute }): JSX.Element
           {route === 'skills' ? <SkillPortalPageLazy /> : null}
           {route === 'prompts' ? <PromptLibraryPageLazy /> : null}
           {route === 'prompt-detail' ? <PromptDetailPageLazy /> : null}
+          {route === 'pricing' ? <PricingPageLazy /> : null}
         </React.Suspense>
       </div>
     </div>

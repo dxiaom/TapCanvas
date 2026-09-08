@@ -375,6 +375,11 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	privateData := task.PrivateData
 	if privateData.Key != "" {
 		key = privateData.Key
+	} else if resolvedKey, _, keyErr := ch.GetNextEnabledKey(nil); keyErr == nil {
+		// 多 key 渠道的原始 Key 串含换行，直接用作 Authorization 头会产生
+		// net/http: invalid header field value；取一个干净的单 key（非多 key
+		// 渠道 GetNextEnabledKey 原样返回 Key，行为不变）。
+		key = resolvedKey
 	}
 	resp, err := adaptor.FetchTask(baseURL, key, map[string]any{
 		"task_id": task.GetUpstreamTaskID(),

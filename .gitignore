@@ -50,3 +50,16 @@ helloagents
 project-data
 
 cert
+
+# Local build artifacts / deploy bundles / secrets (never commit)
+apps/hono-api/dist-upload.zip
+apps/hono-api/hono-api-dist.zip
+apps/web/web-dist.zip
+apps/web/dist/
+apps/new-api/web/dist/
+apps/new-api/dist-bin/
+apps/media-worker/dist-bin/
+wxpay-cert.zip
+new-api-new.exe
+.edgeone/
+.sdd/

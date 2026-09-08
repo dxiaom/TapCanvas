@@ -61,7 +61,7 @@ describe('TopToolbar LibTV menu interaction', () => {
         <TopToolbar
           isVisible
           hasContent
-          toolbarBackground="#222"
+          toolbarBackground="rgba(32,32,36,0.55)"
           toolbarShadow="none"
           toolbarActionIconStyles={{ root: {}, icon: {} }}
           inlineDividerColor="#555"
@@ -98,7 +98,7 @@ describe('TopToolbar LibTV menu interaction', () => {
         <TopToolbar
           isVisible
           hasContent
-          toolbarBackground="#222"
+          toolbarBackground="rgba(32,32,36,0.55)"
           toolbarShadow="none"
           toolbarActionIconStyles={{ root: {}, icon: {} }}
           inlineDividerColor="#555"
@@ -132,7 +132,7 @@ describe('TopToolbar LibTV menu interaction', () => {
         <TopToolbar
           isVisible
           hasContent
-          toolbarBackground="#222"
+          toolbarBackground="rgba(32,32,36,0.55)"
           toolbarShadow="none"
           toolbarActionIconStyles={{ root: {}, icon: {} }}
           inlineDividerColor="#555"
@@ -160,7 +160,7 @@ describe('TopToolbar LibTV menu interaction', () => {
         <TopToolbar
           isVisible
           hasContent
-          toolbarBackground="#222"
+          toolbarBackground="rgba(32,32,36,0.55)"
           toolbarShadow="none"
           toolbarActionIconStyles={{ root: {}, icon: {} }}
           inlineDividerColor="#555"

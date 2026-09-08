@@ -98,38 +98,6 @@ export function NewApiSetupGate(): JSX.Element | null {
                 : '正在读取 new-api 的真实配置状态。'}
           </p>
 
-          {readiness ? (
-            <div className="new-api-setup-gate__recommendation">
-              <span className="new-api-setup-gate__recommendation-label">推荐渠道</span>
-              <strong className="new-api-setup-gate__recommendation-name">
-                {readiness.recommendedProvider.name}
-              </strong>
-              <span className="new-api-setup-gate__recommendation-copy">
-                先注册并获得管理员分配的额度，再创建令牌；回到本机 new-api 的“鲁班 API（推荐）”渠道粘贴令牌并启用。
-              </span>
-              <span className="new-api-setup-gate__recommendation-links">
-                <a
-                  className="new-api-setup-gate__recommendation-link"
-                  href={readiness.recommendedProvider.registerUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                >注册</a>
-                <a
-                  className="new-api-setup-gate__recommendation-link"
-                  href={readiness.recommendedProvider.topupUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                >兑换额度</a>
-                <a
-                  className="new-api-setup-gate__recommendation-link"
-                  href={readiness.recommendedProvider.tokenUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                >创建令牌</a>
-              </span>
-            </div>
-          ) : null}
-
           <div className="new-api-setup-gate__credentials">
             <span className="new-api-setup-gate__credentials-label">两个平台的默认管理员账号</span>
             <div className="new-api-setup-gate__credentials-list">
@@ -168,16 +136,6 @@ export function NewApiSetupGate(): JSX.Element | null {
           ) : null}
 
           <div className="new-api-setup-gate__actions">
-            {readiness ? (
-              <a
-                className="new-api-setup-gate__primary-action"
-                href={readiness.setupUrl}
-                target="_blank"
-                rel="noreferrer"
-              >
-                第 2 步：打开本机 new-api 渠道配置
-              </a>
-            ) : null}
             <button
               className="new-api-setup-gate__secondary-action"
               type="button"

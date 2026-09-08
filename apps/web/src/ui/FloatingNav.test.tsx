@@ -2,24 +2,38 @@
 import React from 'react'
 import '@testing-library/jest-dom/vitest'
 import { MantineProvider } from '@mantine/core'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import FloatingNav from './FloatingNav'
+import { useRFStore } from '../canvas/store'
 import { useUIStore } from './uiStore'
+import FloatingNav from './FloatingNav'
 
-vi.mock('./capabilities/CapabilityBayDialog', () => ({
-  CapabilityBayDialog: ({ opened, focusRequest, onClose }: {
-    opened: boolean
-    focusRequest?: { requestKey: string; flowId: string } | null
-    onClose: () => void
-  }) => opened ? (
-    <section className="capability-bay-test-double" role="dialog" aria-label="Agent 配置" data-flow-id={focusRequest?.flowId ?? ''}>
-      <button className="capability-bay-close-test-double" type="button" onClick={onClose}>关闭</button>
-    </section>
-  ) : null,
-}))
+class ResizeObserverStub {
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
 
-describe('FloatingNav character library entry', () => {
+// 测试环境语言可能是 en，标签需同时兼容中英文。
+const CREATION_SHORTCUT_LABELS: readonly (readonly string[])[] = [
+  ['文本', 'Text'],
+  ['图像', 'Image'],
+  ['分镜编辑'],
+  ['分镜表'],
+  ['导演台'],
+  ['视频', 'Video'],
+  ['音频', 'Audio'],
+  ['视频分析'],
+  ['视频合成'],
+]
+
+function shortcutButton(labels: readonly string[]): HTMLElement {
+  return screen.getByRole('button', { name: new RegExp(`^(${labels.join('|')})$`) })
+}
+
+describe('FloatingNav creation node shortcuts', () => {
+  afterEach(() => cleanup())
+
   beforeEach(() => {
     vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({
       matches: false,
@@ -31,68 +45,58 @@ describe('FloatingNav character library entry', () => {
       removeEventListener: vi.fn(),
       dispatchEvent: vi.fn(),
     }))
-    useUIStore.setState({
-      activePanel: null,
-      panelAnchorX: null,
-      assetPanelMaterialCategory: 'docs',
-      capabilityBayOpenRequest: null,
-    })
+    vi.stubGlobal('ResizeObserver', ResizeObserverStub)
+    useUIStore.setState({ activePanel: null })
+    useRFStore.getState().reset()
+    vi.stubGlobal('crypto', { randomUUID: () => 'floating-nav-test-id' })
   })
 
-  afterEach(() => {
-    cleanup()
-    vi.unstubAllGlobals()
-    useUIStore.setState({
-      activePanel: null,
-      panelAnchorX: null,
-      assetPanelMaterialCategory: 'docs',
-      capabilityBayOpenRequest: null,
-    })
+  it('renders every creation node as a one-click toolbar shortcut', () => {
+    render(<MantineProvider><FloatingNav /></MantineProvider>)
+
+    for (const labels of CREATION_SHORTCUT_LABELS) {
+      expect(shortcutButton(labels)).toBeInTheDocument()
+    }
   })
 
-  it('opens the independent character library instead of project assets', () => {
-    render(
-      <MantineProvider>
-        <FloatingNav />
-      </MantineProvider>,
-    )
+  it('adds an image node directly from the toolbar without opening the add panel', () => {
+    useUIStore.setState({ activePanel: 'add' })
+    render(<MantineProvider><FloatingNav /></MantineProvider>)
 
-    fireEvent.click(screen.getByRole('button', { name: '角色库' }))
+    fireEvent.click(shortcutButton(['图像', 'Image']))
 
-    expect(useUIStore.getState().activePanel).toBe('character-library')
-    expect(useUIStore.getState().assetPanelMaterialCategory).toBe('docs')
-
-    fireEvent.click(screen.getByRole('button', { name: '角色库' }))
+    const nodes = useRFStore.getState().nodes
+    const imageNode = nodes.find((node) => (
+      node.type === 'taskNode' && (node.data as { kind?: string }).kind === 'image'
+    ))
+    expect(imageNode).toBeDefined()
     expect(useUIStore.getState().activePanel).toBeNull()
   })
 
-  it('opens and closes the capability bay without changing the active canvas panel', async () => {
-    render(
-      <MantineProvider>
-        <FloatingNav />
-      </MantineProvider>,
-    )
+  it('adds a director console node from the toolbar', () => {
+    render(<MantineProvider><FloatingNav /></MantineProvider>)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Agent 配置' }))
-    expect(await screen.findByRole('dialog', { name: 'Agent 配置' })).toBeInTheDocument()
-    expect(useUIStore.getState().activePanel).toBeNull()
+    fireEvent.click(shortcutButton(['导演台']))
 
-    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
-    expect(screen.queryByRole('dialog', { name: 'Agent 配置' })).not.toBeInTheDocument()
+    expect(useRFStore.getState().nodes.some((node) => node.type === 'directorConsole')).toBe(true)
   })
 
-  it('opens the capability bay at the exact saved Flow requested by the canvas', async () => {
-    render(
-      <MantineProvider>
-        <FloatingNav />
-      </MantineProvider>,
-    )
+  it('toggles the orchestration node panel from the AI orchestration toolbar item', () => {
+    render(<MantineProvider><FloatingNav /></MantineProvider>)
 
-    act(() => {
-      useUIStore.getState().requestCapabilityBayForFlow('flow-one-click')
-    })
+    fireEvent.click(screen.getByRole('button', { name: 'AI 编排' }))
+    expect(useUIStore.getState().activePanel).toBe('add')
 
-    const dialog = await screen.findByRole('dialog', { name: 'Agent 配置' })
-    expect(dialog).toHaveAttribute('data-flow-id', 'flow-one-click')
+    fireEvent.click(screen.getByRole('button', { name: 'AI 编排' }))
+    expect(useUIStore.getState().activePanel).toBeNull()
+  })
+
+  it('renders vertically when the toolbar is docked to a canvas side', () => {
+    useUIStore.setState({ canvasToolbarPosition: 'left' })
+    const { container } = render(<MantineProvider><FloatingNav /></MantineProvider>)
+
+    const bar = container.querySelector<HTMLElement>('.floating-nav')
+    expect(bar?.classList.contains('floating-nav--side')).toBe(true)
+    expect(bar?.style.top).toBe('50%')
   })
 })

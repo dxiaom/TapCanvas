@@ -57,14 +57,22 @@ function ShortcutKey({ text, isDark }: { text: string; isDark: boolean }) {
   )
 }
 
-export function KeyboardShortcutsButton(): JSX.Element {
+export function KeyboardShortcutsButton(
+  { tooltipPosition = 'top' }: { tooltipPosition?: 'top' | 'right' | 'left' } = {},
+): JSX.Element {
   const [open, setOpen] = React.useState(false)
   const { colorScheme } = useMantineColorScheme()
   const isDark = colorScheme === 'dark'
+  // 快捷键弹层方向与提示文字一致：底部停靠在上方，左右停靠朝画布内侧展开。
+  const popoverPosition = tooltipPosition === 'right'
+    ? 'right-start' as const
+    : tooltipPosition === 'left'
+      ? 'left-start' as const
+      : 'top-end' as const
   return (
-    <Popover opened={open} onChange={setOpen} position="top-end" offset={10} withinPortal shadow="md" radius={12}>
+    <Popover opened={open} onChange={setOpen} position={popoverPosition} offset={10} withinPortal shadow="md" radius={12}>
       <Popover.Target>
-        <Tooltip label="键盘快捷键" position="top" withArrow disabled={open}>
+        <Tooltip label="键盘快捷键" position={tooltipPosition} offset={10} withArrow disabled={open}>
           <ActionIcon
             className="floating-nav-item"
             variant="subtle"

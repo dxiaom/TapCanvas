@@ -78,14 +78,6 @@ export type NewApiGatewayReadinessDto = {
 		| "no_configured_channels"
 		| "no_executable_models"
 	>;
-	setupUrl: string;
-	recommendedProvider: {
-		name: string;
-		baseUrl: string;
-		registerUrl: string;
-		topupUrl: string;
-		tokenUrl: string;
-	};
 };
 
 type NewApiGatewayReadinessResponse = {
@@ -109,71 +101,6 @@ const NEW_API_GATEWAY_READINESS_REASONS = new Set([
 
 function readNonNegativeInteger(value: unknown): number | null {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
-}
-
-function readGatewaySetupUrl(env: WorkerEnv): string {
-	const processEnv = globalThis.process?.env;
-	const raw = String(
-		env.NEW_API_PUBLIC_BASE_URL ?? processEnv?.NEW_API_PUBLIC_BASE_URL ?? "",
-	).trim();
-	if (!raw) {
-		throw new AppError("NEW_API_PUBLIC_BASE_URL 未配置", {
-			status: 500,
-			code: "new_api_public_base_url_missing",
-		});
-	}
-
-	let baseUrl: URL;
-	try {
-		baseUrl = new URL(raw);
-	} catch (error) {
-		throw new AppError("NEW_API_PUBLIC_BASE_URL 不是合法 URL", {
-			status: 500,
-			code: "new_api_public_base_url_invalid",
-			details: { message: error instanceof Error ? error.message : String(error) },
-		});
-	}
-	if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
-		throw new AppError("NEW_API_PUBLIC_BASE_URL 仅支持 http/https", {
-			status: 500,
-			code: "new_api_public_base_url_invalid",
-			details: { protocol: baseUrl.protocol },
-		});
-	}
-	return new URL("/console/channel", baseUrl).toString();
-}
-
-function readRecommendedProvider(env: WorkerEnv): NewApiGatewayReadinessDto["recommendedProvider"] {
-	const processEnv = globalThis.process?.env;
-	const raw = String(
-		env.NEW_API_RECOMMENDED_PROVIDER_BASE_URL
-			?? processEnv?.NEW_API_RECOMMENDED_PROVIDER_BASE_URL
-			?? "https://tt-api.lluban.com",
-	).trim();
-	let baseUrl: URL;
-	try {
-		baseUrl = new URL(raw);
-	} catch (error) {
-		throw new AppError("NEW_API_RECOMMENDED_PROVIDER_BASE_URL 不是合法 URL", {
-			status: 500,
-			code: "new_api_recommended_provider_url_invalid",
-			details: { message: error instanceof Error ? error.message : String(error) },
-		});
-	}
-	if (baseUrl.protocol !== "https:") {
-		throw new AppError("推荐渠道站点必须使用 HTTPS", {
-			status: 500,
-			code: "new_api_recommended_provider_url_invalid",
-			details: { protocol: baseUrl.protocol },
-		});
-	}
-	return {
-		name: "鲁班 API",
-		baseUrl: baseUrl.toString(),
-		registerUrl: new URL("/register", baseUrl).toString(),
-		topupUrl: new URL("/console/topup", baseUrl).toString(),
-		tokenUrl: new URL("/console/token", baseUrl).toString(),
-	};
 }
 
 export async function getNewApiGatewayReadiness(
@@ -257,8 +184,6 @@ export async function getNewApiGatewayReadiness(
 		configuredChannelCount,
 		executableModelCount,
 		reasons,
-		setupUrl: readGatewaySetupUrl(env),
-		recommendedProvider: readRecommendedProvider(env),
 	};
 }
 

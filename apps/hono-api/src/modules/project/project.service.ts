@@ -43,6 +43,7 @@ import { CanvasFlowSchema } from "../chapter/chapter.canvas-flow.schemas";
 import { resolveProjectDataRepoRoot } from "../asset/project-data-root";
 import { execute } from "../../db/db";
 import { projectWorkflowGraphForViewer } from "@tapcanvas/workflow-kernel-protocol";
+import { BUILTIN_GREETING_WORKFLOW } from "../agents/system-greeting-workflow";
 import { cloneProjectMaterialAssets } from "../material/material.repo";
 import {
 	rewriteClonedBookIndexes,
@@ -947,6 +948,27 @@ export async function deleteProjectForUser(
 		throw new AppError("Not project owner", {
 			status: 403,
 			code: "forbidden",
+		});
+	}
+
+	// 内置工作流项目：删除是用户的明确意图，落一条 enabled=0 墓碑，
+	// 防止启动时的 syncBuiltInGreetingWorkflow 用保留 ID 把项目/画布复活。
+	if (projectId === BUILTIN_GREETING_WORKFLOW.projectId) {
+		const now = new Date().toISOString();
+		await c.env.DB.agent_builtin_capability_settings.upsert({
+			where: { capability_id: BUILTIN_GREETING_WORKFLOW.id },
+			create: {
+				capability_id: BUILTIN_GREETING_WORKFLOW.id,
+				enabled: 0,
+				updated_by_user_id: userId,
+				created_at: now,
+				updated_at: now,
+			},
+			update: {
+				enabled: 0,
+				updated_by_user_id: userId,
+				updated_at: now,
+			},
 		});
 	}
 
