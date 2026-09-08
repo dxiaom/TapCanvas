@@ -1,0 +1,10 @@
+[
+  { "id": "product-commerce", "name": "产品电商/带货", "styleTone": "clean-real", "aspect": "9:16", "durationDefault": 15, "recipeBias": [], "qaCriteria": [] },
+  { "id": "narrative-drama", "name": "剧情叙事/小说改编", "styleTone": "cinematic", "aspect": "16:9", "recipeBias": [], "qaCriteria": [] },
+  { "id": "comic-anime", "name": "漫剧/动画短剧", "styleTone": "anime", "aspect": "16:9", "recipeBias": [], "qaCriteria": [] },
+  { "id": "mv-stylized", "name": "MV/风格化短片", "styleTone": "cinematic", "aspect": "16:9", "recipeBias": [], "qaCriteria": [] },
+  { "id": "fashion", "name": "时尚/服装大片", "styleTone": "cinematic", "aspect": "9:16", "durationDefault": 20, "recipeBias": [], "qaCriteria": [] },
+  { "id": "ecommerce-tvc", "name": "电商广告/TVC", "styleTone": "cinematic", "aspect": "9:16", "durationDefault": 20, "recipeBias": [], "qaCriteria": [] },
+  { "id": "short-video-creator", "name": "短视频达人/无缝转场·变装爆款", "styleTone": "cinematic", "aspect": "9:16", "durationDefault": 15, "recipeBias": [], "qaCriteria": [] },
+  { "id": "default", "name": "兜底（沿用现状）", "styleTone": "", "recipeBias": [], "qaCriteria": [] }
+]
