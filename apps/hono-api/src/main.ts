@@ -41,6 +41,10 @@ import { waitForGracefulShutdown } from "./platform/node/graceful-shutdown";
 import { resumePersistedPromptLibraryCrawls } from "./modules/prompt-library/prompt-library.crawler";
 import { ensureBootstrapAdmin } from "./modules/auth/bootstrap-admin";
 import { syncBuiltInGreetingWorkflow } from "./modules/agents/system-greeting-workflow";
+import { nodeDurableInstanceCount } from "./platform/node/node-durable";
+import { resilientDraftMemorySize } from "./modules/task/video-orchestrator.resilient-draft-store";
+import { countAllCanvasSseConns } from "./modules/chapter/canvas-sse.manager";
+import { yjsRoomCount } from "./modules/realtime/yjs-realtime";
 
 async function bootstrap() {
 	loadLocalEnvFiles();
@@ -87,14 +91,17 @@ async function bootstrap() {
 	console.log(`[api] listening on http://localhost:${port}`);
 
 	// 内存周期日志：每 60s 采样一次，用于诊断内存飙升根因。
-	// 观察 heapUsed 趋势；如持续增长未回落说明存在泄漏。
+	// heapUsed 观察对象留存趋势；ext（external=arrayBuffers）观察 Buffer/二进制滞留；
+	// do/draftMem/sseConns/yjsRooms 是四个已知内存缓存容器的实时 size（见各模块的淘汰策略）。
 	if (process.env.NODE_ENV !== "test") {
 		const memTimer = setInterval(() => {
 			const m = process.memoryUsage();
 			const mb = (b: number) => Math.round(b / 1024 / 1024);
 			// eslint-disable-next-line no-console
 			console.log(
-				`[mem] rss=${mb(m.rss)}MB heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}MB ext=${mb(m.external)}MB`,
+				`[mem] rss=${mb(m.rss)}MB heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}MB ext=${mb(m.external)}MB `
+				+ `do=${nodeDurableInstanceCount()} draftMem=${resilientDraftMemorySize()} `
+				+ `sseConns=${countAllCanvasSseConns()} yjsRooms=${yjsRoomCount()}`,
 			);
 		}, 60_000);
 		memTimer.unref?.();

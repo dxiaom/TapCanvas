@@ -217,7 +217,9 @@ async function resolveConfiguredCredits(
 			},
 		});
 	}
-	if (!Number.isFinite(row.cost) || row.cost <= 0) {
+	// cost === 0 is an explicit "free" configuration set by admins; only negative
+	// or non-numeric values are invalid. Zero resolves downstream to no reservation.
+	if (!Number.isFinite(row.cost) || row.cost < 0) {
 		throw new AppError(isSpecPrice ? "模型规格积分价格配置无效" : "模型积分价格配置无效", {
 			status: 503,
 			code: isSpecPrice ? "model_spec_pricing_invalid" : "model_pricing_invalid",

@@ -104,7 +104,13 @@ export function parseLocalAgentsBridgeEndpoint(raw: string): LocalAgentsBridgeEn
 async function isHealthy(baseUrl: string): Promise<boolean> {
 	try {
 		const url = `${normalizeBaseUrl(baseUrl)}/health`;
-		const res = await fetch(url, { method: "GET" });
+		// A bridge that is draining (SIGTERM accepted, port still listening) can
+		// leave this fetch hanging forever without an explicit timeout, which
+		// deadlocks the whole startup chain before the HTTP server listens.
+		const res = await fetch(url, {
+			method: "GET",
+			signal: AbortSignal.timeout(2_500),
+		});
 		if (!res.ok) return false;
 		const payload: unknown = await res.json();
 		return isDeepSeekHarnessHealthPayload(payload);
@@ -131,6 +137,22 @@ export async function maybeAutostartAgentsBridge(
 	options: Readonly<{ stabilityWindowMs?: number }> = {},
 ): Promise<void> {
 	if (!shouldAutostartAgentsBridge()) return;
+
+	// 部署运维模式：AGENTS_BRIDGE_SERVE_ENTRY 显式指向 agents-cli 入口（如
+	// /www/tapcanvas/agents/agents-cli/dist/cli/index.js）。该形态下服务器上没有
+	// pnpm workspace 结构，findRepoRoot 必然失败，因此跳过仓库定位、直接用显式
+	// 入口 spawn；且入口缺失/健康等待失败时只 warn/error 并继续启动——生产环境
+	// bridge 缺失由 /chat/status 等接口的显式 502 反映，不能拖垮整个 API。
+	const serveEntryRaw = String(process.env.AGENTS_BRIDGE_SERVE_ENTRY || "").trim();
+	let serveEntryOverride: string | null = null;
+	if (serveEntryRaw) {
+		if (!fs.existsSync(serveEntryRaw)) {
+			// eslint-disable-next-line no-console
+			console.warn(`[api] AGENTS_BRIDGE_SERVE_ENTRY is set but the entry does not exist: ${serveEntryRaw}; skipping agents bridge autostart`);
+			return;
+		}
+		serveEntryOverride = serveEntryRaw;
+	}
 
 	const existing = normalizeBaseUrl(process.env.AGENTS_BRIDGE_BASE_URL || "");
 	let configuredLocalEndpoint: LocalAgentsBridgeEndpoint | null = null;
@@ -167,7 +189,9 @@ export async function maybeAutostartAgentsBridge(
 		return;
 	}
 
-	const repoRoot = findRepoRoot(process.cwd()) ?? findRepoRoot(path.resolve(__dirname, "..", "..", ".."));
+	const repoRoot = serveEntryOverride
+		? path.dirname(serveEntryOverride)
+		: (findRepoRoot(process.cwd()) ?? findRepoRoot(path.resolve(__dirname, "..", "..", "..")));
 	if (!repoRoot) {
 		throw new Error("Agents bridge autostart failed: repository root was not found");
 	}
@@ -179,18 +203,24 @@ export async function maybeAutostartAgentsBridge(
 		typeof process.env.AGENTS_SKILLS_DIR === "string"
 			? process.env.AGENTS_SKILLS_DIR.trim()
 			: "";
-	const defaultSkillsDir = path.join(repoRoot, "apps", "agents-cli", "skills");
+	const defaultSkillsDir = serveEntryOverride
+		? path.join(path.dirname(serveEntryOverride), "..", "..", "skills")
+		: path.join(repoRoot, "apps", "agents-cli", "skills");
 	const childEnv = {
 		...process.env,
-		...(skillsDir ? {} : { AGENTS_SKILLS_DIR: defaultSkillsDir }),
+		...(skillsDir ? {} : { AGENTS_SKILLS_DIR: path.resolve(defaultSkillsDir) }),
 	};
 
-	const agentsCliDir = path.join(repoRoot, "apps", "agents-cli");
-	const useBuiltBridge = fs.existsSync(path.join(agentsCliDir, "dist", "cli", "index.js"));
+	const agentsCliDir = serveEntryOverride
+		? path.dirname(serveEntryOverride)
+		: path.join(repoRoot, "apps", "agents-cli");
+	const useBuiltBridge = serveEntryOverride
+		? true
+		: fs.existsSync(path.join(agentsCliDir, "dist", "cli", "index.js"));
 	const bridgeCommand = useBuiltBridge ? process.execPath : "pnpm";
-	const bridgeCwd = useBuiltBridge ? agentsCliDir : repoRoot;
+	const bridgeCwd = agentsCliDir;
 	const args = useBuiltBridge
-		? [path.join(agentsCliDir, "dist", "cli", "index.js")]
+		? [serveEntryOverride ?? path.join(agentsCliDir, "dist", "cli", "index.js")]
 		: ["--filter", "agents", "dev"];
 	args.push(
 		"serve",
@@ -236,7 +266,15 @@ export async function maybeAutostartAgentsBridge(
 	const ok = await waitForHealthy(baseUrl, 15_000, () => spawnFailed);
 	if (!ok) {
 		killChild();
-		throw new Error(`Agents bridge autostart failed (${spawnFailed ? "spawn_error" : "timeout"}) at ${baseUrl}`);
+		const reason = spawnFailed ? "spawn_error" : "timeout";
+		if (serveEntryOverride) {
+			// 部署运维模式：bridge 起不来不能拖垮整个 API；错误显式留在日志，
+			// bridge 缺失由 /chat/status 等接口的 transport 502 持续反映。
+			// eslint-disable-next-line no-console
+			console.error(`[api] agents bridge autostart failed (${reason}) at ${baseUrl}; continuing without bridge`);
+			return;
+		}
+		throw new Error(`Agents bridge autostart failed (${reason}) at ${baseUrl}`);
 	}
 
 	process.env.AGENTS_BRIDGE_BASE_URL = baseUrl;

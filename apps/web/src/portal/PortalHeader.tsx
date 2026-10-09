@@ -1,6 +1,7 @@
 import React from 'react'
 import {
   IconBraces,
+  IconCoins,
   IconFolders,
   IconHome,
   IconSparkles,
@@ -16,7 +17,7 @@ import { preloadPortalRoute } from './portalRouteModules'
 const PortalAccountRuntime = React.lazy(() => import('./PortalAccountRuntime'))
 const PortalLoginRuntime = React.lazy(() => import('./PortalLoginRuntime'))
 
-export type PortalRoute = 'home' | 'neo-tv' | 'prompts' | 'projects' | 'skills'
+export type PortalRoute = 'home' | 'neo-tv' | 'prompts' | 'projects' | 'skills' | 'pricing'
 
 type PortalHeaderProps = {
   active: PortalRoute
@@ -35,6 +36,7 @@ const NAV_ITEMS: ReadonlyArray<{
   { key: 'prompts', label: '提示词', href: '/prompts', icon: IconBraces },
   { key: 'skills', label: 'Skill', href: '/skills', icon: IconSparkles },
   { key: 'projects', label: '画布', href: '/canvas', icon: IconFolders },
+  { key: 'pricing', label: '定价', href: '/pricing', icon: IconCoins },
 ]
 
 type ViewTransitionDocument = Document & {

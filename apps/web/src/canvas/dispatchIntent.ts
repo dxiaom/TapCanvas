@@ -2,6 +2,7 @@ import type { ChapterCanvasIntent } from '@tapcanvas/chapter-canvas-intents'
 import { generateBatchUlid } from '@tapcanvas/chapter-canvas-intents'
 import { streamChapterIntent, type PendingUserInputRequest } from './streamChapterIntent'
 import { useIntentLifecycle } from './intentLifecycle'
+import { clearBatchRowCursor } from './applyFlowPatchToStore'
 import { toast } from '../ui/toast'
 import { useUIStore } from '../ui/uiStore'
 
@@ -156,5 +157,7 @@ export async function dispatchIntent(
     }
   } finally {
     useIntentLifecycle.getState().finish(batchUlid)
+    // 批量布局游标只在本批次内有效，批次结束（含失败/取消）即释放，避免 Map 随批次数无界增长。
+    clearBatchRowCursor(batchUlid)
   }
 }

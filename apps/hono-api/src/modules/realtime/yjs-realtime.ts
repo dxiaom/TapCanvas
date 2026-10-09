@@ -28,6 +28,15 @@ const MESSAGE_AWARENESS = 1;
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
 const PING_INTERVAL_MS = 30_000;
+// 房间空闲驱逐：rooms Map 里每个 flow 一个 Y.Doc（含完整画布内容 + Yjs 内部 TypedArray
+// 结构），此前"空房间保留 doc"的注释方案永不执行导致无界增长。doc 只是镜像（无服务端
+// 持久化，真源在 flows/Postgres）：空房间过期销毁后，下一个客户端连接会经 syncStep1/2
+// 把自己的完整状态回灌进新 doc，agent 回写桥也是按需 getRoom 重建——语义与进程重启等价。
+const ROOM_IDLE_TTL_MS = 10 * 60_000;
+const ROOM_SWEEP_INTERVAL_MS = 60_000;
+// ws 出站背压：ws 库在 socket 拥塞时会把待发帧缓存进内部队列（bufferedAmount，Buffer
+// 计入 external）。超过上限判定为僵死客户端，直接断开。
+const MAX_WS_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 type YjsLibs = {
   Y: typeof Y;
@@ -38,9 +47,11 @@ type YjsLibs = {
 };
 
 type Room = {
+  flowId: string;
   doc: Y.Doc;
   awareness: Awareness;
   conns: Map<WebSocket, Set<number>>;
+  lastActivityAt: number;
 };
 
 let libs: YjsLibs | null = null;
@@ -59,16 +70,20 @@ function getJwtSecret(): string {
 
 function getRoom(flowId: string): Room {
   const existing = rooms.get(flowId);
-  if (existing) return existing;
+  if (existing) {
+    existing.lastActivityAt = Date.now();
+    return existing;
+  }
   const L = libs!;
   const doc = new L.Y.Doc();
   const awareness = new L.awareness.Awareness(doc);
   awareness.setLocalState(null);
-  const room: Room = { doc, awareness, conns: new Map() };
+  const room: Room = { flowId, doc, awareness, conns: new Map(), lastActivityAt: Date.now() };
   rooms.set(flowId, room);
 
   // 文档变更 → 广播 sync update
   doc.on("update", (update: Uint8Array) => {
+    room.lastActivityAt = Date.now();
     const encoder = L.encoding.createEncoder();
     L.encoding.writeVarUint(encoder, MESSAGE_SYNC);
     L.sync.writeUpdate(encoder, update);
@@ -78,6 +93,7 @@ function getRoom(flowId: string): Room {
 
   // awareness 变更 → 广播
   awareness.on("update", (changes, origin) => {
+    room.lastActivityAt = Date.now();
     const changed = changes.added.concat(changes.updated, changes.removed);
     if (origin && room.conns.has(origin as WebSocket)) {
       const ids = room.conns.get(origin as WebSocket)!;
@@ -100,6 +116,16 @@ function sendMsg(room: Room, conn: WebSocket, msg: Uint8Array): void {
     closeConn(room, conn);
     return;
   }
+  // 出站背压：socket 拥塞时 ws 会在内部队列缓存帧（external 内存），僵死客户端超限即断开。
+  const bufferedAmount = (conn as unknown as { bufferedAmount?: number }).bufferedAmount;
+  if (typeof bufferedAmount === "number" && bufferedAmount > MAX_WS_BUFFERED_BYTES) {
+    console.warn("[yjs] stalled connection evicted (ws outbound buffer overflow)", {
+      flowId: room.flowId,
+      bufferedAmount,
+    });
+    closeConn(room, conn);
+    return;
+  }
   try {
     conn.send(msg, (err?: Error) => {
       if (err) closeConn(room, conn);
@@ -116,10 +142,11 @@ function closeConn(room: Room, conn: WebSocket): void {
     libs!.awareness.removeAwarenessStates(room.awareness, Array.from(ids), null);
   }
   try { conn.close(); } catch { /* already closed */ }
-  // 房间空：暂保留 doc 以便短期复用（Phase 5 可在此 checkpoint 到 flows.data 后销毁）。
+  // 空房间由 evictIdleYjsRooms 按 TTL 统一驱逐（doc 只是镜像，销毁后客户端会自动回灌）。
 }
 
 function onMessage(room: Room, conn: WebSocket, data: Uint8Array): void {
+  room.lastActivityAt = Date.now();
   const L = libs!;
   try {
     const decoder = L.decoding.createDecoder(data);
@@ -241,6 +268,10 @@ export async function attachYjsWebsocketServer(httpServer: HttpServer): Promise<
 
   // eslint-disable-next-line no-console
   console.log("[yjs] y-websocket 已挂载于 /yjs/<flowId>（CANVAS_YJS_WS=on）");
+
+  // 空房间空闲驱逐：防止 rooms Map 随触达过的 flow 数无界增长。
+  const roomSweepTimer = setInterval(() => evictIdleYjsRooms(), ROOM_SWEEP_INTERVAL_MS);
+  roomSweepTimer.unref?.();
 }
 
 /** 暴露房间内的 Y.Doc（供 agent 回写桥 / 后续持久化使用）。仅灰度开启后可用。 */
@@ -250,6 +281,33 @@ export function getFlowYDoc(flowId: string): Y.Doc | null {
 
 export function listActiveFlowRooms(): string[] {
   return Array.from(rooms.keys());
+}
+
+/** 当前存活房间数（[mem] 周期打点用；未启用时恒为 0）。 */
+export function yjsRoomCount(): number {
+  return libs ? rooms.size : 0;
+}
+
+/**
+ * 驱逐空闲空房间：conns 为空且超过 ROOM_IDLE_TTL_MS 无任何活动即销毁 Y.Doc 与 Awareness。
+ * 返回驱逐数量。真源在 Postgres/flows，销毁后客户端重连会自动回灌，语义与重启等价。
+ */
+export function evictIdleYjsRooms(nowMs = Date.now()): number {
+  if (!libs) return 0;
+  let evicted = 0;
+  for (const [flowId, room] of rooms) {
+    if (room.conns.size > 0) continue;
+    if (nowMs - room.lastActivityAt <= ROOM_IDLE_TTL_MS) continue;
+    try { room.awareness.destroy(); } catch { /* already destroyed */ }
+    try { room.doc.destroy(); } catch { /* already destroyed */ }
+    rooms.delete(flowId);
+    evicted += 1;
+  }
+  if (evicted > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[yjs] evicted ${evicted} idle room(s), remaining=${rooms.size}`);
+  }
+  return evicted;
 }
 
 // ── Phase 4：agent 回写桥（SyncPatch → 服务端 Y.Doc）────────────────────────────

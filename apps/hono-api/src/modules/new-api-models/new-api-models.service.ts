@@ -963,7 +963,9 @@ export function isSelectableNewApiModel(
 	return (
 		typeof item.pricing.cost === "number" &&
 		Number.isFinite(item.pricing.cost) &&
-		item.pricing.cost > 0
+		// cost === 0 is an explicit free price (configured in model credit costs);
+		// only a missing/invalid pricing row makes a model unselectable.
+		item.pricing.cost >= 0
 	);
 }
 

@@ -2,6 +2,7 @@
 // 行×列×间距一键生成一组共享 crowdId 的角色，场景树按组折叠，支持整组统一操作。
 // 群组广播只覆盖「造型/表演」键（姿势/动作/颜色/缩放/朝向/显隐/锁定），位置始终各自独立。
 import type { DirectorConsoleData, CharacterObj, Vec3 } from '../types'
+import { releaseDetachedCharacterModels } from './scene'
 
 export type CrowdInput = {
   /** 素体 id（BODY_TYPES），默认 male */
@@ -122,7 +123,9 @@ export function translateCrowd(d: DirectorConsoleData, crowdId: string, delta: V
 export function removeCrowd(d: DirectorConsoleData, crowdId: string): DirectorConsoleData {
   const next = clone(d)
   const removed = new Set(next.scene.characters.filter((c) => c.crowdId === crowdId).map((c) => c.id))
+  const previousCharacters = next.scene.characters
   next.scene.characters = next.scene.characters.filter((c) => c.crowdId !== crowdId)
+  releaseDetachedCharacterModels(previousCharacters, next.scene.characters)
   if (next.selectedObjectId && removed.has(next.selectedObjectId)) next.selectedObjectId = undefined
   return next
 }

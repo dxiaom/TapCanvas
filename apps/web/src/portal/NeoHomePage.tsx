@@ -16,7 +16,7 @@ import {
 import type { CommerceProductDto, PublicAssetDto } from '../api/server'
 import { apiFetch, API_BASE } from '../api/server'
 import { useAuth } from '../auth/store'
-import { buildMembershipPlanCards } from './account/membershipPlanViewModel'
+import { buildMembershipPlanCards, hasMembershipDailyGift } from './account/membershipPlanViewModel'
 import { hostedAssetUrl } from '../config/objectStorageAssets'
 import { ManagedImage } from '../domain/resource-runtime/components/ManagedImage'
 import { createMediaPlaybackRequestController } from '../utils/mediaPlayback'
@@ -210,6 +210,7 @@ export function NeoHomePageSurface({
     () => buildMembershipPlanCards(membershipPlans ?? [], 'monthly').cards,
     [membershipPlans],
   )
+  const membershipHasDailyGift = membershipPlanCards.some((card) => card.variants.some((variant) => hasMembershipDailyGift(variant.dailyGiftCredits)))
 
   const playHeroVideo = React.useCallback((video: HTMLVideoElement): void => {
     void playbackController.play(video).then((result) => {
@@ -525,7 +526,7 @@ export function NeoHomePageSurface({
             <div className="neo-home-section-heading">
               <span className="neo-home-section-heading__index">Pricing</span>
               <h2 className="neo-home-section-heading__title" id="neo-home-pricing-title">选择你的创作套餐</h2>
-              <p className="neo-home-section-heading__subtitle">开通即得本月积分，会员期内每日赠送积分，当日有效；年付套餐在账户中心切换查看。</p>
+              <p className="neo-home-section-heading__subtitle">开通即得本月积分{membershipHasDailyGift ? '，会员期内每日赠送积分，当日有效' : ''}。</p>
             </div>
             <div className="neo-home-pricing__grid">
               {membershipPlanCards.map((card) => {

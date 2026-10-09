@@ -30,7 +30,12 @@ export const useToolProgressStore = create<ToolProgressState>((set) => ({
   setToolProgress: (p) =>
     set((st) => {
       const m = new Map(st.byCallId)
-      m.set(p.toolCallId, { ...p, updatedAt: Date.now() })
+      const now = Date.now()
+      // 写入时顺手清掉已过 TTL 的残留条目（tool.completed 漏达的批次），TTL 不再只是读端过滤。
+      for (const [key, entry] of m) {
+        if (now - entry.updatedAt > TTL_MS) m.delete(key)
+      }
+      m.set(p.toolCallId, { ...p, updatedAt: now })
       return { byCallId: m }
     }),
   clearToolProgress: (toolCallId) =>

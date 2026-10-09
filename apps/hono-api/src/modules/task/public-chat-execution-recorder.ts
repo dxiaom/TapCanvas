@@ -31,6 +31,7 @@ export type PublicChatExecutionRecorder = {
 		failedEventCount: number;
 		lastError: string | null;
 		pendingEventCount: number;
+		droppedEventCount: number;
 		persistedEventCount: number;
 		batchWriteCount: number;
 		lastFlushAt: string | null;
@@ -39,6 +40,11 @@ export type PublicChatExecutionRecorder = {
 
 const EVENT_BATCH_SIZE = 48;
 const EVENT_FLUSH_INTERVAL_MS = 300;
+// DB 持久化持续失败时 pendingEvents 只进不出（flushOneBatch catch 分支不缩减），长跑回合
+// 下事件数组会无界堆积。超过上限丢弃最旧事件（显式计数 + 节流 error 日志），trace 是
+// 观测数据，丢弃必须可见而不是静默涨内存。
+const MAX_PENDING_EVENTS = 2_000;
+const DROP_LOG_THROTTLE_MS = 30_000;
 const FLUSH_BARRIER_EVENTS = new Set([
 	"request.accepted",
 	"tool",
@@ -232,6 +238,8 @@ export async function startPublicChatExecutionRecorder(input: {
 	let failedEventCount = 0;
 	let lastError: string | null = null;
 	let persistedEventCount = 0;
+	let droppedEventCount = 0;
+	let lastDropLogAt = 0;
 	let batchWriteCount = 0;
 	let lastFlushAt: string | null = null;
 	let producerSequence = 0;
@@ -257,6 +265,7 @@ export async function startPublicChatExecutionRecorder(input: {
 		failedEventCount,
 		lastError,
 		pendingEventCount: pendingEvents.length,
+		droppedEventCount,
 		persistedEventCount,
 		batchWriteCount,
 		lastFlushAt,
@@ -342,6 +351,19 @@ export async function startPublicChatExecutionRecorder(input: {
 				parentTraceId: input.parentTraceId ?? null,
 			}),
 		});
+		if (pendingEvents.length > MAX_PENDING_EVENTS) {
+			pendingEvents.shift();
+			droppedEventCount += 1;
+			const nowMs = Date.now();
+			if (nowMs - lastDropLogAt > DROP_LOG_THROTTLE_MS) {
+				lastDropLogAt = nowMs;
+				console.error("[public-agents-chat] execution trace pending queue over cap; dropping oldest events", {
+					traceId: input.traceId,
+					droppedEventCount,
+					cap: MAX_PENDING_EVENTS,
+				});
+			}
+		}
 		if (requireDurableSequence) durableProducerEventIds.add(producerEventId);
 		if (FLUSH_BARRIER_EVENTS.has(event.event) || pendingEvents.length >= EVENT_BATCH_SIZE) {
 			await flushOneBatch();

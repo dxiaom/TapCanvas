@@ -8,6 +8,7 @@ import {
   buildMembershipPlanCards,
   classifyMembershipPurchase,
   formatMembershipDiscount,
+  hasMembershipDailyGift,
   type MembershipBillingCycle,
   type MembershipPlanCard,
   type MembershipPlanVariant,
@@ -61,7 +62,9 @@ function PlanCard({ card, cycle, current, busy, onPurchase }: {
                 {variant.capacityLabel
                   ? <span>动态算力 {variant.capacityLabel}</span>
                   : <span>每月 {variant.monthlyCredits.toLocaleString('zh-CN')} 积分</span>}
-                <span>每日赠送 {variant.dailyGiftCredits.toLocaleString('zh-CN')}</span>
+                {hasMembershipDailyGift(variant.dailyGiftCredits)
+                  ? <span>每日赠送 {variant.dailyGiftCredits.toLocaleString('zh-CN')}</span>
+                  : null}
               </div>
               <Button
                 className="membership-plan-card__buy"
@@ -94,7 +97,12 @@ export function MembershipPlansView({ overview, onPurchased }: {
 
   const current = overview?.membership.current ?? null
   const plans = overview?.membership.plans ?? []
-  const cardsResult = React.useMemo(() => buildMembershipPlanCards(plans, cycle), [plans, cycle])
+  const annualAvailable = React.useMemo(
+    () => buildMembershipPlanCards(plans, 'annual').cards.length > 0,
+    [plans],
+  )
+  const effectiveCycle: MembershipBillingCycle = annualAvailable ? cycle : 'monthly'
+  const cardsResult = React.useMemo(() => buildMembershipPlanCards(plans, effectiveCycle), [plans, effectiveCycle])
 
   const handlePurchase = React.useCallback((card: MembershipPlanCard, variant: MembershipPlanVariant) => {
     if (!variant.sku) {
@@ -121,17 +129,19 @@ export function MembershipPlansView({ overview, onPurchased }: {
           <span className="membership-current-banner__validity">有效至 {new Date(current.endAt).toLocaleDateString('zh-CN')}</span>
         </div>
       ) : null}
-      <Group className="membership-cycle-switch" justify="flex-end" gap="xs">
-        <SegmentedControl
-          size="xs"
-          value={cycle}
-          onChange={(value: string) => setCycle(value === 'annual' ? 'annual' : 'monthly')}
-          data={[
-            { label: '月付', value: 'monthly' },
-            { label: '年付', value: 'annual' },
-          ]}
-        />
-      </Group>
+      {annualAvailable ? (
+        <Group className="membership-cycle-switch" justify="flex-end" gap="xs">
+          <SegmentedControl
+            size="xs"
+            value={cycle}
+            onChange={(value: string) => setCycle(value === 'annual' ? 'annual' : 'monthly')}
+            data={[
+              { label: '月付', value: 'monthly' },
+              { label: '年付', value: 'annual' },
+            ]}
+          />
+        </Group>
+      ) : null}
       {cardsResult.errors.length > 0 ? (
         <div className="membership-plan-errors">
           {cardsResult.errors.map((message) => <Text className="membership-plan-errors__item" key={message} size="xs" c="red">{message}</Text>)}
@@ -141,7 +151,7 @@ export function MembershipPlansView({ overview, onPurchased }: {
         {cardsResult.cards.map((card) => (
           <PlanCard
             card={card}
-            cycle={cycle}
+            cycle={effectiveCycle}
             current={current}
             busy={busy}
             onPurchase={handlePurchase}

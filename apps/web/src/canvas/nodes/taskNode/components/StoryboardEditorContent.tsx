@@ -59,6 +59,29 @@ const normalizeImageFile = (file: File | null | undefined): File | null => {
   return typeof file.type === 'string' && file.type.startsWith('image/') ? file : null
 }
 
+// 本模块 createObjectURL 的 blob URL 登记（模块级，跨组件重挂载保持）：格子被替换/清除时显式释放，
+// 避免每次本地拖放泄漏一个图片 Blob。只释放自己创建的 URL——payload.url 可能来自其他节点的
+// blob URL，其生命周期归源节点所有，这里不得代为 revoke。
+const selfCreatedCellBlobUrls = new Set<string>()
+
+function registerCellBlobUrl(url: string): void {
+  selfCreatedCellBlobUrls.add(url)
+}
+
+/** 释放登记表中已不在 nextCells 里继续引用的本模块 blob URL。 */
+function releaseOrphanedCellBlobUrls(nextCells: StoryboardEditorCell[]): void {
+  const live = new Set<string>()
+  for (const cell of nextCells) {
+    if (typeof cell.imageUrl === 'string' && cell.imageUrl) live.add(cell.imageUrl)
+  }
+  for (const url of Array.from(selfCreatedCellBlobUrls)) {
+    if (!live.has(url)) {
+      selfCreatedCellBlobUrls.delete(url)
+      URL.revokeObjectURL(url)
+    }
+  }
+}
+
 function StoryboardEditorContent(props: StoryboardEditorContentProps) {
   const {
     label,
@@ -113,6 +136,7 @@ function StoryboardEditorContent(props: StoryboardEditorContentProps) {
   }, [normalizedSelectedIndex])
 
   const patchCells = React.useCallback((nextCells: StoryboardEditorCell[]) => {
+    releaseOrphanedCellBlobUrls(nextCells)
     onUpdateNodeData({ storyboardEditorCells: nextCells })
   }, [onUpdateNodeData])
 
@@ -163,6 +187,7 @@ function StoryboardEditorContent(props: StoryboardEditorContentProps) {
     const defaults = buildDefaultStoryboardEditorData()
     const nextCellCount = getStoryboardEditorGridConfig(nextGrid).columns * getStoryboardEditorGridConfig(nextGrid).rows
     const nextCells = Array.from({ length: nextCellCount }, (_, index) => cells[index] ?? defaults.storyboardEditorCells[index])
+    releaseOrphanedCellBlobUrls(nextCells)
     onUpdateNodeData({
       storyboardEditorGrid: nextGrid,
       storyboardEditorCells: nextCells,
@@ -207,8 +232,10 @@ function StoryboardEditorContent(props: StoryboardEditorContentProps) {
   }, [aspect, cells, grid, onComposeToImageNode])
 
   const handleClearAll = React.useCallback(() => {
+    const defaults = buildDefaultStoryboardEditorData()
+    releaseOrphanedCellBlobUrls(defaults.storyboardEditorCells)
     onUpdateNodeData({
-      ...buildDefaultStoryboardEditorData(),
+      ...defaults,
       storyboardEditorAspect: aspect,
       storyboardEditorGrid: grid,
       storyboardEditorSelectedIndex: 0,
@@ -243,6 +270,7 @@ function StoryboardEditorContent(props: StoryboardEditorContentProps) {
     const file = normalizeImageFile(event.dataTransfer.files?.[0])
     if (!file) return
     const localUrl = URL.createObjectURL(file)
+    registerCellBlobUrl(localUrl)
     replaceCell(index, {
       imageUrl: localUrl,
       label: file.name,

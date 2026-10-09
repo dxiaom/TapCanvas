@@ -933,6 +933,10 @@ payload 中，列表主类型使用实际 task result kind。轮询取得 `succe
 稳定错误码，不再退回默认超时或吞掉启动失败。Node API 启动会对已配置 bridge 做短稳定性复检，避免采用即将随旧 API
 退出的 bridge 子进程；已配置的 loopback bridge 不健康时只在原 host/port 拉起，不得改投默认端口，远程 bridge 不健康时
 明确失败且不得由本地进程冒充。显式启用 autostart 后若仓库定位、spawn 或健康等待失败，API 不进入 ready。
+部署运维模式例外：设置 `AGENTS_BRIDGE_SERVE_ENTRY`（显式 agents-cli 入口绝对路径，供无 pnpm workspace
+结构的服务器部署使用）后，autostart 改用该入口 spawn，且入口缺失或健康等待失败时只记录显式 error 并继续启动——
+bridge 缺失由 `/chat/status` 等接口的 `agents_chat_runtime_transport_unknown` 502 持续反映，不得拖垮整个 API；
+`AGENTS_BRIDGE_SERVE_ENTRY` 配置了不存在的路径时跳过 autostart 并输出 warn。
 工作流 `/cancel` 的 Durable Object 内部合同必须携带结构化 `reasonCode + actorType + actorId`：管理员主动取消记录
 `user_requested/owner_admin`，余额恢复与模型切换对旧物理执行的围栏分别记录
 `provider_balance_recovery/agent_model_cutover + workflow_recovery`。节点取消文案和 append-only `execution_canceled`

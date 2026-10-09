@@ -10,11 +10,49 @@ import { projectWorkflowGraphPatchForViewer } from "@tapcanvas/workflow-kernel-p
 
 const enc = new TextEncoder()
 
+// ── SSE 出站背压（external 内存泄漏防线）────────────────────────────────────
+// 痛点：SSE 帧经 enc.encode() 变成 Uint8Array（V8 堆外 ArrayBuffer）后 enqueue 进
+// ReadableStream 队列。一个"不断开也不消费"的客户端（休眠标签页、半开代理、NAT 掉线）
+// 会让该连接的队列无界堆积——广播 patch 可达百 KB/帧、keepalive 每 20s 一帧，实测
+// 单个僵死连接即可贡献上百 MB/h 的 external 增速。防线：所有 SSE 流统一用字节计量
+// 策略创建（SSE_STREAM_QUEUING_STRATEGY），投递前检查 desiredSize，积压超过
+// SSE_BUFFER_MAX_BYTES 即判定为僵死连接：主动 error 掉流释放队列内存并踢出注册表，
+// 客户端会自动重连并拿快照重建状态。
+export const SSE_BUFFER_HIGH_WATER_MARK_BYTES = 1 * 1024 * 1024
+export const SSE_BUFFER_MAX_BYTES = 4 * 1024 * 1024
+
+export const SSE_STREAM_QUEUING_STRATEGY: QueuingStrategy<Uint8Array> = {
+  highWaterMark: SSE_BUFFER_HIGH_WATER_MARK_BYTES,
+  size: (chunk) => chunk.byteLength,
+}
+
 type SseConn = {
   connId: string
   userId: string
   controller: ReadableStreamDefaultController
   canViewAdminWorkflow: boolean
+}
+
+/**
+ * 受背压保护的入队。返回 false 表示连接已被踢出（调用方须将其从房间移除）。
+ * desiredSize（字节策略）= highWaterMark - 已积压字节；积压超上限即驱逐。
+ */
+function enqueueFrame(conn: SseConn, chunk: Uint8Array): boolean {
+  try {
+    conn.controller.enqueue(chunk)
+  } catch {
+    return false
+  }
+  const desired = conn.controller.desiredSize
+  if (typeof desired === "number" && desired < SSE_BUFFER_HIGH_WATER_MARK_BYTES - SSE_BUFFER_MAX_BYTES) {
+    console.warn(
+      "[canvas-sse] stalled connection evicted (outbound buffer overflow)",
+      { connId: conn.connId, userId: conn.userId, bufferedBytes: SSE_BUFFER_HIGH_WATER_MARK_BYTES - desired },
+    )
+    try { conn.controller.error(new Error("canvas-sse outbound buffer overflow")) } catch { /* already errored */ }
+    return false
+  }
+  return true
 }
 
 // chapterId → Set of active SSE connections
@@ -86,11 +124,8 @@ function deliverToRooms(rooms: string[], frame: string, senderConnId: string): v
     if (!conns?.size) continue
     for (const conn of conns) {
       if (senderConnId && conn.connId === senderConnId) continue
-      try {
-        conn.controller.enqueue(enc.encode(projectFrameForConnection(frame, conn.canViewAdminWorkflow)))
-      } catch {
-        conns.delete(conn)
-      }
+      const ok = enqueueFrame(conn, enc.encode(projectFrameForConnection(frame, conn.canViewAdminWorkflow)))
+      if (!ok) conns.delete(conn)
     }
   }
 }
@@ -214,14 +249,12 @@ function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
     sweepAgentTurns()
     const ping = enc.encode(': keepalive\n\n')
-    for (const conns of chapterConns.values()) {
+    for (const [room, conns] of chapterConns) {
       for (const conn of conns) {
-        try {
-          conn.controller.enqueue(ping)
-        } catch {
-          conns.delete(conn)
-        }
+        const ok = enqueueFrame(conn, ping)
+        if (!ok) conns.delete(conn)
       }
+      if (conns.size === 0) chapterConns.delete(room)
     }
   }, 20_000)
 }
@@ -281,6 +314,13 @@ export function broadcastPatch(
  *  注意：只统计本进程连接，多副本部署下是每实例视角（现有调用方均可接受）。 */
 export function countChapterConns(chapterId: string): number {
 	return chapterConns.get(chapterId)?.size ?? 0;
+}
+
+/** 本进程全部活跃 SSE 连接数（[mem] 周期打点用）。 */
+export function countAllCanvasSseConns(): number {
+	let total = 0
+	for (const conns of chapterConns.values()) total += conns.size
+	return total
 }
 
 export type RunStatusEvent = Omit<

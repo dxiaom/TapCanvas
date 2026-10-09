@@ -5882,7 +5882,12 @@ function TaskNodeInner({ id, data, selected, dragging }: NodeProps<TaskNodeType>
       if (durableUrl) {
         const fresh = useRFStore.getState().nodes.find((n) => n.id === id)
         const patch = buildComposeUrlSwapPatch(fresh?.data, blobUrl, durableUrl, uploadToken)
-        if (patch) updateNodeData(id, patch)
+        if (patch) {
+          updateNodeData(id, patch)
+          // swap patch 已把节点数据里该 blob: 的最后一处引用换成持久 URL，此时 revoke 才安全。
+          // patch 为 null（期间节点数据已变、blob 引用还在）时保留 blob: 供本会话播放，与失败分支同语义。
+          URL.revokeObjectURL(blobUrl)
+        }
       }
     } catch (error: unknown) {
       toast(`成片已在当前会话生成，但持久化上传失败：${error instanceof Error ? error.message : String(error)}`, 'error')
@@ -9762,7 +9767,9 @@ const rewritePromptWithCharacters = React.useCallback(
         updateNodeData(id, { runCount: value })
       }}
       mappedControls={isVideoNode ? mappedVideoControls : isAudioNode ? mappedAudioControls : mappedImageControls}
-      showStyleChip={false}
+      // 视频节点同样会注入全局画风锚定（见 remoteRunner 视频路径 styleImages 注入），
+      // chip 必须可见才能满足「所见即所得」：隐藏它会让用户以为没带参考图。
+      showStyleChip={isVideoNode || isImageNode || kind === 'imageEdit'}
       styleImageCount={styleImages.length}
       onStyleClick={() => setStyleImagePickerOpen(true)}
       onStyleClear={handleStyleClear}

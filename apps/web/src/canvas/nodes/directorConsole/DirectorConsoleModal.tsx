@@ -719,6 +719,9 @@ export default function DirectorConsoleModal({ nodeId, onClose }: Props) {
   }, [data, apply])
 
   const onSetSkybox = React.useCallback((file: File | null) => {
+    // 替换/清除天空盒时，旧的本地上传 blob 资产已无数据引用，显式释放，避免反复上传泄漏。
+    const previous = data.scene.skybox
+    if (typeof previous === 'string' && previous.startsWith('blob:')) URL.revokeObjectURL(previous)
     apply(setSkybox(data, file ? URL.createObjectURL(file) : undefined))
   }, [data, apply])
 

@@ -16,6 +16,39 @@ let lastDegradedLogAt = 0;
 const DEGRADED_LOG_THROTTLE_MS = 5_000;
 const DURABLE_ARTIFACT_KEY = "workflow-state";
 
+// 内存层上限：draft 状态机会为每轮修订写入 current/history/repair 等多个 key，其中
+// history key 写后不再被读取，仅靠"读时惰性删除"永远轮不到 → 无界增长。此处统一
+// "写入时清理过期 + 超过上限删最旧"（LRU 语义，Map 迭代序=插入序）。值是 draft JSON
+// 长文本，heap 侧大户，必须封顶。
+const MAX_MEMORY_ENTRIES = 500;
+let lastMemoryEvictLogAt = 0;
+const MEMORY_EVICT_LOG_THROTTLE_MS = 30_000;
+
+function pruneMemory(now: number): void {
+  if (memory.size === 0) return;
+  for (const [key, entry] of memory) {
+    if (entry.expiresAt <= now) memory.delete(key);
+  }
+  let evicted = 0;
+  while (memory.size > MAX_MEMORY_ENTRIES) {
+    const oldestKey = memory.keys().next().value;
+    if (oldestKey === undefined) break;
+    memory.delete(oldestKey);
+    evicted += 1;
+  }
+  if (evicted > 0 && now - lastMemoryEvictLogAt > MEMORY_EVICT_LOG_THROTTLE_MS) {
+    lastMemoryEvictLogAt = now;
+    console.warn(
+      `[video-draft-store] memory cache over cap (${MAX_MEMORY_ENTRIES}); evicted ${evicted} oldest entries, remaining=${memory.size}`,
+    );
+  }
+}
+
+/** 当前内存层条目数（[mem] 周期打点用）。 */
+export function resilientDraftMemorySize(): number {
+  return memory.size;
+}
+
 type DurableEnvelope = {
   version: 1;
   key: string;
@@ -197,6 +230,8 @@ function setMemory(key: string, value: string, ttlSeconds: number): void {
     value,
     expiresAt: Date.now() + Math.max(1, ttlSeconds) * 1_000,
   });
+  // 先写后清：保证"每次写入后 size ≤ 上限"这一不变量成立（ prune 会清过期并按插入序淘汰最旧）。
+  pruneMemory(Date.now());
 }
 
 function applyMemoryBatch(operations: readonly BatchOperation[]): void {

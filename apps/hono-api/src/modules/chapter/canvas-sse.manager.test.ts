@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { subscribeToChapter, countChapterConns, broadcastPatch, broadcastRunStatus, broadcastToolProgress } from "./canvas-sse.manager";
+import { subscribeToChapter, countChapterConns, broadcastPatch, broadcastRunStatus, broadcastToolProgress, SSE_STREAM_QUEUING_STRATEGY } from "./canvas-sse.manager";
 
 function fakeController() {
 	return { enqueue() {}, close() {}, error() {} } as unknown as ReadableStreamDefaultController;
@@ -200,5 +200,63 @@ describe("broadcastToolProgress", () => {
 		expect(() => broadcastToolProgress(`empty-${Math.random()}`, {
 			toolCallId: "c", toolName: "x", completed: 0, total: 1, failed: 0, chapterId: null,
 		})).not.toThrow();
+	});
+});
+
+describe("SSE 出站背压（external 内存泄漏防线）", () => {
+	/** 用生产同款字节计量策略创建一个"从不消费"的真实流控制器（模拟僵死客户端）。 */
+	function stalledController(): { controller: ReadableStreamDefaultController; errored: () => boolean } {
+		let captured: ReadableStreamDefaultController | null = null;
+		let errorSignaled = false;
+		const stream = new ReadableStream({
+			start(controller) { captured = controller; },
+		}, SSE_STREAM_QUEUING_STRATEGY);
+		// reader.closed 在 error() 时 reject；不 read，队列保持堆积。
+		void stream.getReader().closed.catch(() => { errorSignaled = true; });
+		return {
+			controller: captured as unknown as ReadableStreamDefaultController,
+			errored: () => errorSignaled,
+		};
+	}
+
+	it("慢/僵死连接积压超过 SSE_BUFFER_MAX_BYTES 后被驱逐并断开", async () => {
+		const room = `bp-stalled-${Math.random()}`;
+		const stalled = stalledController();
+		const sub = subscribeToChapter(room, "stalled-user", stalled.controller);
+
+		// 单帧 ~300KB；超过 HWM(1MB)+MAX(4MB) 必然触发驱逐
+		const bigNode = { id: "n", data: { kind: "text", blob: "x".repeat(300 * 1024) } };
+		for (let i = 0; i < 40 && countChapterConns(room) > 0; i += 1) {
+			broadcastPatch(room, { upsertNodes: [bigNode] }, "");
+		}
+
+		expect(countChapterConns(room)).toBe(0);
+		// controller.error() 的 reject 异步送达 reader.closed，让一个宏任务跑完再断言
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(stalled.errored()).toBe(true);
+		sub.unsubscribe(); // 已被驱逐，幂等
+	});
+
+	it("正常消费的连接不受影响（积压在水位内持续投递）", async () => {
+		const room = `bp-healthy-${Math.random()}`;
+		const received: string[] = [];
+		let captured!: ReadableStreamDefaultController;
+		const stream = new ReadableStream({
+			start(controller) { captured = controller; },
+		}, SSE_STREAM_QUEUING_STRATEGY);
+		void stream
+			.pipeTo(new WritableStream({
+				write(chunk) { received.push(new TextDecoder().decode(chunk)); },
+			}))
+			.catch(() => {});
+		const sub = subscribeToChapter(room, "healthy-user", captured);
+		broadcastPatch(room, { upsertNodes: [{ id: "n1", data: { kind: "text" } }] }, "");
+		broadcastPatch(room, { upsertNodes: [{ id: "n2", data: { kind: "text" } }] }, "");
+		sub.unsubscribe();
+		// pipeTo 异步消费，等微任务+定时器排空后再断言
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(received.some((w) => w.includes('"n1"'))).toBe(true);
+		expect(received.some((w) => w.includes('"n2"'))).toBe(true);
+		expect(countChapterConns(room)).toBe(0);
 	});
 });

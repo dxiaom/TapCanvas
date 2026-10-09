@@ -2269,11 +2269,6 @@ export function isGeminiNativeImageModel(modelKey: string): boolean {
 		|| /nano[-_]?banana/i.test(modelKey);
 }
 
-// Agnes 视频模型走专用 body 契约（mode/seconds/size/aspect_ratio），见视频分支。
-export function isAgnesVideoModel(modelKey: string): boolean {
-	return modelKey.trim().toLowerCase().startsWith("agnes-video");
-}
-
 // Agnes 上游（境外）下载不了 EdgeOne 国内加速域的媒体 URL（实测报
 // "media URL could not be downloaded"）。发给 agnes 的媒体链接统一改走
 // R2 的 Cloudflare 直连域（全球 anycast，上游必然可达）；画布内展示仍用加速域。
@@ -4053,7 +4048,9 @@ async function runTaskViaNewApi(
 		// （model/prompt/mode/seconds/size/aspect_ratio/seed/n，keyframe 用 first_frame/last_frame，
 		// reference 用 images/audios）。response_format、duration、resolution、metadata 均被上游拒绝，
 		// 且 mode 为必填——因此按文档构造专用请求体，不走通用 OpenAI 视频分支。
-		if (isAgnesVideoModel(model)) {
+		// 注意：本函数作用域内存在局部布尔 isAgnesVideoModel（见上方判定），
+		// 会遮蔽模块级同名函数，因此这里直接使用同一判据内联判断。
+		if (/^agnes-video/i.test(model)) {
 			const agnesFirstFrameUrl =
 				typeof extras.firstFrameUrl === "string" ? extras.firstFrameUrl.trim() : "";
 			const agnesLastFrameUrl =
@@ -4559,9 +4556,8 @@ export async function fetchNewApiTaskResult(
 				Accept: "application/json",
 			},
 		},
-		typeof input?.timeoutMs === "number"
-			? { provider: vendorRaw, timeoutMs: input.timeoutMs }
-			: { provider: vendorRaw },
+		{ provider: vendorRaw },
+		typeof input?.timeoutMs === "number" ? { timeoutMs: input.timeoutMs } : undefined,
 	);
 	const assets = extractNewApiVideoAssets(data);
 	const parsedResult = attachGenerationAssetContextToTaskResult(

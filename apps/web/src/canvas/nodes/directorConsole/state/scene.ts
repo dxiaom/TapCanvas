@@ -78,9 +78,22 @@ export function patchCamera(d: DirectorConsoleData, id: string, patch: Partial<C
   return next
 }
 
+/**
+ * 场景变更后，释放"被移除且不再被任何角色引用"的本地 blob 模型。
+ * modelId 可能是库内 ID 或本地上传的 blob: URL；只有 blob: 且无人引用的才需要释放。
+ */
+export function releaseDetachedCharacterModels(before: CharacterObj[], after: CharacterObj[]): void {
+  const retained = new Set(after.map((c) => c.modelId))
+  for (const c of before) {
+    if (c.modelId.startsWith('blob:') && !retained.has(c.modelId)) URL.revokeObjectURL(c.modelId)
+  }
+}
+
 export function removeObject(d: DirectorConsoleData, id: string): DirectorConsoleData {
   const next = clone(d)
+  const previousCharacters = next.scene.characters
   next.scene.characters = next.scene.characters.filter((c) => c.id !== id)
+  releaseDetachedCharacterModels(previousCharacters, next.scene.characters)
   next.scene.cameras = next.scene.cameras.filter((c) => c.id !== id)
   if (next.selectedObjectId === id) next.selectedObjectId = undefined
   if (next.scene.activeCameraId === id) next.scene.activeCameraId = next.scene.cameras[0]?.id

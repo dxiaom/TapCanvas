@@ -6,6 +6,7 @@ import {
   type AccountCreditsPage,
   type AccountOverview,
 } from '../accountApi'
+import { hasMembershipDailyGift } from './membershipPlanViewModel'
 
 type CreditEntryTone = 'credit' | 'deduct' | 'reserve' | 'release' | 'expire' | 'neutral'
 
@@ -83,8 +84,10 @@ export function presentCreditEntry(entry: Pick<AccountCreditEntry, 'type' | 'amo
 export function presentMembershipEntitlements(current: AccountMembershipCurrent): MembershipEntitlementMetric[] {
   const metrics: MembershipEntitlementMetric[] = [
     { label: '每月积分', value: formatCreditAmount(current.monthlyCredits) },
-    { label: '每日赠送', value: formatCreditAmount(current.dailyGiftCredits) },
   ]
+  if (hasMembershipDailyGift(current.dailyGiftCredits)) {
+    metrics.push({ label: '每日赠送', value: formatCreditAmount(current.dailyGiftCredits) })
+  }
   if (current.capacityLabel) metrics.push({ label: '动态算力', value: current.capacityLabel })
   metrics.push({ label: '同时任务', value: creditNumber.format(Math.max(0, Math.trunc(current.concurrencyLimit))) })
   return metrics

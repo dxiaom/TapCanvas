@@ -126,7 +126,10 @@ export function useYjsCanvasSync(flowId: string, enabled: boolean): YjsMode {
         provider.destroy()
       }
       usePresenceStore.getState()._clearAll()
-      // local 模式保留 doc 以便复用；ws 模式销毁连接但保留 doc 缓存
+      // Y.Doc 只是 store/服务端的 CRDT 镜像，不是真源；卸载即销毁，避免每个打开过的
+      // flowId 永久滞留一份全图文档。重挂载时 getCanvasDoc 新建，isDocEmpty 分支会用
+      // store 当前态（或 ws 远端态）幂等回灌。
+      destroyCanvasDoc(flowId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flowId, enabled, mode, user])
@@ -153,5 +156,3 @@ function applyRemoteToStore(
     queueMicrotask(() => { applyingRemoteRef.current = false })
   }
 }
-
-export { destroyCanvasDoc }

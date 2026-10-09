@@ -29,6 +29,7 @@ import {
   getMyTeam,
   upsertProject,
   pingActivity,
+  toggleProjectPublic,
   API_BASE,
   type FlowDto,
   type FlowSaveReceipt,
@@ -1592,15 +1593,28 @@ function CanvasApp({
     }
   }, [])
 
-  const handleCopyShareLink = React.useCallback(() => {
+  const handleCopyShareLink = React.useCallback(async () => {
     const pid = currentProject?.id
     if (!pid) { toast('请先保存项目', 'info'); return }
+    // 分享链路依赖公开端点（后端要求 is_public=1），复制前先确保项目已公开，
+    // 否则访客打开 /share 必然 403（project_process_not_public）。
+    let newlyPublic = false
+    if (currentProject?.isPublic !== true) {
+      try {
+        await toggleProjectPublic(pid, true)
+      } catch (error) {
+        toast(error instanceof Error ? error.message : '设为公开失败，无法分享', 'error')
+        return
+      }
+      newlyPublic = true
+      useUIStore.getState().setCurrentProject({ ...currentProject, id: pid, isPublic: true })
+    }
     const url = `${window.location.origin}/share?projectId=${pid}`
     navigator.clipboard.writeText(url).then(
-      () => toast('链接已复制', 'success'),
+      () => toast(newlyPublic ? '项目已公开，链接已复制' : '链接已复制', 'success'),
       () => toast(`请手动复制：${url}`, 'info'),
     )
-  }, [currentProject?.id])
+  }, [currentProject])
 
   if (!projectSelectionReady) {
     return <CanvasLoadingScreen fixed />

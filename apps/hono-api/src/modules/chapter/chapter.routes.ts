@@ -31,7 +31,7 @@ import {
 	CanvasFlowNotFoundError,
 	CanvasFlowRevisionConflictError,
 } from "./chapter.canvas-flow.service";
-import { subscribeToChapter, broadcastPatch } from "./canvas-sse.manager";
+import { subscribeToChapter, broadcastPatch, SSE_STREAM_QUEUING_STRATEGY } from "./canvas-sse.manager";
 
 import { setChapterFilmSpec } from "../task/video-orchestrator.authoring.repo";
 import { buildChapterVideoRunStatusSnapshot } from "../task/video-run.status-snapshot";
@@ -218,6 +218,7 @@ authed.get("/:id/canvas-events", async (c) => {
 	}
 
 	const enc = new TextEncoder();
+	// 字节计量策略：让 manager 能用 desiredSize 精确监测每连接出站积压（背压驱逐依赖它）。
 	const stream = new ReadableStream({
 		start(controller) {
 			const { connId, unsubscribe } = subscribeToChapter(chapterId, userId, controller, {
@@ -243,7 +244,7 @@ authed.get("/:id/canvas-events", async (c) => {
 				try { controller.close(); } catch { /* already closed */ }
 			});
 		},
-	});
+	}, SSE_STREAM_QUEUING_STRATEGY);
 
 	return new Response(stream, {
 		headers: {

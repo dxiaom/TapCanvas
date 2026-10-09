@@ -77,6 +77,11 @@ export function classifyMembershipPurchase(
   return doesNotReduceEntitlements && improvesAtLeastOneEntitlement ? 'upgrade' : 'downgrade'
 }
 
+/** schema 要求 dailyGiftCredits ≥ 1，未配置日赠的套餐用 1 占位；≤1 视为无每日赠送。 */
+export function hasMembershipDailyGift(dailyGiftCredits: number): boolean {
+  return dailyGiftCredits > 1
+}
+
 export function membershipPlanSummary(card: MembershipPlanCard, variant: MembershipPlanVariant): string {
   if (card.variants.length > 1) {
     const capacityLabels = card.variants.map((item) => item.capacityLabel).filter(Boolean)
@@ -85,7 +90,10 @@ export function membershipPlanSummary(card: MembershipPlanCard, variant: Members
       : capacityLabels[0] || variant.capacityLabel
     return `动态算力 ${capacityRange}`
   }
-  return `每月 ${variant.monthlyCredits.toLocaleString('zh-CN')} 积分 + 每日赠送 ${variant.dailyGiftCredits.toLocaleString('zh-CN')}`
+  const dailyGiftSuffix = hasMembershipDailyGift(variant.dailyGiftCredits)
+    ? ` + 每日赠送 ${variant.dailyGiftCredits.toLocaleString('zh-CN')}`
+    : ''
+  return `每月 ${variant.monthlyCredits.toLocaleString('zh-CN')} 积分${dailyGiftSuffix}`
 }
 
 export function formatMembershipDiscount(priceCents: number, compareAtPriceCents: number | null): string | null {

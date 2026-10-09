@@ -14,8 +14,17 @@ export type PlaybackState = {
 
 const store = new Map<string, PlaybackState>()
 
+/** 每个节点只保留最新播放源的恢复状态：重新生成会产出新 src，旧 src 条目若不清理会随操作数无界增长。 */
+function pruneOtherEntriesForNode(key: string): void {
+  const nodePrefix = `${key.split('::')[0]}::`
+  for (const existingKey of store.keys()) {
+    if (existingKey !== key && existingKey.startsWith(nodePrefix)) store.delete(existingKey)
+  }
+}
+
 export function saveVideoPlayback(key: string | null | undefined, state: PlaybackState): void {
   if (!key) return
+  pruneOtherEntriesForNode(key)
   store.set(key, state)
 }
 

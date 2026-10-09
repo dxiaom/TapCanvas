@@ -6,6 +6,7 @@ import { useAuth } from '../auth/store'
 import { getAccountOverview, type AccountOverview } from './accountApi'
 import {
   buildMembershipPlanCards,
+  hasMembershipDailyGift,
   type MembershipBillingCycle,
   type MembershipPlanCard,
   type MembershipPlanVariant,
@@ -66,10 +67,16 @@ export default function PricingPage(): JSX.Element {
 
   const { busy, phase, qrDataUrl, purchase, switchPayMethod, closeScanModal } = useMembershipPurchase(refreshOverview)
 
-  const cards = React.useMemo(
-    () => buildMembershipPlanCards(plans ?? [], cycle).cards,
-    [plans, cycle],
+  const annualAvailable = React.useMemo(
+    () => buildMembershipPlanCards(plans ?? [], 'annual').cards.length > 0,
+    [plans],
   )
+  const effectiveCycle: MembershipBillingCycle = annualAvailable ? cycle : 'monthly'
+  const cards = React.useMemo(
+    () => buildMembershipPlanCards(plans ?? [], effectiveCycle).cards,
+    [plans, effectiveCycle],
+  )
+  const hasDailyGift = cards.some((card) => card.variants.some((variant) => hasMembershipDailyGift(variant.dailyGiftCredits)))
 
   const current = overview?.membership.current ?? null
 
@@ -88,25 +95,27 @@ export default function PricingPage(): JSX.Element {
   return (
     <div className="neo-pricing">
       <PortalHeader
-        active="home"
+        active="pricing"
         onRequestLogin={() => setLoginOpen(true)}
       />
       <div className="tc-portal-scroll-area">
         <main className="neo-pricing__main">
           <span className="pricing-kicker">Pricing</span>
           <h1 className="pricing-title">选择你的创作套餐</h1>
-          <p className="pricing-subtitle">开通即得本月积分，会员期内每日赠送积分，当日有效。</p>
-          <div className="pricing-cycle-switch">
-            <SegmentedControl
-              size="md"
-              value={cycle}
-              onChange={(value: string) => setCycle(value === 'annual' ? 'annual' : 'monthly')}
-              data={[
-                { label: '年付', value: 'annual' },
-                { label: '月付', value: 'monthly' },
-              ]}
-            />
-          </div>
+          <p className="pricing-subtitle">开通即得本月积分{hasDailyGift ? '，会员期内每日赠送积分，当日有效' : ''}。</p>
+          {annualAvailable ? (
+            <div className="pricing-cycle-switch">
+              <SegmentedControl
+                size="md"
+                value={cycle}
+                onChange={(value: string) => setCycle(value === 'annual' ? 'annual' : 'monthly')}
+                data={[
+                  { label: '年付', value: 'annual' },
+                  { label: '月付', value: 'monthly' },
+                ]}
+              />
+            </div>
+          ) : null}
           {cards.length > 0 ? (
             <div className="pricing-grid">
               {cards.map((card) => (
@@ -115,7 +124,7 @@ export default function PricingPage(): JSX.Element {
                   current={current}
                   busy={busy}
                   onPurchase={handlePurchase}
-                  key={`${card.product.id}:${cycle}`}
+                  key={`${card.product.id}:${effectiveCycle}`}
                 />
               ))}
             </div>

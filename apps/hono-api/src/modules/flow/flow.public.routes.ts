@@ -25,7 +25,7 @@ import {
 } from "./flow.public.schemas";
 import { applyPublicFlowGraphPatch, buildCanvasSyncPatch } from "./flow.public.service";
 import { syncCanvasBookFromFlow } from "./flow.canvas-book-sync";
-import { broadcastPatch, subscribeToChapter } from "../chapter/canvas-sse.manager";
+import { broadcastPatch, subscribeToChapter, SSE_STREAM_QUEUING_STRATEGY } from "../chapter/canvas-sse.manager";
 import { applyPatchToFlowYDoc } from "../realtime/yjs-realtime";
 import { prepareProjectFlowScopeRepair } from "./flow.project-scope-repair";
 import { isAdminRequest } from "../team/team.service";
@@ -462,6 +462,7 @@ export function registerPublicFlowRoutes(publicApiRouter: OpenAPIHono<AppEnv>) {
 		}
 		const channelId = row.project_id ?? id;
 		const enc = new TextEncoder();
+		// 字节计量策略：让 manager 能用 desiredSize 精确监测每连接出站积压（背压驱逐依赖它）。
 		const stream = new ReadableStream({
 			start(controller) {
 				const { connId, unsubscribe } = subscribeToChapter(channelId, userId, controller);
@@ -474,7 +475,7 @@ export function registerPublicFlowRoutes(publicApiRouter: OpenAPIHono<AppEnv>) {
 					try { controller.close(); } catch { /* already closed */ }
 				});
 			},
-		});
+		}, SSE_STREAM_QUEUING_STRATEGY);
 		return new Response(stream, {
 			headers: {
 				"Content-Type": "text/event-stream",

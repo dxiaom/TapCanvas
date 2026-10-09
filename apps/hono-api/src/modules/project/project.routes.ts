@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../../types";
 import { apiKeyAuthMiddleware } from "../apiKey/apiKey.middleware";
-import { subscribeToChapter, broadcastPatch, broadcastRunStatus } from "../chapter/canvas-sse.manager";
+import { subscribeToChapter, broadcastPatch, broadcastRunStatus, SSE_STREAM_QUEUING_STRATEGY } from "../chapter/canvas-sse.manager";
 import {
 	getProjectForUserAccess,
 	isValidWorkflow,
@@ -305,6 +305,7 @@ authed.get("/:id/canvas-events", async (c) => {
 	if (!project) return c.json({ error: "Forbidden" }, 403);
 
 	const enc = new TextEncoder();
+	// 字节计量策略：让 manager 能用 desiredSize 精确监测每连接出站积压（背压驱逐依赖它）。
 	const stream = new ReadableStream({
 		start(controller) {
 			const { connId, unsubscribe } = subscribeToChapter(projectId, userId, controller, {
@@ -330,7 +331,7 @@ authed.get("/:id/canvas-events", async (c) => {
 				try { controller.close(); } catch { /* already closed */ }
 			});
 		},
-	});
+	}, SSE_STREAM_QUEUING_STRATEGY);
 
 	return new Response(stream, {
 		headers: {

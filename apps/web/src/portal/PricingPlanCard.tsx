@@ -4,6 +4,7 @@ import type { AccountMembershipCurrent } from './account/AccountCreditsView'
 import {
   classifyMembershipPurchase,
   formatMembershipDiscount,
+  hasMembershipDailyGift,
   membershipPlanSummary,
   type MembershipPlanCard,
   type MembershipPlanVariant,
@@ -92,10 +93,12 @@ export function PricingPlanCard({ card, current, busy, onPurchase }: {
           <span className="pricing-card__stat-label">{multiVariant ? `每月获得 · ${variant.capacityLabel}` : '每月获得'}</span>
           <strong className="pricing-card__stat-value">{variant.monthlyCredits.toLocaleString('zh-CN')}</strong>
         </div>
-        <div className="pricing-card__stat">
-          <span className="pricing-card__stat-label">每日赠送 · 当日有效</span>
-          <strong className="pricing-card__stat-value">{variant.dailyGiftCredits.toLocaleString('zh-CN')}</strong>
-        </div>
+        {hasMembershipDailyGift(variant.dailyGiftCredits) ? (
+          <div className="pricing-card__stat">
+            <span className="pricing-card__stat-label">每日赠送 · 当日有效</span>
+            <strong className="pricing-card__stat-value">{variant.dailyGiftCredits.toLocaleString('zh-CN')}</strong>
+          </div>
+        ) : null}
       </div>
       <button className="pricing-card__cta" type="button" disabled={busy} onClick={() => onPurchase(card, variant)}>
         {purchaseLabel(kind)} {card.product.title}

@@ -6,12 +6,13 @@ export const loadPromptLibraryPage = () => import('./PromptLibraryPage')
 export const loadPromptDetailPage = () => import('./PromptDetailPage')
 export const loadPricingPage = () => import('./PricingPage')
 
-export type PortalModuleRoute = 'home' | 'neo-tv' | 'prompts' | 'projects' | 'skills'
+export type PortalModuleRoute = 'home' | 'neo-tv' | 'prompts' | 'projects' | 'skills' | 'pricing'
 
 export function preloadPortalRoute(route: PortalModuleRoute): Promise<unknown> {
   if (route === 'home') return loadNeoHomePage()
   if (route === 'neo-tv') return loadNeoTvPage()
   if (route === 'prompts') return loadPromptLibraryPage()
   if (route === 'skills') return loadSkillPortalPage()
+  if (route === 'pricing') return loadPricingPage()
   return loadCanvasHubPage()
 }
