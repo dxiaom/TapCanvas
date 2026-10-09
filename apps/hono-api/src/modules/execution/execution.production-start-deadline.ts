@@ -1,10 +1,13 @@
+import { DEFAULT_TARGET_DURATION_MS } from "../../../../../packages/schemas/logical-task-budget/index.cjs";
+import { flattenWorkflowNodeTree } from "./execution.node-tree";
+
 export const WORKFLOW_VIDEO_PROVIDER_EXECUTOR_REF = "tapcanvas.video.generate/v1";
 
 export type WorkflowProductionStartDeadlineV2 = Readonly<{
 	version: 2;
 	kind: "video_provider_receipt";
 	source: "public_chat";
-	anchor: "workflow_execution_created";
+	anchor: "request_accepted";
 	publicTurnId: string;
 	acceptedAt: string;
 	deadlineAt: string;
@@ -24,7 +27,7 @@ export type WorkflowExecutionControlAdmissionV2 = Readonly<{
 		kind: "video_provider_receipt";
 		source: "public_chat";
 		publicTurnId: string;
-		windowMs: number;
+		acceptedAt: string;
 		targetExecutorRef: typeof WORKFLOW_VIDEO_PROVIDER_EXECUTOR_REF;
 	}>;
 }>;
@@ -55,9 +58,15 @@ function controlledUpstreamNodeIds(
 	targetExecutorRef: string,
 ): readonly string[] {
 	const nodes = Array.isArray(flowData.nodes) ? flowData.nodes : [];
+	const nestedTargetParents = new Set<string>();
 	const targetNodeIds = nodes.flatMap((node) => {
-		if (!isRecord(node) || workflowNodeExecutorRef(node) !== targetExecutorRef) return [];
+		if (!isRecord(node)) return [];
 		const nodeId = readNonEmptyString(node.id);
+		if (workflowNodeExecutorRef(node) !== targetExecutorRef) {
+			const containsTarget = flattenWorkflowNodeTree([node]).some(inner => inner !== node && workflowNodeExecutorRef(inner) === targetExecutorRef);
+			if (!nodeId || !containsTarget) return [];
+			nestedTargetParents.add(nodeId);
+		}
 		return nodeId ? [nodeId] : [];
 	});
 	if (targetNodeIds.length === 0) {
@@ -78,7 +87,7 @@ function controlledUpstreamNodeIds(
 		sources.push(source);
 		reverse.set(target, sources);
 	}
-	const controlled = new Set<string>();
+	const controlled = new Set<string>(nestedTargetParents);
 	const frontier = [...targetNodeIds];
 	while (frontier.length > 0) {
 		const target = frontier.pop();
@@ -95,26 +104,24 @@ function controlledUpstreamNodeIds(
 export function materializeWorkflowExecutionControl(
 	flowData: Record<string, unknown>,
 	admission: WorkflowExecutionControlAdmissionV2,
-	executionCreatedAt: string,
 ): WorkflowExecutionControlV2 {
 	const deadline = admission.productionStartDeadline;
 	const publicTurnId = readNonEmptyString(deadline.publicTurnId);
-	const acceptedAt = readIsoTimestamp(executionCreatedAt);
-	const windowMs = Number.isFinite(deadline.windowMs) ? Math.floor(deadline.windowMs) : 0;
-	if (!publicTurnId || !acceptedAt || windowMs <= 0) {
+	const acceptedAt = readIsoTimestamp(deadline.acceptedAt);
+	if (!publicTurnId || !acceptedAt) {
 		throw new Error("Workflow production-start deadline admission is invalid");
 	}
 	if (deadline.targetExecutorRef !== WORKFLOW_VIDEO_PROVIDER_EXECUTOR_REF) {
 		throw new Error("Workflow production-start target executor is invalid");
 	}
-	const deadlineAt = new Date(Date.parse(acceptedAt) + windowMs).toISOString();
+	const deadlineAt = new Date(Date.parse(acceptedAt) + DEFAULT_TARGET_DURATION_MS).toISOString();
 	return {
 		version: 2,
 		productionStartDeadline: {
 			version: 2,
 			kind: deadline.kind,
 			source: deadline.source,
-			anchor: "workflow_execution_created",
+			anchor: "request_accepted",
 			publicTurnId,
 			acceptedAt,
 			deadlineAt,
@@ -140,11 +147,12 @@ export function parseWorkflowExecutionControl(value: unknown): WorkflowExecution
 		deadline.version !== 2
 		|| deadline.kind !== "video_provider_receipt"
 		|| deadline.source !== "public_chat"
-		|| deadline.anchor !== "workflow_execution_created"
+		|| deadline.anchor !== "request_accepted"
 		|| deadline.targetExecutorRef !== WORKFLOW_VIDEO_PROVIDER_EXECUTOR_REF
 		|| !publicTurnId
 		|| !acceptedAt
 		|| !deadlineAt
+		|| Date.parse(deadlineAt) !== Date.parse(acceptedAt) + DEFAULT_TARGET_DURATION_MS
 		|| controlledNodeIds.length === 0
 	) return null;
 	return {
@@ -153,7 +161,7 @@ export function parseWorkflowExecutionControl(value: unknown): WorkflowExecution
 			version: 2,
 			kind: "video_provider_receipt",
 			source: "public_chat",
-			anchor: "workflow_execution_created",
+			anchor: "request_accepted",
 			publicTurnId,
 			acceptedAt,
 			deadlineAt,
@@ -161,22 +169,4 @@ export function parseWorkflowExecutionControl(value: unknown): WorkflowExecution
 			controlledNodeIds: [...new Set(controlledNodeIds)].sort(),
 		},
 	};
-}
-
-/**
- * Every pre-provider Agent observes the one immutable public production-start
- * deadline. Do not subdivide that deadline into speculative retry shares: a
- * physical timeout does not guarantee that the provider emitted a resumable
- * candidate, so an early artificial cutoff can turn one healthy inference into
- * several shorter from-scratch inferences. The execution-level deadline worker
- * remains the single authority that cancels unaccepted branches at deadlineAt.
- */
-export function computeWorkflowAgentPhysicalAttemptDeadlineAt(input: Readonly<{
-	productionStartDeadline: WorkflowProductionStartDeadlineV2;
-}>): string {
-	const finalDeadlineMs = Date.parse(input.productionStartDeadline.deadlineAt);
-	if (!Number.isFinite(finalDeadlineMs)) {
-		throw new Error("Workflow production-start deadline is invalid");
-	}
-	return new Date(finalDeadlineMs).toISOString();
 }

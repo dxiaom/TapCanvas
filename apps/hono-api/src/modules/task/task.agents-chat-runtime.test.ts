@@ -128,7 +128,7 @@ describe("agents chat runtime status", () => {
 			get: () => undefined,
 		} as unknown as AppContext;
 
-		await getAgentsChatTurnStatus(context, "user-1", "session-1", { timeoutMs: 1_000 });
+		await getAgentsChatTurnStatus(context, "user-1", "session-1", { timeoutMs: 1_000, includeStructuredOutputRepair: true });
 		await interruptAgentsChatTurn(context, "user-1", {
 			sessionId: "session-1",
 			turnId: "turn-1",
@@ -140,6 +140,7 @@ describe("agents chat runtime status", () => {
 			sessionId: "session-1",
 		});
 		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ sessionId: "session-1", includeStructuredOutputRepair: true });
 		for (const call of fetchMock.mock.calls) {
 			const init = call[1];
 			expect(new Headers(init?.headers).get(
@@ -638,7 +639,7 @@ describe("agents chat runtime status", () => {
 		});
 	});
 
-	it("preserves an active logical task across an interrupted physical run", () => {
+	it.each(["agent_running", "suspended"] as const)("preserves interrupted logical work without inventing a live transport (%s)", (phase) => {
 		const result = parseAgentsChatTurnStatusSnapshot({
 			sessionId: "session_1",
 			durable: true,
@@ -659,7 +660,7 @@ describe("agents chat runtime status", () => {
 					updatedAt: "2026-08-03T05:00:02.000Z",
 					continuationTicket: null,
 				},
-				phase: "agent_running",
+				phase,
 				startedAt: "2026-08-03T05:00:00.000Z",
 				updatedAt: "2026-08-03T05:00:02.000Z",
 				lastConfirmedAt: "2026-08-03T05:00:02.000Z",
@@ -683,9 +684,9 @@ describe("agents chat runtime status", () => {
 
 		expect(result.activeTurn).toBe(false);
 		expect(result.turn).toMatchObject({
-			state: "running",
+			state: phase === "suspended" ? "suspended" : "unknown",
 			logicalTaskState: { status: "active", physicalRunStatus: "interrupted" },
-			phase: "agent_running",
+			phase,
 			reasonCode: "provider_stream_interrupted",
 			recoveryCheckpoint: {
 				physicalRunId: "physical_run_interrupted_1",

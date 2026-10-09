@@ -4,9 +4,19 @@
 
 <h1 align="center">TapCanvas</h1>
 
+<p align="center">
+  <a href="https://github.com/anymouschina/TapCanvas/stargazers"><img src="https://img.shields.io/github/stars/anymouschina/TapCanvas?style=flat-square" alt="GitHub Stars" /></a>
+  <a href="https://atomgit.com/gcw_PzejWSbY/TapCanvas" target="_blank" rel="noopener noreferrer"><img src="https://atomgit.com/gcw_PzejWSbY/TapCanvas/star/badge.svg" alt="AtomGit Star" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT License" /></a>
+</p>
+
 TapCanvas is a multi-model AI content creation platform built around a visual canvas: orchestrate text, image, video and other generation workflows in one place, with fast iteration across multi-step creative pipelines.
 
 **Language:** [中文](README.md) | English
+
+## Changelog
+
+- **2026-09-23 · Director desk upgrade**: Synced TapCanvasPro's standalone director desk, based on [DirectorDesk](https://github.com/mangfufu/director-desk), for 3D scene blocking, character staging and camera previs. Connected TapCanvas AI chat, tool relay and reference-video export to the canvas, replaced the previous embedded implementation, and added MIT attribution. Web development and production builds now build the director desk automatically; install its standalone dependencies before first use.
 
 ## Latest Capabilities
 
@@ -16,6 +26,12 @@ TapCanvas is a multi-model AI content creation platform built around a visual ca
   <img src="assets/video-to-image.jpg" alt="Drag frame to generate reference image" width="1000" />
 </p>
 
+## HeyRoute referral credit
+
+[Register through our HeyRoute referral link](https://heyroute.ai/r/c/ch_iiq2tvtmrc) to claim **$15 in credits** for Codex, Claude and Gemini chat and the platform's image generation services (eligibility and model availability are subject to HeyRoute's terms).
+
+Seven built-in HeyRoute channels provide 31 models: 15 chat models (Claude, GPT, Grok, Gemini and Kimi), five image models and 11 video models (Grok, MiniMax H3 and Seedance), with per-channel pricing. In the new-api channel list or editor, click **Apply for API Key**, register through the link above, enter your own key and enable the desired channels. New channels start disabled with empty keys; upgrades preserve existing credentials and status. See the [initialization SQL](apps/new-api/patches/2026-09-11/004-expand-heyroute-channels.sql) and [integration notes](apps/new-api/docs/heyroute.md).
+
 ## Quick Start
 
 ### Local dev (recommended)
@@ -23,6 +39,7 @@ TapCanvas is a multi-model AI content creation platform built around a visual ca
 ```bash
 # 1) Install deps
 pnpm install
+npm --prefix apps/director-desk ci
 
 # 2) Configure env
 cp apps/web/.env.example apps/web/.env
@@ -108,6 +125,28 @@ Open-source projects built on top of TapCanvas:
 | [JarvisHub](https://github.com/LYL1015/JarvisHub) | An Open Harness for Canvas-Native Multimodal Creative Agents. Treats an editable canvas as shared project state between people and agents for long-horizon creative work (narrative media, interactive web dev, deck generation), with Skills / Memory / Subagents and a bundled Trace Viewer. Apache-2.0. |
 
 > Built something on TapCanvas? Open a PR or issue to get listed here.
+
+## Special Thanks
+
+Thanks to the following platform and open-source projects — TapCanvas' hosting, promotion and implementation are built on them.
+
+- **[AtomGit](https://atomgit.com/gcw_PzejWSbY/TapCanvas) / GitCode** — code hosting, open-source community promotion and badge data; the link above is this project's AtomGit entry.
+
+Upstream open-source projects:
+
+| Project | Role in this repository |
+| --- | --- |
+| [new-api](https://github.com/QuantumNous/new-api) (upstream: [One API](https://github.com/songquanpeng/one-api)) | Source implementation of the `apps/new-api` model gateway: channel access, metering and model delivery |
+| [DirectorDesk](https://github.com/mangfufu/director-desk) | MIT-licensed source of the `apps/director-desk` 3D previs, scene blocking, staging and camera tools |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | Official runtime, agent loop and tooling for the `apps/agents-cli` bridge |
+| [React Flow](https://github.com/xyflow/xyflow) (`@xyflow/react`) | Node, handle and edge kernel of the infinite canvas |
+| [Mantine](https://github.com/mantinedev/mantine) | Web UI components and theming |
+| [Hono](https://github.com/honojs/hono) | Worker routing and OpenAPI layer of `apps/hono-api` |
+| [Prisma](https://github.com/prisma/prisma) | Data models and database access |
+| [Vite](https://github.com/vitejs/vite) / [Vitest](https://github.com/vitest-dev/vitest) | Web build and tests |
+| [AI SDK](https://github.com/vercel/ai), [Zustand](https://github.com/pmndrs/zustand), [Tabler Icons](https://github.com/tabler/tabler-icons) | Model calls, frontend state management and icons |
+
+Dependency versions follow `apps/*/package.json` and `pnpm-lock.yaml`; every third-party component keeps its own upstream license.
 
 ## Contributing
 

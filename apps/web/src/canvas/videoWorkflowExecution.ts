@@ -1,14 +1,16 @@
-import type { Node } from '@xyflow/react'
 import { VIDEO_PRODUCTION_WORKFLOW_DEFINITION, VIDEO_PRODUCTION_WORKFLOW_KEY } from '@tapcanvas/video-orchestrator-protocol'
 import {
   WORKFLOW_AGENT_MAX_OUTPUT_TOKENS_MAX,
   WORKFLOW_AGENT_MAX_OUTPUT_TOKENS_MIN,
   WORKFLOW_ATOMIC_NODE_CATEGORIES,
+  WORKFLOW_PIPELINE_RUN_EXECUTOR_REF,
+  parseWorkflowPipelineRunSpec,
   type WorkflowAtomicNodeCategory,
 } from '@tapcanvas/workflow-kernel-protocol'
 import { useRFStore } from './store'
 import {
   VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
+  VIDEO_PROMPT_ONLY_WORKFLOW_NODE_IDS,
   VIDEO_WORKFLOW_MAX_CLIPS_MAX,
   VIDEO_WORKFLOW_MAX_CLIPS_MIN,
 } from './videoWorkflowCanvasTemplate'
@@ -81,17 +83,34 @@ export type CompiledVideoWorkflow = Readonly<{
   edges: readonly CompiledWorkflowEdge[]
 }>
 
-const PROMPT_ONLY_NODE_IDS = new Set([
-  'canvas-source',
-  'delivery-contract',
-  'beat-sheet-agent',
-  'beat-sheet-format',
-  'clip-fan-out',
-  'clip-writer-agent',
-  'prompt-package',
-])
+const PROMPT_ONLY_NODE_IDS = new Set<string>(VIDEO_PROMPT_ONLY_WORKFLOW_NODE_IDS)
 
-function nodeData(node: Node): Record<string, unknown> {
+type WorkflowNodeTreeEntry = Readonly<{ id: string; data: unknown }>
+
+function flattenWorkflowNodeTree(nodes: readonly WorkflowNodeTreeEntry[]): WorkflowNodeTreeEntry[] {
+  const flattened: WorkflowNodeTreeEntry[] = []
+  const visit = (node: WorkflowNodeTreeEntry): void => {
+    const data = node.data && typeof node.data === 'object' && !Array.isArray(node.data)
+      ? node.data as Record<string, unknown>
+      : {}
+    const pipeline = data.workflowPipeline
+    const spec = data.workflowAtomicSpec && typeof data.workflowAtomicSpec === 'object' && !Array.isArray(data.workflowAtomicSpec)
+      ? data.workflowAtomicSpec as Record<string, unknown>
+      : {}
+    if (spec.executorRef === WORKFLOW_PIPELINE_RUN_EXECUTOR_REF && pipeline === undefined) {
+      throw new Error(`Inline workflow node ${node.id} is missing its frozen pipeline`)
+    }
+    if (pipeline !== undefined) {
+      const parsed = parseWorkflowPipelineRunSpec(pipeline)
+      for (const step of parsed.steps) visit(step.node)
+    }
+    flattened.push(node)
+  }
+  for (const node of nodes) visit(node)
+  return flattened
+}
+
+function nodeData(node: Readonly<{ data: unknown }>): Record<string, unknown> {
   return node.data && typeof node.data === 'object' ? node.data as Record<string, unknown> : {}
 }
 
@@ -154,7 +173,7 @@ function requestedMediaConfiguration(
   return null
 }
 
-function compileNode(node: Node): CompiledVideoWorkflowNode | null {
+function compileNode(node: WorkflowNodeTreeEntry): CompiledVideoWorkflowNode | null {
   const data = nodeData(node)
   if (data.kind !== 'workflowStage') return null
   const spec = atomicSpec(data)
@@ -234,10 +253,18 @@ export function compileVideoWorkflow(
     throw new Error('当前工作流实例没有原子节点，请重新创建一键成片原子模板')
   }
   const compiledEdges = compileWorkflowPortEdges(graph.nodes, graph.edges)
-  const incompatibleEdge = compiledEdges.find((edge) => edge.sourcePort !== edge.targetPort)
-  if (incompatibleEdge) {
-    throw new Error(`一键成片端口类型不兼容：${incompatibleEdge.sourcePort} → ${incompatibleEdge.targetPort}`)
-  }
+  const scopedNodes = executionScope === 'prompt_only'
+    ? compiledNodes
+      .filter((node) => PROMPT_ONLY_NODE_IDS.has(node.workflowNodeId))
+      .map((node) => node.workflowNodeId === 'clip-fan-out'
+        ? { ...node, inputPorts: node.inputPorts.filter((port) => port !== 'asset-items') }
+        : node)
+    : compiledNodes
+  const scopedRootNodeIds = new Set(scopedNodes.map((node) => node.id))
+  const scopedRootNodes = graph.nodes.filter((node) => node.id === triggerNodeId || scopedRootNodeIds.has(node.id))
+  const configurationNodes = flattenWorkflowNodeTree(scopedRootNodes)
+    .map(compileNode)
+    .filter((node): node is CompiledVideoWorkflowNode => node !== null)
   const sourceNode = graph.nodes.find((node) => {
     const compiled = compileNode(node)
     return compiled?.category === 'source'
@@ -293,29 +320,26 @@ export function compileVideoWorkflow(
     throw new Error('请在“成片交付合同”节点中选择用于时长规划的视频模型')
   }
   if (executionScope === 'media_delivery') {
-    const estimateNode = compiledNodes.find((node) => node.workflowNodeId === 'cost-estimate')
-    const estimateConfiguration = estimateNode?.requestedMediaConfiguration
-    if (!estimateConfiguration || estimateConfiguration.kind !== 'video') {
-      throw new Error('请在“费用预估”节点中选择视频模型、分辨率和比例')
+    const estimateNodes = configurationNodes.filter((node) => node.category === 'tool' && node.operation === 'estimate')
+    if (estimateNodes.length === 0) throw new Error('媒体交付工作流缺少费用估算节点')
+    const unconfiguredEstimate = estimateNodes.find((node) => node.requestedMediaConfiguration?.kind !== 'video')
+    if (unconfiguredEstimate) {
+      throw new Error(`媒体估算节点“${unconfiguredEstimate.workflowNodeId}”必须选择视频模型、分辨率和比例`)
     }
-    if (estimateConfiguration.modelKey !== deliveryVideoModelKey) {
-      throw new Error('“成片交付合同”的时长能力模型必须与“费用预估”的视频模型一致')
+    const mismatchedEstimate = estimateNodes.find((node) => (
+      node.requestedMediaConfiguration?.kind === 'video'
+      && node.requestedMediaConfiguration.modelKey !== deliveryVideoModelKey
+    ))
+    if (mismatchedEstimate) {
+      throw new Error(`“成片交付合同”的时长能力模型必须与媒体估算节点“${mismatchedEstimate.workflowNodeId}”的视频模型一致`)
     }
   }
-
-  const scopedNodes = executionScope === 'prompt_only'
-    ? compiledNodes
-      .filter((node) => PROMPT_ONLY_NODE_IDS.has(node.workflowNodeId))
-      .map((node) => node.workflowNodeId === 'clip-fan-out'
-        ? { ...node, inputPorts: node.inputPorts.filter((port) => port !== 'asset-items') }
-        : node)
-    : compiledNodes
   const scopedNodeIds = new Set([triggerNodeId, ...scopedNodes.map((node) => node.id)])
   const scopedEdges = executionScope === 'prompt_only'
     ? compiledEdges.filter((edge) => scopedNodeIds.has(edge.source) && scopedNodeIds.has(edge.target))
     : compiledEdges
 
-  const agentNodes = scopedNodes.filter((node) => node.category === 'agent')
+  const agentNodes = configurationNodes.filter((node) => node.category === 'agent')
   const unboundAgent = agentNodes.find((node) => !node.agentDefinitionId)
   if (unboundAgent) throw new Error(`Agent 节点“${unboundAgent.workflowNodeId}”还没有选择执行智能体`)
   const unboundAgentModel = agentNodes.find((node) => !node.agentModelKey)
@@ -334,7 +358,7 @@ export function compileVideoWorkflow(
     throw new Error(`Agent 节点“${incompleteAgentContract.workflowNodeId}”缺少任务、输出格式或本节点交付合同`)
   }
   if (executionScope === 'media_delivery') {
-    const unconfiguredMediaNode = scopedNodes.find((node) => (
+    const unconfiguredMediaNode = configurationNodes.find((node) => (
       node.operation === 'image_generate' || node.operation === 'estimate'
     ) && node.requestedMediaConfiguration === null)
     if (unconfiguredMediaNode) {

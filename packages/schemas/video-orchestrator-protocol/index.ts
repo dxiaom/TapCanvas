@@ -1,3 +1,5 @@
+export * from "./canvas-output-ownership";
+export * from "./canvas-video-receipt-status";
 export const VIDEO_ORCHESTRATOR_PROTOCOL_VERSION = "1" as const;
 export const VIDEO_AUTHORING_GRAPH_PROTOCOL_VERSION = "2" as const;
 export const VIDEO_RUN_STATUS_PROTOCOL_VERSION = "2" as const;
@@ -10,7 +12,7 @@ export const VIDEO_ATOMIC_WORKFLOW_PROTOCOL_VERSION = "2" as const;
  * canvas. The editor, capability equipment boundary, and durable executor must
  * compare the same structural fact.
  */
-export const VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION = 71 as const;
+export const VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION = 135 as const;
 
 /**
  * SHA-256 of the canonical executable canvas template with instance-specific
@@ -20,7 +22,7 @@ export const VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION = 71 as const;
  * structurally different definitions can never both masquerade as the same version.
  */
 export const VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT =
-	"sha256:88a3dc15edf80a7268723be2b93e6a04f4e2366a8d7df1004ee4bd316d880f29" as const;
+	"sha256:6d24ad34ffb3520ae8bf6c87f9a60cb32516722bf65c0d2b5a0e27dd25d3faed" as const;
 
 /**
  * Editable one-click-production operations. These IDs are the stable bridge
@@ -31,19 +33,12 @@ export const VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT =
 export const VIDEO_ATOMIC_WORKFLOW_NODE_IDS = [
 	"canvas-source",
 	"delivery-contract",
-	"beat-sheet-agent",
-	"beat-sheet-format",
-	"asset-coverage",
-	"asset-fan-out",
-	"asset-image-generate",
-	"clip-fan-out",
-	"clip-writer-agent",
-	"prompt-package",
-	"voice-materialize",
-	"cost-estimate",
-	"production-handoff",
-	"video-submit",
-	"video-results",
+	"chapter-sequence-agent",
+	"chapter-sequence-project",
+	"clip-production-pipeline",
+	"node-only-verify",
+	"clip-media-pipeline",
+	"clip-production-aggregate",
 	"concat",
 	"delivery-verify",
 ] as const;
@@ -613,7 +608,7 @@ export function parseVideoAtomicWorkflowSnapshot(value: unknown): ParseResult<Vi
 		nodes.push(parsed.data);
 	}
 	if (nodes.map((node) => node.atomicNodeId).join(",") !== VIDEO_ATOMIC_WORKFLOW_NODE_IDS.join(",")) {
-		return failure("atomic workflow snapshot must contain the canonical fifteen nodes in order");
+		return failure("atomic workflow snapshot must contain every canonical node in order");
 	}
 	return {
 		success: true,

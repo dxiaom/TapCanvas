@@ -1,14 +1,17 @@
+import { mapWorkflowNodeTree, flattenWorkflowNodeTree } from "./execution.node-tree";
 type JsonRecord = Record<string, unknown>;
 
 const INHERITED_MEDIA_CONFIGURATION_FIELDS = [
 	"workflowVideoModelSelection",
 	"workflowVideoModelKey",
 	"workflowVideoResolution",
+	"workflowVideoSize",
 	"workflowVideoAspectRatio",
 	"workflowImageModelSelection",
 	"workflowImageModelKey",
 	"workflowImageAspectRatio",
 	"workflowImageSize",
+	"workflowImageQuality",
 ] as const;
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -41,7 +44,7 @@ function workflowNodeIdentity(node: JsonRecord): string {
 export function materializeWorkflowConfigurationInheritance(
 	nodesInput: readonly unknown[],
 ): unknown[] {
-	const nodes = nodesInput.map((value) => isRecord(value) ? value : null);
+	const nodes = flattenWorkflowNodeTree(nodesInput);
 	const byIdentity = new Map<string, JsonRecord>();
 	for (const node of nodes) {
 		if (!node) continue;
@@ -49,8 +52,8 @@ export function materializeWorkflowConfigurationInheritance(
 		if (identity !== "\u0000") byIdentity.set(identity, node);
 	}
 
-	return nodesInput.map((rawNode, index) => {
-		const node = nodes[index];
+	return mapWorkflowNodeTree(nodesInput, (rawNode) => {
+		const node = rawNode;
 		if (!node || !isRecord(node.data)) return rawNode;
 		const targetData = node.data;
 		const sourceNodeId = readString(targetData, "workflowConfigurationSourceNodeId");

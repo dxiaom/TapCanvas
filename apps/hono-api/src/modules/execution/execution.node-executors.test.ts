@@ -1,17 +1,70 @@
+import { normalizeWorkflowAgentOutcome } from "./execution.agent-runner";
+import { AUTHOR_SOURCE_REPRESENTATION, authorSourceJsonHash, authorSourceTextHash, normalizeHarnessAcceptedAuthorSource } from "../../../../../packages/schemas/author-source-representation/index.mjs";
+import { normalizeAgentsRuntimeTraceSummary } from "../task/task.agents-bridge";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { globalSequenceFixture } from "./execution.chapter-sequence.fixture";
+import { CHARACTER_IDENTITY_BOARD_SPEC } from "./execution.character-identity-contract";
+import { chapterSequenceSchema } from "../../../../../packages/schemas/chapter-sequence/index.mjs";
+import { bindChapterScriptAuthoringContract } from "./execution.chapter-sequence";
+import { compileChapterScript } from "./execution.chapter-script.test-support";
+
+/** Ordered chapter events belong to provider Clips; the video model owns their internal timing. */
+function briefChapterScript(beats: readonly Record<string, unknown>[] = [
+  { performance: "action", clipId: "clip-1", picture: "双方对峙，气流推动碎石", visible: ["主角", "对手"] },
+  { performance: "action", clipId: "clip-1", picture: "主角冲出，双方高速交锋", visible: ["主角", "对手"] },
+  { performance: "dialogue", clipId: "clip-1", picture: "主角蓄力，攻势升级", visible: ["主角"], speech: { speaker: "旁白", voice: "onscreen", delivery: "平稳", says: "有大招" } },
+  { performance: "vfx", clipId: "clip-2", picture: "大招对撞，主角击破防御", visible: ["主角", "对手"] },
+], adapts: readonly string[] = ["brief"]) {
+  return {
+    wholeFilmIntent: "一场连续六十秒的对抗，铺垫后逐步升级。",
+    sourceKind: "brief",
+    characters: ["主角", "对手"],
+    clips: [{ clipId: "clip-1", durationSeconds: 30 }, { clipId: "clip-2", durationSeconds: 30 }],
+    adaptation: [{ spanId: "brief", until: "有具形招式", decision: "dramatize", note: "按简报原创整场对抗" }],
+    scenes: [{ sceneId: "fight", setting: "荒原战场，黄昏", place: "荒原战场", adapts, cast: ["主角", "对手"], layout: { landmarks: [{ kind: "area", label: "战场", at: [0.5, 0.5] }], marks: [{ mark: "left", where: "战场左侧", at: [0.3, 0.5] }, { mark: "right", where: "战场右侧", at: [0.7, 0.5] }] }, positions: [{ who: "主角", mark: "left", posture: "stand" }, { who: "对手", mark: "right", posture: "stand" }], entryState: "双方对峙", exitState: "主角落地站稳", beats }],
+  };
+}
+import type { WorkflowVideoRunRequest } from "./execution.node-executors";
+import { enrichVideoClipContextWithMaterializedAssets } from "./execution.video-workflow-contract";
+import { prepareChapterAssetCollection, bindMaterializedAssetConsumers } from "./execution.chapter-asset-preparation";
+import { assetBindingIdentity } from "./execution.asset-identity";
+import type { WorkflowAgentRunRequest } from "./execution.node-executors";
+import { stagedAuthoringFixture } from "./test-fixtures/video-authoring-stages";
+import { sceneReferenceFixture } from "./execution.scene-reference-fixture";
+import { chapterAssetPlanSchema } from "../../../../../packages/schemas/video-authoring-stages/schema.mjs";
+import { ExternalDependencyError } from "../../platform/external-dependency-error";
 import { describe, expect, it, vi } from "vitest";
 import { createWorkflowCollection, isWorkflowCollection } from "@tapcanvas/workflow-kernel-protocol";
 import {
+	CLIP_PRODUCTION_ASSET_INTENTS_ARTIFACT_TYPE,
+	CLIP_PRODUCTION_PACKET_COLLECTION_ARTIFACT_TYPE,
+	CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION,
+} from "../../../../../packages/schemas/clip-production-packet/index.mjs";
+import {
+	BEAT_SHEET_TAKE_EXECUTOR_REF,
 	executeRegisteredWorkflowNode,
 	validateWorkflowBeatSheetProjectAssetBindings,
 	workflowImageAssetMetadata,
 } from "./execution.node-executors";
 import {
 	createWorkflowAcceptedTurnSource,
+	freezeWorkflowActionableDeliverySource,
 	WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD,
 } from "./execution.workflow-source-authority";
 import type { WorkflowNodeOutputV1 } from "./execution.node-runtime";
 import type { WorkflowNodeSnapshot } from "./execution.node-runtime";
 import { sha256Hex } from "../asset/book-content-hash";
+import { freezeWorkflowUserIntent } from "./execution.workflow-user-intent";
+import { readWorkflowCanvasProjectContextFromSnapshot } from "./execution.canvas-source-runner";
+import type { WorkflowProjectContext } from "./execution.project-context";
+import { workflowIntentFixture } from "./test-fixtures/workflow-user-intent";
+import { clipProductionBlockingFixture } from "./test-fixtures/clip-production-blocking";
+import { materializeClipProductionDraft } from "./execution.clip-production";
+import { projectClipProductionNodePlan } from "./execution.clip-production-nodes";
+import { renderClipProductionReferencePrompt } from "./execution.clip-production-reference-prompt";
+import { projectStructuredOutputReview } from "../task/structured-output-review";
 
 const runVideo = vi.fn();
 
@@ -52,10 +105,12 @@ function selectedAssetProjectContext(selectedAssetIds: readonly string[]) {
 			assetPurpose: null,
 			productionEligible: true,
 			productionExclusionReason: null,
-			sourceFacts: {
-				referenceType: null,
+			styleFingerprint: null,
+				sourceFacts: {
+					referenceType: null,
 				roleName: null,
 				physicalIdentityKey: null,
+				mediaIdentityKey: `image-urls:sha256:${assetId}`,
 				characterAssetRole: null,
 				characterProfileVersion: null,
 				identityAnchors: [],
@@ -110,6 +165,43 @@ describe("workflow BeatSheet project asset bindings", () => {
 			projectContext,
 		});
 		expect(error).toBeNull();
+	});
+
+	it("accepts four current-canvas node references for one object and rejects cross-canvas handles", () => {
+		const base = selectedAssetProjectContext(["a", "b", "c", "d"]);
+		const projectContext = { ...base, assetSnapshot: base.assetSnapshot.map((asset) => ({
+			...asset, flowId: base.canvasId, nodeId: `node-${asset.assetId}`,
+		})) };
+		const beatSheetText = JSON.stringify({ beats: [{ assetObjectContracts: [{ kind: "prop", name: "产品",
+			referenceImageNodeIds: ["node-a", "node-b", "node-c", "node-d"], referenceAssetIds: ["a"],
+		}] }] });
+		expect(validateWorkflowBeatSheetProjectAssetBindings({ beatSheetText, projectContext })).toBeNull();
+		expect(validateWorkflowBeatSheetProjectAssetBindings({ beatSheetText, projectContext: {
+			...projectContext, canvasId: "another-canvas",
+		} })).toContain("requires exactly one ready image");
+	});
+
+	it("keeps multi-view and distinct-object selections separate, and supplies exact handles for isolated repair", () => {
+		const base = selectedAssetProjectContext(["product-front", "product-back", "host"]);
+		const projectContext = { ...base, assetSnapshot: base.assetSnapshot.map((asset) => ({
+			...asset, flowId: base.canvasId, nodeId: `node-${asset.assetId}`,
+		})) };
+		const contracts = [{ kind: "prop", name: "商品", referenceAssetIds: ["product-front", "product-back"] },
+			{ kind: "character", name: "主播", physicalIdentityKey: "host-body", referenceAssetIds: ["host"] }];
+		const validate = (assetObjectContracts: typeof contracts) => validateWorkflowBeatSheetProjectAssetBindings({
+			beatSheetText: JSON.stringify({ beats: [{ assetObjectContracts }] }), projectContext,
+		});
+		expect(validate(contracts)).toBeNull();
+		const missing = validate([contracts[0]!]);
+		expect(missing).toContain('"host"');
+		expect(missing).toContain("root objectRegistry[].referenceAssetIds");
+		expect(missing).toContain("Do not write beats[].assetObjectContracts");
+		expect(missing).toContain('"assetId":"host","nodeId":"node-host"');
+		const error = validate([{ ...contracts[0]!, referenceAssetIds: ["invented-id"] }, contracts[1]!]);
+		expect(error).toContain("outside the frozen ready production image set");
+		expect(error).not.toContain('"assetId":"product-front","nodeId":"node-product-front"');
+		expect(error).toContain("frozenAssetMatch");
+		expect(error).toContain('preserve selectedAssetIds=["product-front","product-back","host"]');
 	});
 
 	it("rejects unauthorized project assets and cross-role identity drift", () => {
@@ -210,12 +302,23 @@ describe("workflow image asset identity metadata", () => {
 	it("persists canonical object identity for scene and character generations", () => {
 		expect(workflowImageAssetMetadata({
 			role: "scene://五指巷小义庄",
+			sceneCard: sceneReferenceFixture,
+			prompt: sceneReferenceFixture.spacePrompt,
+			negativePrompt: sceneReferenceFixture.negativePrompt,
+			identityAnchors: ["固定入口"],
+			prohibitedDrift: ["入口不变"],
 			displayName: "五指巷小义庄",
 		})).toEqual({
 			referenceType: "scene",
 			canonicalName: "五指巷小义庄",
 			displayName: "五指巷小义庄",
 			sceneName: "五指巷小义庄",
+			sceneAssetRole: sceneReferenceFixture.sceneAssetRole,
+			sceneProfileVersion: sceneReferenceFixture.sceneProfileVersion,
+			sceneOccupancy: sceneReferenceFixture.sceneOccupancy,
+			sceneLightingSpec: sceneReferenceFixture.sceneLightingSpec,
+			sceneAnchors: ["固定入口"],
+			prohibitedSceneDrift: ["入口不变"],
 		});
 		expect(workflowImageAssetMetadata({
 			role: "character://body-liu-xiu-001",
@@ -224,6 +327,19 @@ describe("workflow image asset identity metadata", () => {
 			roleName: "body-liu-xiu-001",
 			characterAssetRole: "identity_anchor",
 			characterProfileVersion: "character-card/v3",
+			identityBoardSpec: {
+				layout: "identity_board_four_view",
+				faceViews: ["front", "profile"],
+				fullBodyViews: ["front", "back"],
+				crossViewConsistency: true,
+				referenceRoleIsolation: true,
+				neutralReferenceBackground: true,
+				readableTextVisible: true,
+				brandingVisible: false,
+				neutralBaseState: true,
+				canonicalNameVisible: false,
+				ipSafeOriginal: true,
+			},
 			identityAnchors: ["固定骨相"],
 			prohibitedDrift: ["不得换脸"],
 		})).toEqual(expect.objectContaining({
@@ -231,7 +347,35 @@ describe("workflow image asset identity metadata", () => {
 			canonicalName: "body-liu-xiu-001",
 			displayName: "刘秀",
 			physicalIdentityKey: "body-liu-xiu-001",
+			identityBoardSpec: {
+				layout: "identity_board_four_view",
+				faceViews: ["front", "profile"],
+				fullBodyViews: ["front", "back"],
+				crossViewConsistency: true,
+				referenceRoleIsolation: true,
+				neutralReferenceBackground: true,
+				readableTextVisible: true,
+				brandingVisible: false,
+				neutralBaseState: true,
+				canonicalNameVisible: false,
+				ipSafeOriginal: true,
+			},
 		}));
+	});
+
+	it("stamps the host's identity board whatever board the plan echoes", () => {
+		// The board is a host constant; an author's partial or differing echo no longer fails the delivery.
+		expect(workflowImageAssetMetadata({
+			role: "character://hero",
+			displayName: "Hero",
+			referenceType: "character",
+			roleName: "hero",
+			characterAssetRole: "identity_anchor",
+			characterProfileVersion: "character-card/v3",
+			identityBoardSpec: { layout: "identity_board_four_view" },
+			identityAnchors: ["固定骨相"],
+			prohibitedDrift: ["不得换脸"],
+		})).toMatchObject({ identityBoardSpec: CHARACTER_IDENTITY_BOARD_SPEC });
 	});
 });
 
@@ -271,6 +415,7 @@ function node(
 function context(input: {
 	node: WorkflowNodeSnapshot;
 	inputs?: Record<string, readonly unknown[]>;
+	projectContext?: NonNullable<WorkflowAgentRunRequest["projectContext"]> | null;
 	inputProvenance?: readonly Readonly<{
 		sourceNodeId: string;
 		sourceNodeRunId: string;
@@ -288,6 +433,7 @@ function context(input: {
 		flowId: "flow-1",
 		flowVersionId: "flow-version-parent",
 		projectId: "project-1",
+		...(input.projectContext === undefined ? {} : { projectContext: input.projectContext }),
 		workflowKey: "agent-workflow/v1",
 		...(input.flowVersionData === undefined ? {} : { flowVersionData: input.flowVersionData }),
 		node: input.node,
@@ -296,6 +442,45 @@ function context(input: {
 		...(input.checkpointOutputRefs ? { checkpointOutputRefs: input.checkpointOutputRefs } : {}),
 	};
 }
+
+describe("workflow read-only contract recovery", () => {
+	it("waits through a catalog fault and resumes the same estimate without invoking media or authors", async () => {
+		const runVideoEstimate = vi.fn()
+			.mockRejectedValueOnce(new ExternalDependencyError({ kind: "model_catalog", identity: "video-model", field: "maxReferenceImages", code: "missing_reference_limit", observed: null }))
+			.mockRejectedValueOnce(new ExternalDependencyError({ kind: "model_catalog", identity: "video-model", field: "maxReferenceImages", code: "missing_reference_limit", observed: null }))
+			.mockResolvedValueOnce({ estimateIdentity: "execution-1:estimate", modelKey: "video-model", resolution: "720p", aspectRatio: "16:9", estimatedCredits: 4, perClip: [] });
+		const runAgent = vi.fn();
+		const generate = vi.fn();
+		const dependencies = { runAgent, runJavascript: vi.fn(), runVideo: generate, runVideoEstimate };
+		const input = context({ node: node("estimate", "video.estimate/v1", {
+			workflowVideoModelKey: "video-model", workflowVideoResolution: "720p", workflowVideoAspectRatio: "16:9",
+		}, "collect", ["estimate"], undefined, ["prompt-package"]), inputs: {
+			"prompt-package": [{ clips: [{ itemId: "clip-1", durationSeconds: 15 }] }],
+		} });
+		const waiting = await executeRegisteredWorkflowNode(input, dependencies);
+		expect(waiting).toMatchObject({ ok: false, waitingExternal: true });
+		if (waiting.ok || !waiting.waitingExternal) throw new Error("Expected external wait");
+		const resumed = await executeRegisteredWorkflowNode({ ...input,
+			resumeOutputRefs: JSON.parse(JSON.stringify(waiting.outputRefs)) as WorkflowNodeOutputV1,
+		}, dependencies);
+		expect(resumed).toMatchObject({ ok: true, outputRefs: { evidence: { executorCompleted: true } } });
+		expect(runVideoEstimate).toHaveBeenCalledTimes(3);
+		expect(runVideoEstimate.mock.calls[0]).toEqual(runVideoEstimate.mock.calls[1]);
+		expect(runVideoEstimate.mock.calls[1]).toEqual(runVideoEstimate.mock.calls[2]);
+		expect(runAgent).not.toHaveBeenCalled();
+		expect(generate).not.toHaveBeenCalled();
+	});
+	it("does not turn arbitrary errors or matching error text into retry authorization", async () => {
+		const result = await executeRegisteredWorkflowNode(context({ node: node("estimate", "video.estimate/v1", {
+			workflowVideoModelKey: "video-model", workflowVideoResolution: "720p", workflowVideoAspectRatio: "16:9",
+		}, "collect", ["estimate"], undefined, ["prompt-package"]), inputs: { "prompt-package": [{ clips: [] }] } }), {
+			runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: vi.fn(),
+			runVideoEstimate: vi.fn().mockRejectedValue(new Error("video_model_reference_image_policy_missing:video-model")),
+		});
+		expect(result).toMatchObject({ ok: false, errorCode: "workflow_node_runtime_failed" });
+		expect(result).not.toHaveProperty("waitingExternal", true);
+	});
+});
 
 function frozenTemporalFrameTrack(
 	durationSeconds: number,
@@ -370,9 +555,9 @@ function frozenSingleClipContext(input: Readonly<{
 
 function frozenWriterObjectContract(input: Readonly<{
 	assetId?: string;
-	kind: "character" | "scene";
+	kind: "character" | "scene" | "prop";
 	name: string;
-	referenceRole: "identity" | "environment" | "none";
+	referenceRole: "identity" | "environment" | "none" | "prop";
 }>): Record<string, unknown> {
 	const state = `${input.kind}:${input.name}:state`;
 	return {
@@ -415,6 +600,45 @@ function frozenAssetBeatSheet(
 }
 
 describe("workflow node executor registry", () => {
+	it("polls a no-progress Agent suspension on its durable retry timer", async () => {
+		const runAgent = vi.fn(async () => ({
+			taskId: "workflow:execution-1:agent-1",
+			text: "",
+			assets: [],
+			expectedDelivery: { artifactType: "tapcanvas.text/v1" },
+			 deliveryEvidence: {
+				retryablePhysicalFailure: true,
+				physicalFailureReason: "workflow_agent_no_progress_window_exhausted",
+				noProgressRecoveryMode: "signal_only",
+				retryNotBeforeAt: "2026-08-23T00:01:00.000Z",
+			},
+			deliveryVerification: null,
+			requestTerminal: {
+				status: "suspended",
+				reason: "workflow_agent_no_progress_recovery_deferred",
+			},
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("agent-1", "agents.logical-task/v2", {
+				workflowInstruction: "生成文本",
+				workflowAgentOutputArtifactType: "tapcanvas.text/v1",
+				workflowAgentDeliveryRequirement: "交付文本",
+				workflowAgentDefinitionId: "writer",
+				workflowAgentModelKey: "gemini-3.1-pro",
+			}),
+		}), {
+			runAgent,
+			runJavascript: vi.fn(),
+			runVideo,
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			waitingExternal: true,
+			externalCheck: { version: 1, mode: "poll", notBeforeAt: "2026-08-23T00:01:00.000Z" },
+		});
+		expect(runAgent).toHaveBeenCalledTimes(1);
+	});
+
 	it("treats an explicitly cleared workflow trigger payload as a fresh manual trigger", async () => {
 		const result = await executeRegisteredWorkflowNode(context({
 			node: node("manual-trigger", "workflow.trigger/v1", { workflowTriggerPayload: null }, "once", ["trigger"]),
@@ -435,6 +659,77 @@ describe("workflow node executor registry", () => {
 				},
 			},
 		});
+	});
+
+	it("freezes inline text as authoritative source through delivery and chapter binding", async () => {
+		const sourceText = "深夜厨房：姐姐提出轮流照顾父亲，弟弟认为她又替全家做决定。";
+		const workflowVideoDurationPlan = {
+			protocolVersion: "tapcanvas.workflow-video-duration-plan/v2",
+			targetDurationSeconds: 60,
+			modelKey: "dola-seedance-2.5",
+			durationOptions: [30],
+			maxDurationSeconds: 30,
+			policy: "agent_semantic_duration_budget",
+		};
+		const sourceResult = await executeRegisteredWorkflowNode({
+			...context({
+				node: node("canvas-source", "tapcanvas.canvas.group.read/v1", {
+					workflowSourceMode: "inline_text",
+				}, "once", ["canvas-facts"], undefined, ["trigger"]),
+				inputs: {
+					trigger: [{
+						source: sourceText,
+						targetDurationSeconds: 60,
+						videoModelKey: "dola-seedance-2.5",
+						workflowVideoDurationPlan,
+					}],
+				},
+			}),
+			flowVersionData: { workflowDeliveryScope: { flowId: "caller-flow", projectId: "caller-project" } },
+		}, {
+			runAgent: vi.fn(),
+			runJavascript: vi.fn(),
+			runVideo,
+		});
+		expect(sourceResult.ok).toBe(true);
+		if (!sourceResult.ok) throw new Error(`Expected inline source success: ${JSON.stringify(sourceResult)}`);
+		const canvasFacts = sourceResult.outputRefs.ports["canvas-facts"] as Record<string, unknown>;
+		const authoritativeSources = canvasFacts.authoritativeSources as Array<Record<string, unknown>>;
+		const source = authoritativeSources[0]!;
+		expect(authoritativeSources).toHaveLength(1);
+		expect(source).toMatchObject({
+			sourceId: "inline-text:execution-1:canvas-source",
+			sourceType: "inline_text",
+			content: sourceText,
+			sourceFingerprint: sha256Hex(sourceText),
+			sourceCoordinates: { coordinateSystem: "utf16", startOffset: 0, endOffset: sourceText.length, utf16Length: sourceText.length },
+		});
+		expect(canvasFacts).toMatchObject({ sourceMode: "inline_text", text: sourceText, callConfig: { source: sourceText } });
+
+		const deliveryResult = await executeRegisteredWorkflowNode(context({
+			node: node("delivery-contract", "agents.delivery.contract/v2", {
+				workflowExecutionScope: "media_delivery",
+			}, "once", ["delivery-contract"], undefined, ["canvas-facts"]),
+			inputs: { "canvas-facts": [canvasFacts] },
+		}), {
+			runAgent: vi.fn(),
+			runJavascript: vi.fn(),
+			runVideo,
+		});
+		expect(deliveryResult.ok).toBe(true);
+		if (!deliveryResult.ok) throw new Error(`Expected delivery contract success: ${JSON.stringify(deliveryResult)}`);
+		const deliveryContract = deliveryResult.outputRefs.ports["delivery-contract"] as Record<string, unknown>;
+		expect(deliveryContract).toMatchObject({
+			targetDurationSeconds: 60,
+			canvasFacts: { authoritativeSources: [source] },
+		});
+
+		const bound = bindChapterScriptAuthoringContract({ allowedFields: [] }, deliveryContract);
+		expect(bound.contractName).toBe("tapcanvas.chapter-script");
+		expect(bound.contractVersion).toBe("3");
+		const recordProperties = ((bound.jsonSchema?.properties as Record<string, Record<string, unknown>>).authoringRecord!.properties) as Record<string, Record<string, unknown>>;
+		expect((recordProperties.sourceIds!.items as Record<string, unknown>).enum).toEqual([source.sourceId]);
+		expect(bound.jsonSchema?.description).toContain(`冻结来源共 1 份、${sourceText.length} 字`);
 	});
 
 	it("uses the admission-frozen semantic duration window without imposing clip topology", async () => {
@@ -475,6 +770,218 @@ describe("workflow node executor registry", () => {
 						generationContract: {
 							clipPlanningPolicy: "agent_semantic_duration_budget",
 							durationOptions: expect.any(Array),
+						},
+					},
+				},
+			},
+		});
+	});
+
+	it("freezes canonical trigger video media fields and accepts the model catalog's auto resolution", async () => {
+		const resolveVideoMediaOptions = vi.fn(async () => ({
+			durationOptions: [30],
+			maxReferenceImages: 12,
+			supportsTextToVideo: true,
+			supportsReferenceImages: true,
+			supportsFirstLastFrame: false,
+			resolutionOptions: ["auto"],
+			aspectRatioOptions: ["16:9"],
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("delivery-contract", "agents.delivery.contract/v2", {
+				workflowExecutionScope: "media_delivery",
+				workflowVideoModelKey: "legacy-video-model",
+				workflowVideoResolution: "720p",
+				workflowVideoAspectRatio: "9:16",
+				workflowVideoSize: "720x1280",
+			}, "once", ["delivery-contract"], undefined, ["canvas-facts"]),
+			inputs: {
+				"canvas-facts": [{
+					sourceMode: "inline_text",
+					text: "首段视频来源",
+					callConfig: {
+					targetDurationSeconds: 30,
+					videoModelKey: "dola-seedance-2.5",
+					videoResolution: "auto",
+					videoAspectRatio: "16:9",
+					videoSize: "1280x720",
+					workflowVideoDurationPlan: {
+						protocolVersion: "tapcanvas.workflow-video-duration-plan/v2",
+						targetDurationSeconds: 30,
+						modelKey: "dola-seedance-2.5",
+						durationOptions: [30],
+						maxDurationSeconds: 30,
+						policy: "agent_semantic_duration_budget",
+						maxReferenceImages: null,
+						supportsTextToVideo: null,
+						supportsReferenceImages: null,
+						supportsFirstLastFrame: null,
+					},
+					},
+				}],
+			},
+		}), {
+			runAgent: vi.fn(),
+			runJavascript: vi.fn(),
+			runVideo,
+			resolveVideoDurationOptions: vi.fn(async () => [30]),
+			resolveVideoMediaOptions,
+		});
+
+		expect(result).toMatchObject({
+			ok: true,
+			outputRefs: {
+				ports: {
+					"delivery-contract": {
+					generationContract: {
+						videoModel: "dola-seedance-2.5",
+						resolution: "auto",
+						aspectRatio: "16:9",
+						size: "1280x720",
+						maxReferenceImages: 12,
+						supportsTextToVideo: true,
+						supportsReferenceImages: true,
+						supportsFirstLastFrame: false,
+					},
+				},
+			},
+			},
+		});
+		expect(resolveVideoMediaOptions).toHaveBeenCalledWith(expect.objectContaining({ modelKey: "dola-seedance-2.5" }));
+	});
+
+	it("preserves chapter source identity and content when attaching an expansion draft", async () => {
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("delivery-contract", "agents.delivery.contract/v2", {
+				workflowExecutionScope: "media_delivery",
+				workflowVideoModelKey: "doubao-seedance-2.5",
+			}, "once", ["delivery-contract"], undefined, ["canvas-facts", "expanded-source"]),
+			inputs: {
+				"canvas-facts": [{
+					sourceMode: "project_context",
+					authoritativeSources: [{
+						sourceId: "source-node-1",
+						content: "原始短文本",
+						sourceFingerprint: "stale",
+					}],
+				}],
+				"expanded-source": [{ text: "同一人物完成了一条可拍的连续行动链。" }],
+			},
+		}), {
+			runAgent: vi.fn(),
+			runJavascript: vi.fn(),
+			runVideo,
+			resolveVideoDurationOptions: vi.fn(async () => [5, 10]),
+		});
+
+		expect(result).toMatchObject({
+			ok: true,
+			outputRefs: {
+				ports: {
+					"delivery-contract": {
+						canvasFacts: {
+							sourceProcessing: "optional_text_expansion_non_authoritative",
+							authoritativeSources: [{
+								sourceId: "source-node-1",
+								content: "原始短文本",
+								sourceFingerprint: "stale",
+							}],
+							expandedSourceDraft: {
+								content: "同一人物完成了一条可拍的连续行动链。",
+								sourceFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+							},
+						},
+					},
+				},
+			},
+		});
+	});
+
+	it("keeps the latest public-chat turn authoritative over an expansion draft", async () => {
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("delivery-contract", "agents.delivery.contract/v2", {
+				workflowExecutionScope: "media_delivery",
+				workflowVideoModelKey: "doubao-seedance-2.5",
+			}, "once", ["delivery-contract"], undefined, ["canvas-facts", "expanded-source"]),
+			inputs: {
+				"canvas-facts": [{
+					sourceMode: "project_context",
+					authoritativeSources: [{
+						sourceId: "source-node-1",
+						content: "原始短文本，结尾保持开放动作",
+						sourceFingerprint: "stale",
+					}],
+					userRequest: {
+						kind: "public_chat_turn",
+						requestId: "turn-1",
+						content: "15 秒直接进入高潮，不要收势",
+					},
+				}],
+				"expanded-source": [{ text: "扩写草稿加入了碰撞前定格。" }],
+			},
+		}), {
+			runAgent: vi.fn(),
+			runJavascript: vi.fn(),
+			runVideo,
+			resolveVideoDurationOptions: vi.fn(async () => [5, 10]),
+		});
+
+		expect(result).toMatchObject({
+			ok: true,
+			outputRefs: {
+				ports: {
+					"delivery-contract": {
+						canvasFacts: {
+							sourceProcessing: "optional_text_expansion_non_authoritative",
+							authoritativeSources: [{
+								sourceId: "source-node-1",
+								content: "原始短文本，结尾保持开放动作",
+							}],
+							expandedSourceDraft: { content: "扩写草稿加入了碰撞前定格。" },
+						},
+					},
+				},
+			},
+		});
+	});
+
+	it("keeps a public-chat source authoritative when the userRequest projection is absent", async () => {
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("delivery-contract", "agents.delivery.contract/v2", {
+				workflowExecutionScope: "media_delivery",
+				workflowVideoModelKey: "doubao-seedance-2.5",
+			}, "once", ["delivery-contract"], undefined, ["canvas-facts", "expanded-source"]),
+			inputs: {
+				"canvas-facts": [{
+					sourceMode: "project_context",
+					authoritativeSources: [{
+						sourceId: "public-chat-turn:turn-1",
+						kind: "public_chat_turn",
+						content: "直接进入动作并保持开放出口",
+						sourceFingerprint: "stale",
+					}],
+				}],
+				"expanded-source": [{ text: "扩写草稿加入了对峙停顿。" }],
+			},
+		}), {
+			runAgent: vi.fn(),
+			runJavascript: vi.fn(),
+			runVideo,
+			resolveVideoDurationOptions: vi.fn(async () => [5, 10]),
+		});
+
+		expect(result).toMatchObject({
+			ok: true,
+			outputRefs: {
+				ports: {
+					"delivery-contract": {
+						canvasFacts: {
+							sourceProcessing: "optional_text_expansion_non_authoritative",
+							authoritativeSources: [{
+								sourceId: "public-chat-turn:turn-1",
+								content: "直接进入动作并保持开放出口",
+							}],
+							expandedSourceDraft: { content: "扩写草稿加入了对峙停顿。" },
 						},
 					},
 				},
@@ -596,6 +1103,7 @@ describe("workflow node executor registry", () => {
 			estimateIdentity: "execution-1:estimate",
 			modelKey: "video-model",
 			resolution: "1080p",
+			size: "16:9",
 			aspectRatio: "16:9",
 			estimatedCredits: 12,
 			perClip: [
@@ -607,12 +1115,17 @@ describe("workflow node executor registry", () => {
 			node: node("estimate", "video.estimate/v1", {
 				workflowVideoModelKey: "video-model",
 				workflowVideoResolution: "1080p",
+				workflowVideoSize: "16:9",
 				workflowVideoAspectRatio: "16:9",
 			}, "collect", ["estimate"], undefined, ["prompt-package"]),
 			inputs: { "prompt-package": [promptPackage] },
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo, runVideoEstimate });
 		expect(estimate.ok).toBe(true);
 		if (!estimate.ok) throw new Error("Expected estimate success");
+		expect(runVideoEstimate).toHaveBeenCalledWith(expect.objectContaining({
+			size: "16:9",
+			referenceImageCount: 0,
+		}));
 
 		const handoff = await executeRegisteredWorkflowNode(context({
 			node: node("handoff", "video.production.handoff/v1", {}, "collect", ["production-plan"], undefined, ["prompt-package", "estimate", "asset-bindings", "voice-manifest"]),
@@ -641,6 +1154,7 @@ describe("workflow node executor registry", () => {
 			&& item.value !== null
 			&& !Array.isArray(item.value)
 			&& (item.value as Record<string, unknown>).videoReferencePolicy === "forbidden"
+			&& (item.value as Record<string, unknown>).size === "16:9"
 		))).toBe(true);
 
 		const submitVideo = vi.fn(async (request: { itemIndex: number }) => ({
@@ -654,7 +1168,35 @@ describe("workflow node executor registry", () => {
 		const submitted = await executeRegisteredWorkflowNode(context({
 			node: node("submit", "tapcanvas.video.generate/v1", {}, "each", ["provider-receipts"], 1, ["production-plan"]),
 			inputs: { "production-plan": [productionPlan] },
+			flowVersionData: {
+				workflowProjectContext: {
+					...selectedAssetProjectContext([]),
+					visualStyle: {
+						referenceImages: ["https://assets.example/style.png"],
+						styleLock: { styleId: "anime-night", styleName: "统一夜战", stylePrompt: "二维赛璐璐，蓝紫霓虹" },
+						styleFingerprint: "sha256:style-night",
+					},
+				},
+			},
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: submitVideo });
+    const prepareVideo = vi.fn(async (request: WorkflowVideoRunRequest) => ({
+      nodeId: "prepared-video", persisted: true as const, promptPersisted: true as const,
+      referenceImageNodeIds: request.referenceImageNodeIds ?? [], referenceAssetIds: request.referenceAssetIds ?? [],
+      imageDependencies: [
+        ...(request.referenceImageNodeIds ?? []).map(referenceId => `node:${referenceId}`),
+        ...(request.referenceAssetIds ?? []).map(referenceId => `asset:${referenceId}`),
+      ].map(referenceId => ({ referenceId, url: "https://assets.example/reference.png" })),
+    }));
+    const noVideoSubmission = vi.fn();
+    const prepared = await executeRegisteredWorkflowNode(context({
+      node: node("prepare", "tapcanvas.video.prepare/v1", { workflowVideoReferencePolicy: "forbidden" }, "each", ["prepared-nodes"], 1, ["production-plan"]),
+      inputs: { "production-plan": [productionPlan] },
+    }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: noVideoSubmission, prepareVideo });
+    if (!prepared.ok) throw new Error("errorMessage" in prepared ? prepared.errorMessage : "Unexpected pending executor result");
+    expect(prepared).toMatchObject({ ok: true });
+    expect(prepareVideo).toHaveBeenCalledTimes(productionPlan.items.length);
+    expect(prepareVideo).toHaveBeenCalledWith(expect.objectContaining({ size: "16:9" }));
+    expect(noVideoSubmission).not.toHaveBeenCalled();
 		expect(submitted.ok).toBe(true);
 		expect(submitVideo).toHaveBeenCalledTimes(2);
 		expect(submitVideo).toHaveBeenNthCalledWith(1, expect.objectContaining({
@@ -662,6 +1204,9 @@ describe("workflow node executor registry", () => {
 			modelKey: "video-model",
 			itemIndex: 0,
 			referenceImageNodeIds: ["image-node-hero"],
+			styleReferenceImages: ["https://assets.example/style.png"],
+			stylePrompt: "二维赛璐璐，蓝紫霓虹",
+			styleFingerprint: "sha256:style-night",
 			structuredClip: expect.objectContaining({
 				shots: [{ shotNo: 1, visualTask: "看清动作结果", action: "剑修跨步并稳住重心", durationSeconds: 5, depictedStoryEventIndices: [0] }],
 			}),
@@ -707,6 +1252,17 @@ describe("workflow node executor registry", () => {
 			assetId: "asset-master-1",
 			clipCount: 2,
 			reusedSingleClip: false,
+			mediaProbeEvidence: {
+				probe: { width: 832, height: 480, durationSeconds: 13 },
+				diagnostics: [{
+					code: "media_spec_mismatch" as const,
+					blocking: false as const,
+					expected: { aspectRatio: "16:9", durationSeconds: 13 },
+					actual: { width: 832, height: 480, durationSeconds: 13 },
+					fields: ["aspectRatio"] as const,
+					message: "规格差异",
+				}],
+			},
 		}));
 		const projectWorkflowFilm = vi.fn(async () => undefined);
 		const concatenated = await executeRegisteredWorkflowNode(context({
@@ -717,15 +1273,16 @@ describe("workflow node executor registry", () => {
 				"prompt-package": [promptPackage],
 			},
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo, runVideoConcat, projectWorkflowFilm });
-		if (!concatenated.ok) throw new Error(concatenated.errorMessage);
+		if (!concatenated.ok) throw new Error("errorMessage" in concatenated ? concatenated.errorMessage : "Unexpected pending executor result");
 		expect(concatenated).toMatchObject({ ok: true, outputRefs: { ports: { "master-video": { videoUrl: "https://assets.example/master.mp4" } } } });
 		expect(projectWorkflowFilm).toHaveBeenCalledWith(expect.objectContaining({
 		videoUrl: "https://assets.example/master.mp4",
 		assetId: "asset-master-1",
 		clipCount: 2,
 		targetDurationSeconds: 13,
-		aspectRatio: "16:9",
-	}));
+			aspectRatio: "16:9",
+		mediaProbeEvidence: expect.objectContaining({ probe: expect.objectContaining({ width: 832, height: 480 }) }),
+		}));
 		const delivered = await executeRegisteredWorkflowNode(context({
 			node: node("delivery", "agents.delivery.verify/v2", {
 				workflowDeliveryArtifactType: "tapcanvas.master-video/v1",
@@ -739,6 +1296,34 @@ describe("workflow node executor registry", () => {
 			ok: true,
 			outputRefs: { artifacts: [{ type: "tapcanvas.master-video/v1", value: "https://assets.example/master.mp4" }] },
 		});
+
+        const assets = normalized.outputRefs.ports["video-assets"];
+        if (!isWorkflowCollection(assets)) throw new Error("Expected video collection");
+        runVideoConcat.mockClear();
+        const partial = await executeRegisteredWorkflowNode(context({
+            node: node("concat-partial", "video.concat/v1", {
+                workflowMediaDeliveryPolicy: { version: 1, maxRetries: 1, exhausted: "deliver_successes" },
+            }, "collect", ["master-video"], undefined, ["video-assets", "estimate", "prompt-package"]),
+            inputs: { "video-assets": [createWorkflowCollection({ collectionId: "partial", producerNodeId: "results", producerPortId: "video-assets", values: assets.items.filter(item => item.itemId === "clip-b").map(item => item.value), itemIds: ["clip-b"] })],
+                estimate: [estimate.outputRefs.ports.estimate], "prompt-package": [promptPackage] },
+        }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo, runVideoConcat });
+        if (!partial.ok) throw new Error("errorMessage" in partial ? partial.errorMessage : "Unexpected pending executor result");
+        expect(runVideoConcat).toHaveBeenCalledWith(expect.objectContaining({ targetDurationSeconds: 8 }));
+        expect(partial.outputRefs.ports["master-video"]).toMatchObject({ deliveryCoverage: {
+            status: "partial", requestedDurationSeconds: 13, deliveredDurationSeconds: 8,
+            completedItemIds: ["clip-b"], missingItemIds: ["clip-a"],
+        } });
+        const partialDelivery = await executeRegisteredWorkflowNode(context({
+            node: node("delivery-partial", "agents.delivery.verify/v2", {
+                workflowDeliveryArtifactType: "tapcanvas.master-video/v1",
+            }, "collect", ["delivery-evidence"], undefined, ["master-video", "prompt-package"]),
+            inputs: { "master-video": [partial.outputRefs.ports["master-video"]], "prompt-package": [promptPackage] },
+        }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+        expect(partialDelivery).toMatchObject({ ok: true, outputRefs: { evidence: {
+            expectedDelivery: { itemIds: ["clip-b", "clip-a"], durationSeconds: 13 },
+            deliveryEvidence: { itemIds: ["clip-b"], durationSeconds: 8 },
+            deliveryVerification: { status: "unsatisfied", coverage: "partial", missingItemIds: ["clip-a"], artifactPreserved: true, terminalAuthority: false },
+        } } });
 	});
 	it("submits a strict Agent image prompt package with explicit asset roles", async () => {
 		const runImage = vi.fn(async () => ({
@@ -760,6 +1345,16 @@ describe("workflow node executor registry", () => {
 			inputs: {
 				"prompt-package": [{ text: JSON.stringify({ prompt: "动态提示词", negativePrompt: "动态负向词" }) }],
 			},
+			flowVersionData: {
+				workflowProjectContext: {
+					...selectedAssetProjectContext([]),
+					visualStyle: {
+						referenceImages: ["https://assets.example/style.png"],
+						styleLock: { styleId: "anime-night", styleName: "统一夜战", stylePrompt: "二维赛璐璐，蓝紫霓虹" },
+						styleFingerprint: "sha256:style-night",
+					},
+				},
+			},
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runImage, runVideo });
 		expect(result).toMatchObject({ ok: false, waitingExternal: true });
 		expect(runImage).toHaveBeenCalledWith(expect.objectContaining({
@@ -772,6 +1367,9 @@ describe("workflow node executor registry", () => {
 				{ assetId: "layout-asset", role: "layout", strength: 0.8 },
 				{ assetId: "style-asset", role: "style", strength: 0.55 },
 			],
+			styleReferenceImages: ["https://assets.example/style.png"],
+			stylePrompt: "二维赛璐璐，蓝紫霓虹",
+			styleFingerprint: "sha256:style-night",
 		}));
 	});
 
@@ -826,6 +1424,7 @@ describe("workflow node executor registry", () => {
 			status: "waiting_external" as const,
 			nodeId: `canvas-video-${request.itemIndex}`,
 			taskId: `task-${request.itemIndex}`,
+			providerAcceptedAt: "2026-09-07T01:02:03.000Z",
 			reused: false,
 		}));
 		const first = await executeRegisteredWorkflowNode(context({
@@ -834,6 +1433,7 @@ describe("workflow node executor registry", () => {
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: submitVideo });
 		expect(first).toMatchObject({ ok: false, waitingExternal: true });
 		if (first.ok || first.waitingExternal !== true) throw new Error("Expected external wait");
+		expect(first.outputRefs.itemRuns.map((item) => item.evidence.providerAcceptedAt)).toEqual(["2026-09-07T01:02:03.000Z", "2026-09-07T01:02:03.000Z"]);
 		expect(first.outputRefs.itemRuns.map((item) => ({ itemId: item.itemId, status: item.status, taskId: item.evidence.taskId }))).toEqual([
 			{ itemId: "segment-1", status: "waiting_external", taskId: "task-0" },
 			{ itemId: "segment-2", status: "waiting_external", taskId: "task-1" },
@@ -1004,7 +1604,7 @@ describe("workflow node executor registry", () => {
 				estimate: [{ modelKey: "doubao-seedance-2.0" }],
 			},
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: vi.fn(), prepareVideoProductionAssets });
-		expect(result.ok).toBe(true);
+		if (!result.ok) throw new Error("errorMessage" in result ? result.errorMessage : "Unexpected external wait");
 		expect(prepareVideoProductionAssets).not.toHaveBeenCalled();
 		if (!result.ok) return;
 		expect(result.outputRefs).toMatchObject({
@@ -1229,8 +1829,8 @@ describe("workflow node executor registry", () => {
 			itemIds: ["clip-1", "clip-2"],
 		});
 		const result = await executeRegisteredWorkflowNode(context({
-			node: node("all-videos", "workflow.collection.concat/v1", {}, "once", ["video-assets"], undefined, ["items"]),
-			inputs: { items: [launch, remainder] },
+			node: node("all-videos", "workflow.collection.concat/v1", {}, "once", ["video-assets"], undefined, ["opening", "suffix"]),
+			inputs: { suffix: [remainder], opening: [launch] },
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
 
 		expect(result.ok).toBe(true);
@@ -1325,7 +1925,13 @@ describe("workflow node executor registry", () => {
 			node: node("first-beat", "video.beat-sheet.take/v1", {
 				workflowBeatSheetTakeCount: 1,
 			}, "once", ["beat-sheet"], undefined, ["beat-sheet"]),
-			inputs: { "beat-sheet": [{ taskId: "beat-task", text: JSON.stringify(fullBeatSheet), assets: [] }] },
+			inputs: { "beat-sheet": [{
+				taskId: "beat-task",
+				text: JSON.stringify(fullBeatSheet),
+				assets: [],
+				executionProvenance: { loadedKnowledgeSources: [{ cardId: "card-combat" }] },
+				knowledgeCandidateSearch: { status: "candidate_found", candidateCount: 1, blocking: false },
+			}] },
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
 
 		expect(result.ok).toBe(true);
@@ -1343,6 +1949,10 @@ describe("workflow node executor registry", () => {
 		};
 		const parsed = JSON.parse(projected.text) as typeof fullBeatSheet;
 		expect(projected.sourceTaskId).toBe("beat-task");
+		expect(projected).toMatchObject({
+			executionProvenance: { loadedKnowledgeSources: [{ cardId: "card-combat" }] },
+			knowledgeCandidateSearch: { status: "candidate_found", candidateCount: 1 },
+		});
 		expect(projected.beatSheetProjection).toEqual({
 			protocolVersion: "tapcanvas.beat-sheet-projection/v1",
 			selection: "prefix",
@@ -1757,7 +2367,7 @@ describe("workflow node executor registry", () => {
 			itemIds: ["item-1", "item-2", "item-3"],
 		});
 
-		await expect(executeRegisteredWorkflowNode(context({
+		const result = await executeRegisteredWorkflowNode(context({
 			node: node("checkpoint-script", "workflow.script.javascript/v1", {
 				workflowJavascriptCode: "return input",
 			}, "each", ["result"], 1),
@@ -1765,7 +2375,11 @@ describe("workflow node executor registry", () => {
 			checkpointOutputRefs: async () => {
 				throw new Error("checkpoint unavailable");
 			},
-		}), { runAgent: vi.fn(), runJavascript, runVideo })).rejects.toThrow("checkpoint unavailable");
+		}), { runAgent: vi.fn(), runJavascript, runVideo });
+		expect(result).toMatchObject({ ok: false, errorMessage: "checkpoint unavailable" });
+		expect(result.outputRefs?.itemRuns).toHaveLength(1);
+		expect(result.outputRefs?.itemRuns[0]).toMatchObject({ itemId: "item-1", status: "success" });
+		expect(result.outputRefs?.artifacts[0]).toMatchObject({ type: "tapcanvas.json/v1", value: 1 });
 		expect(runJavascript).toHaveBeenCalledTimes(1);
 	});
 
@@ -1920,9 +2534,23 @@ describe("workflow node executor registry", () => {
 		expect(skillResult).toMatchObject({ ok: true, outputRefs: { ports: { skills: ["tapcanvas-research"] } } });
 	});
 
+	it("accepts an inline trigger source for text expansion workflows", async () => {
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("text", "workflow.input.text/v1", { workflowTextInput: "" }, "once", ["text"]),
+			inputs: { trigger: [{ source: "粗略剧情：外神降临" }] },
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+
+		expect(result).toMatchObject({
+			ok: true,
+			outputRefs: {
+				ports: { text: "粗略剧情：外神降临" },
+			},
+		});
+	});
+
 	it("persists Knowledge Search candidates and requires their exact artifact for Knowledge Read", async () => {
 		const candidateSet = {
-			protocolVersion: "workflow.knowledge-candidates/v1" as const,
+			protocolVersion: "workflow.knowledge-candidates/v2" as const,
 			candidateSetId: "domain_test",
 			requestHash: "request-hash",
 			createdAt: "2026-08-13T00:00:00.000Z",
@@ -1941,9 +2569,8 @@ describe("workflow node executor registry", () => {
 				facet: null,
 				title: "镜头设计",
 				roleScope: ["director"],
-				keywords: ["景别"],
-				sourceUrls: [],
-				bodyPreview: "知识预览",
+				contentSha256: "a".repeat(64),
+				bodyBytes: 100,
 				rank: 1,
 				score: 0.9,
 				vectorScore: 0.9,
@@ -1963,11 +2590,17 @@ describe("workflow node executor registry", () => {
 			rawUserRequest: "如何设计镜头",
 			limit: 5,
 		}));
+    const unlimited = await executeRegisteredWorkflowNode(context({
+      node: node("knowledge-unlimited", "agents.knowledge.search/v1", {}, "once", ["knowledge-candidates"], undefined, ["query"]),
+      inputs: { query: ["如何设计镜头"] },
+    }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo, searchKnowledge });
+    expect(unlimited.ok).toBe(true);
+    expect(searchKnowledge).toHaveBeenLastCalledWith(expect.objectContaining({ limit: Number.MAX_SAFE_INTEGER }));
 		expect(searchResult).toMatchObject({
 			ok: true,
 			outputRefs: {
 				ports: { "knowledge-candidates": candidateSet },
-				artifacts: [{ type: "workflow.knowledge-candidates/v1", identity: "domain_test" }],
+				artifacts: [{ type: "workflow.knowledge-candidates/v2", identity: "domain_test" }],
 			},
 		});
 
@@ -1989,7 +2622,7 @@ describe("workflow node executor registry", () => {
 			inputs: { "knowledge-candidates": [candidateSet], "card-id": [{ cardId: "card-1" }] },
 		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo, readKnowledge });
 
-		expect(readKnowledge).toHaveBeenCalledWith({ candidateSet, cardId: "card-1" });
+		expect(readKnowledge).toHaveBeenCalledWith({ ownerId: "user-1", candidateSet, cardId: "card-1" });
 		expect(readResult).toMatchObject({
 			ok: true,
 			outputRefs: {
@@ -2022,6 +2655,45 @@ describe("workflow node executor registry", () => {
 			outputRefs: {
 				ports: { result: { projectId: "project-1" } },
 				evidence: { toolName: "tapcanvas_project_context_get", completed: true },
+			},
+		});
+	});
+
+	it("carries upstream delivery metadata through tool invocation without sending it as tool args", async () => {
+		const invokeTool = vi.fn(async () => ({
+			toolName: "tapcanvas_flow_patch",
+			content: "{\"ok\":true}",
+			data: { ok: true },
+			execution: { sideEffect: "state" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("tool-call", "agents.tool.invoke/v1", {
+				workflowToolInvocationName: "tapcanvas_flow_patch",
+			}, "once", ["result"], undefined, ["arguments"]),
+			inputs: {
+				arguments: [{
+					allowOverwrite: true,
+					patchNodeData: [{ id: "expanded-source", data: { content: "正文" } }],
+					deliveryEvidence: { source: "agent" },
+					deliveryVerification: { version: 2, status: "satisfied" },
+				}],
+			},
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo, invokeTool });
+
+		expect(invokeTool).toHaveBeenCalledWith(expect.objectContaining({
+			toolName: "tapcanvas_flow_patch",
+			args: { allowOverwrite: true, patchNodeData: [{ id: "expanded-source", data: { content: "正文" } }] },
+		}));
+		expect(result).toMatchObject({
+			ok: true,
+			outputRefs: {
+				ports: {
+					result: {
+						ok: true,
+						deliveryEvidence: { source: "agent" },
+						deliveryVerification: { version: 2, status: "satisfied" },
+					},
+				},
 			},
 		});
 	});
@@ -2133,7 +2805,7 @@ describe("workflow node executor registry", () => {
 		expect(resumed).toMatchObject({ ok: true, outputRefs: { ports: { result: { childExecutionId: "execution-child" } } } });
 	});
 
-	it("forwards frozen Workflow Skill dependencies alongside bounded discovery", async () => {
+	it("forwards frozen Workflow Skill dependencies alongside open discovery", async () => {
 		const executionProvenance = {
 			version: 1 as const,
 			executionId: "agent-execution-1",
@@ -2175,6 +2847,7 @@ describe("workflow node executor registry", () => {
 		}));
 		const runJavascript = vi.fn();
 		const result = await executeRegisteredWorkflowNode(context({
+			flowVersionData: { nodes: [{ id: "trigger", data: { workflowTriggerPayload: { chapterId: "chapter-1", workflowRootTaskIdentity: { version: 1, ownerId: "user-1", logicalTaskBudgetRootId: "public-turn-origin" } } } }] },
 				node: node("agent", "agents.logical-task/v2", {
 					workflowInstruction: "生成报告",
 					workflowAgentOutputArtifactType: "tapcanvas.json/v1",
@@ -2196,6 +2869,7 @@ describe("workflow node executor registry", () => {
 		}), { runAgent, runJavascript, runVideo });
 
 		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			logicalTaskBudgetRootId: "execution-family-1",
 			forcedAgentRole: "research",
 			modelKey: "gemini-3.1-pro",
 			deliveryRequirement: "交付一个可解析且可追溯的 JSON 报告产物",
@@ -2204,8 +2878,13 @@ describe("workflow node executor registry", () => {
 			disabledSkills: [],
 			disabledKnowledgeCardIds: [],
 			allowedTools: [
+				"skill_search",
+				"skill_candidates_page",
+				"retrieval_rank",
 				"Skill",
 				"knowledge_search",
+				"knowledge_candidates_page",
+        "tapcanvas_execution_node_runs_get",
 				"knowledge_read",
 				"tapcanvas_project_read",
 				"tapcanvas_canvas_read",
@@ -2215,7 +2894,7 @@ describe("workflow node executor registry", () => {
 			promptExampleRetrievalScope: {
 				version: 3,
 				mediaType: "video",
-				searchPolicy: "agent_discretion",
+				searchPolicy: "required_non_blocking",
 			},
 		}));
 		expect(result).toMatchObject({
@@ -2232,6 +2911,164 @@ describe("workflow node executor registry", () => {
 				artifacts: [{ type: "tapcanvas.json/v1", identity: "agent-task-1", value: "完成" }],
 			},
 		});
+	});
+
+	it("keeps discovery and explicit optional scoring tools open for typed authoring", async () => {
+		const runAgent = vi.fn(async () => ({
+			taskId: "typed-agent-task-1",
+			text: JSON.stringify({ result: "完成" }),
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: { items: [{ evidenceId: "e-typed-1" }] },
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("typed-agent", "agents.logical-task/v2", {
+				workflowInstruction: "生成 JSON",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentOutputArtifactType: "tapcanvas.json/v1",
+				workflowAgentDeliveryRequirement: "交付一个 JSON 对象",
+				workflowAgentDefinitionId: "research",
+				workflowAgentModelKey: "configured-model",
+				workflowRequiredSkills: ["tapcanvas-research"],
+				workflowPromptExampleMediaType: "video",
+				workflowAgentJsonObjectContract: {
+					requiredStringFields: ["result"],
+					allowedFields: ["result"],
+				},
+			}),
+			inputs: {
+				input: [{
+					executionProvenance: {
+						loadedKnowledgeSources: [{ cardId: "card-combat" }],
+					},
+				}],
+			},
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			mountedKnowledgeCardIds: ["card-combat"],
+			allowedTools: [
+				"skill_search",
+				"skill_candidates_page",
+				"retrieval_rank",
+				"Skill",
+				"knowledge_search",
+				"knowledge_candidates_page",
+        "tapcanvas_execution_node_runs_get",
+				"knowledge_read",
+				"prompt_example_search",
+				"prompt_example_read",
+			],
+		}));
+		expect(result).toMatchObject({ ok: true });
+	});
+
+	it("omits project inspection when the frozen node declares no asset-inspection capability", async () => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "opening-agent-task-1",
+			text: JSON.stringify({ result: "ready" }),
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: { items: [{ evidenceId: "opening-1" }] },
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("opening-agent", "agents.logical-task/v2", {
+				workflowInstruction: "Create the opening clip.",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentOutputArtifactType: "tapcanvas.json/v1",
+				workflowAgentDeliveryRequirement: "Return one structured object.",
+				workflowAgentDefinitionId: "writer",
+				workflowAgentModelKey: "configured-model",
+				workflowProjectAssetInspection: false,
+				workflowAgentJsonObjectContract: { requiredStringFields: ["result"], allowedFields: ["result"] },
+			}),
+			projectContext: selectedAssetProjectContext(["asset-selected"]),
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(result).toMatchObject({ ok: true });
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			allowedTools: expect.arrayContaining([
+				"skill_search", "Skill", "knowledge_search", "knowledge_candidates_page",
+				"tapcanvas_execution_node_runs_get", "knowledge_read",
+			]),
+		}));
+		expect(runAgent.mock.calls[0]?.[0].allowedTools).not.toContain("tapcanvas_workflow_execution_inspect");
+	});
+
+	it.each(["json_object", "json_array"])("preserves media evidence and frozen tool grants for %s authoring", async (encoding) => {
+		const runAgent = vi.fn(async (_request: { allowedTools: readonly string[] }) => ({
+			taskId: "media-author-1",
+			text: encoding === "json_object" ? '{"result":"observed"}' : '[{"result":"observed"}]',
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: { items: [{ evidenceId: "observed-1" }] },
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		}));
+		const projectContext = { ...selectedAssetProjectContext(["image-a"]), selectedAssetIds: [], selection: { nodeIds: [], assetIds: [], activeNodeId: null, groupId: null } };
+		const result = await executeRegisteredWorkflowNode({
+			...context({
+				node: node("media-author", "agents.logical-task/v2", {
+					workflowInstruction: "Interpret authorized inputs",
+					workflowAgentOutputEncoding: encoding,
+					workflowAgentOutputArtifactType: "tapcanvas.test/v1",
+					workflowAgentDeliveryRequirement: "Return the requested structured artifact",
+					workflowAgentModelKey: "configured-model",
+					workflowAgentDefinitionId: "research",
+					workflowAllowedTools: ["tapcanvas_flow_get"],
+					workflowAgentJsonObjectContract: { requiredStringFields: ["result"], allowedFields: ["result"] },
+					workflowAgentJsonArrayContract: { itemRequiredStringFields: ["result"], itemAllowedFields: ["result"] },
+				}),
+			}),
+			projectContext,
+		}, { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(result.ok).toBe(true);
+		const tools = runAgent.mock.calls[0]![0];
+		expect(tools.allowedTools).toEqual(expect.arrayContaining(["Skill", "tapcanvas_flow_get", "tapcanvas_image_refs_get", "tapcanvas_analyze_image"]));
+		expect(tools.allowedTools).not.toContain("tapcanvas_image_generate_to_canvas");
+		expect(tools.allowedTools).not.toContain("tapcanvas_flow_patch");
+	});
+
+	it("mounts knowledge receipts from the clip authoring evidence packet", async () => {
+		const runAgent = vi.fn(async () => ({
+			taskId: "typed-agent-packet-1",
+			text: JSON.stringify({ result: "完成" }),
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: { items: [{ evidenceId: "e-typed-packet-1" }] },
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		}));
+		await executeRegisteredWorkflowNode(context({
+			node: node("typed-agent-packet", "agents.logical-task/v2", {
+				workflowInstruction: "生成 JSON",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentOutputArtifactType: "tapcanvas.clip-prompts/v2",
+				workflowAgentDeliveryRequirement: "交付一个 Clip 提示词对象",
+				workflowAgentDefinitionId: "video-prompt-writer",
+				workflowAgentModelKey: "configured-model",
+				workflowRequiredSkills: ["tapcanvas-video-prompt-writer"],
+				workflowPromptExampleMediaType: "video",
+				workflowAgentJsonObjectContract: {
+					requiredStringFields: ["result"],
+					allowedFields: ["result"],
+				},
+			}),
+			inputs: {
+				"clip-contexts": [{
+					authoringEvidencePacket: {
+						dependencyProvenance: {
+							loadedKnowledgeSources: [{ cardId: "card-packet-combat" }],
+						},
+					},
+				}],
+			},
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			mountedKnowledgeCardIds: ["card-packet-combat"],
+		}));
 	});
 
 	it("scopes system-level workflow Agent nodes to the caller project and canvas", async () => {
@@ -2269,7 +3106,7 @@ describe("workflow node executor registry", () => {
 
 	it("keeps the workflow project canvas scope when no delivery is frozen", async () => {
 		const projectContext = selectedAssetProjectContext(["asset-project-candidate"]);
-		const runAgent = vi.fn(async () => ({
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
 			taskId: "agent-task-local",
 			text: "完成",
 			assets: [],
@@ -2384,7 +3221,7 @@ describe("workflow node executor registry", () => {
 	});
 
 	it("reads a project_context source without a SmallT-planned group and preserves call configuration", async () => {
-		const readCanvasProjectContextFromFlow = vi.fn(async () => ({
+		const readCanvasProjectContextFromSnapshot = vi.fn(async () => ({
 			sourceMode: "project_context" as const,
 			flowId: "caller-flow-1",
 			sourceNodeIds: ["caller-text"],
@@ -2436,11 +3273,11 @@ describe("workflow node executor registry", () => {
 			runAgent: vi.fn(),
 			runJavascript: vi.fn(),
 			runVideo,
-			readCanvasProjectContextFromFlow,
+			readCanvasProjectContextFromSnapshot,
 		});
 
 		expect(result.ok).toBe(true);
-		expect(readCanvasProjectContextFromFlow).toHaveBeenCalledWith(expect.objectContaining({
+		expect(readCanvasProjectContextFromSnapshot).toHaveBeenCalledWith(expect.objectContaining({
 			flowId: "caller-flow-1",
 			ownerId: "user-1",
 		}));
@@ -2448,6 +3285,7 @@ describe("workflow node executor registry", () => {
 			outputRefs: {
 				evidence: {
 					sourceMode: "project_context",
+					sourceReadBoundary: "acceptance_snapshot",
 					sourceNodeIds: ["caller-text"],
 				},
 				artifacts: [{
@@ -2462,8 +3300,70 @@ describe("workflow node executor registry", () => {
 		});
 	});
 
-	it("uses the immutable accepted public-chat turn as the sole project_context source", async () => {
-		const readCanvasProjectContextFromFlow = vi.fn();
+	it("passes the server-owned accepted turn source when a public request has no text node", async () => {
+		const readCanvasProjectContextFromSnapshot = vi.fn(async () => ({
+			sourceMode: "project_context" as const,
+			flowId: "caller-flow-1",
+			sourceNodeIds: [],
+			nodes: [],
+			authoritativeSources: [{
+				sourceId: "public-turn-1",
+				content: "15秒电商视频",
+				sourceFingerprint: "6c6791c32b5d6d9e9eb6a2274de056480c10600d8a06701954f356dba7bda344",
+			}],
+		}));
+		const acceptedTurnSource = {
+			protocolVersion: "tapcanvas.workflow-accepted-turn-source/v1" as const,
+			kind: "public_chat_turn" as const,
+			ownerId: "user-1",
+			sourceId: "public-turn-1",
+			text: "15秒电商视频",
+			fingerprint: "6c6791c32b5d6d9e9eb6a2274de056480c10600d8a06701954f356dba7bda344",
+		};
+		const result = await executeRegisteredWorkflowNode({
+			...context({
+				node: node("canvas-source", "tapcanvas.canvas.group.read/v1", {
+					workflowSourceMode: "project_context",
+				}),
+				inputs: { trigger: [{ workflowAcceptedTurnSource: acceptedTurnSource }] },
+			}),
+			flowVersionData: {
+				workflowProjectContext: {
+					version: 3,
+					projectId: "caller-project-1",
+					canvasId: "caller-flow-1",
+					sourceNodeId: null,
+					selectedAssetIds: [],
+					projectAssetIds: [],
+					timeline: { clips: [] },
+					selection: { nodeIds: [], assetIds: [], activeNodeId: null, groupId: null },
+					permissions: { principalId: "user-1", projectRead: true, canvasRead: true, assetRead: true, assetWrite: true },
+					assetSnapshot: [],
+					capturedAt: "2026-08-18T00:00:00.000Z",
+				},
+			},
+		}, {
+			runAgent: vi.fn(),
+			runJavascript: vi.fn(),
+			runVideo,
+			readCanvasProjectContextFromSnapshot,
+		});
+
+		expect(result.ok).toBe(true);
+		expect(readCanvasProjectContextFromSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+			allowNoTextSource: true,
+			acceptedTurnSource,
+		}));
+	});
+
+	it("keeps the selected screenplay authoritative while projecting the accepted brief as userRequest", async () => {
+		const readCanvasProjectContextFromSnapshot = vi.fn(async () => ({
+			sourceMode: "project_context" as const,
+			flowId: "caller-flow-1",
+			sourceNodeIds: ["screenplay-final"],
+			nodes: [{ nodeId: "screenplay-final", kind: "text", content: "导演定稿：雨夜霓虹追逐以角色和解收尾。" }],
+			authoritativeSources: [{ sourceId: "screenplay-final", content: "导演定稿：雨夜霓虹追逐以角色和解收尾。" }],
+		}));
 		const acceptedSource = createWorkflowAcceptedTurnSource({
 			ownerId: "user-1",
 			sourceId: "public-turn-1",
@@ -2508,26 +3408,32 @@ describe("workflow node executor registry", () => {
 			runAgent: vi.fn(),
 			runJavascript: vi.fn(),
 			runVideo,
-			readCanvasProjectContextFromFlow,
+			readCanvasProjectContextFromSnapshot,
 		});
 
 		expect(result.ok).toBe(true);
-		expect(readCanvasProjectContextFromFlow).not.toHaveBeenCalled();
+		expect(readCanvasProjectContextFromSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+			flowId: "caller-flow-1",
+			ownerId: "user-1",
+		}));
 		expect(result).toMatchObject({
 			outputRefs: {
 				evidence: {
-					sourceMode: "public_chat_turn",
-					sourceId: "public-turn-1",
-					sourceFingerprint: acceptedSource.fingerprint,
+					sourceMode: "project_context",
+					sourceFlowId: "caller-flow-1",
+					sourceNodeIds: ["screenplay-final"],
 				},
 				artifacts: [{
-					identity: "public-turn-1",
+					identity: "caller-flow-1:project-context",
 					value: {
-						sourceMode: "public_chat_turn",
-						sourceId: "public-turn-1",
-						text: "创作一条二十秒的雨夜霓虹追逐视频",
-						sourceNodeIds: [],
-						nodes: [],
+						sourceMode: "project_context",
+						authoritativeSources: [{ sourceId: "screenplay-final", content: "导演定稿：雨夜霓虹追逐以角色和解收尾。" }],
+						userRequest: {
+							kind: "public_chat_turn",
+							requestId: "public-turn-1",
+							content: "创作一条二十秒的雨夜霓虹追逐视频",
+							requestFingerprint: acceptedSource.fingerprint,
+						},
 						callConfig: {
 							targetDurationSeconds: 20,
 							videoModelKey: "doubao-seedance-2.0",
@@ -2540,8 +3446,322 @@ describe("workflow node executor registry", () => {
 		expect(artifact).not.toHaveProperty(WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD);
 	});
 
+	it("passes a selected delivery source separately from the current public-chat request", async () => {
+		const screenplay = "\n《下次》原始剧本正文\n";
+		const reference = {
+			mode: "actionable",
+			version: 1,
+			referenceId: "delivery_ref_next_001",
+			publicTurnId: "public-turn-screenplay",
+			deliveredAt: "2026-09-26T03:15:15.000Z",
+			content: screenplay,
+			contentHash: `sha256:${sha256Hex(screenplay)}`,
+			artifactKind: "screenplay",
+			label: "《下次》",
+			summary: "已确认短片剧本",
+			executionTarget: { mode: "async_artifact", mediaType: "video", kind: "short_film", output: "60秒短片" },
+			allowedNextActions: ["按原剧本制作视频"],
+		};
+		const actionableDeliverySource = freezeWorkflowActionableDeliverySource({
+			ownerId: "user-1",
+			userIntentContract: { referenceResolution: { mode: "selected_exact", referenceId: reference.referenceId } },
+			parentDeliveryReference: reference,
+		});
+		const acceptedTurnSource = createWorkflowAcceptedTurnSource({ ownerId: "user-1", sourceId: "public-turn-one-click", text: "一键成片" });
+		const readCanvasProjectContextFromSnapshot = vi.fn(async ({ actionableDeliverySource: deliveredSource }: {
+			actionableDeliverySource?: { reference: { referenceId: string; content: string; contentHash: string } } | null;
+		}) => ({
+			sourceMode: "project_context" as const,
+			flowId: "caller-flow-1",
+			sourceNodeIds: [],
+			nodes: [],
+			authoritativeSources: deliveredSource ? [{
+				sourceId: `actionable-delivery:${deliveredSource.reference.referenceId}`,
+				sourceType: "actionable_delivery",
+				content: deliveredSource.reference.content,
+				contentHash: deliveredSource.reference.contentHash,
+			}] : [],
+		}));
+		const result = await executeRegisteredWorkflowNode({
+			...context({
+				node: node("canvas-source", "tapcanvas.canvas.group.read/v1", { workflowSourceMode: "project_context" }),
+				inputs: { trigger: [{
+					videoModelKey: "doubao-seedance-2.5",
+					[WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD]: acceptedTurnSource,
+					workflowActionableDeliverySource: actionableDeliverySource,
+				}] },
+			}),
+			flowVersionData: {
+				workflowProjectContext: {
+					version: 3,
+					projectId: "caller-project-1",
+					canvasId: "caller-flow-1",
+					sourceNodeId: null,
+					selectedAssetIds: [],
+					projectAssetIds: [],
+					timeline: { clips: [] },
+					selection: { nodeIds: [], assetIds: [], activeNodeId: null, groupId: null },
+					permissions: { principalId: "user-1", projectRead: true, canvasRead: true, assetRead: true, assetWrite: true },
+					assetSnapshot: [],
+					capturedAt: "2026-08-22T00:00:00.000Z",
+				},
+			},
+		}, {
+			runAgent: vi.fn(),
+			runJavascript: vi.fn(),
+			runVideo,
+			readCanvasProjectContextFromSnapshot,
+		});
+
+		expect(result.ok).toBe(true);
+		expect(readCanvasProjectContextFromSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+			allowNoTextSource: true,
+			acceptedTurnSource,
+			actionableDeliverySource,
+		}));
+		expect(result).toMatchObject({
+			outputRefs: {
+				artifacts: [{
+					value: {
+						authoritativeSources: [{
+							sourceId: "actionable-delivery:delivery_ref_next_001",
+							sourceType: "actionable_delivery",
+							content: screenplay,
+							contentHash: reference.contentHash,
+						}],
+						userRequest: {
+							kind: "public_chat_turn",
+							requestId: "public-turn-one-click",
+							content: "一键成片",
+							requestFingerprint: acceptedTurnSource.fingerprint,
+						},
+					},
+				}],
+			},
+		});
+	});
+
+	// Private saved-run evidence is an explicit audit input, not a prerequisite
+	// for the portable unit suite. An opted-in replay fails if its inputs are absent.
+	it.runIf(Boolean(process.env.TAPCANVAS_WORKFLOW_SOURCE_REPLAY_OUT))("replays the saved approved screenplay through the source boundary without a real execution", async () => {
+		const auditRoot = path.resolve(process.cwd(), "../../docs/reviews/20260927-workflow-density");
+		const memoryContextPath = path.join(auditRoot, "local/project-session-memory-context.json");
+		const recentConversation = (JSON.parse(fs.readFileSync(memoryContextPath, "utf8")) as {
+			data: { context: { recentConversation: Array<{ messageId: string; turnId?: string; role: string; content: string; createdAt: string }> } };
+		}).data.context.recentConversation;
+		const originalRequest = recentConversation.find((turn) => turn.role === "user" && turn.content.startsWith("写一部 60 秒原创短片"));
+		const approvedDelivery = recentConversation.find((turn) => turn.role === "assistant" && turn.content.startsWith("## 《下次》"));
+		const acceptedRequest = recentConversation.find((turn) => turn.role === "user" && turn.content === "一键成片");
+		expect(originalRequest).toBeDefined();
+		expect(approvedDelivery).toBeDefined();
+		expect(acceptedRequest).toBeDefined();
+		if (!originalRequest || !approvedDelivery || !acceptedRequest) throw new Error("Saved screenplay fixture is incomplete");
+
+		const declaration = {
+			mode: "actionable" as const,
+			artifactKind: "screenplay",
+			label: "《下次》",
+			summary: "fixture replay of the saved approved screenplay",
+			executionTarget: {
+				mode: "async_artifact" as const,
+				mediaType: "video" as const,
+				kind: "short_film",
+				output: "60秒短片",
+				durationSeconds: 60,
+			},
+			allowedNextActions: ["reference"],
+		};
+		const fixturePublicTurnId = "public-chat-turn:source-replay-fixture-only";
+		const contentHashHex = createHash("sha256").update(approvedDelivery.content).digest("hex");
+		// Mirrors createActionableDeliveryReference's deterministic ID input for a test-only fixture.
+		const fixtureReferenceId = `delivery_ref_${createHash("sha256").update(JSON.stringify({
+			publicTurnId: fixturePublicTurnId,
+			declaration,
+			contentHash: contentHashHex,
+		})).digest("hex").slice(0, 24)}`;
+		const fixtureReference = {
+			...declaration,
+			version: 1,
+			referenceId: fixtureReferenceId,
+			publicTurnId: fixturePublicTurnId,
+			deliveredAt: "2026-09-27T00:00:00.000Z",
+			content: approvedDelivery.content,
+			contentHash: `sha256:${contentHashHex}`,
+			originalUserRequest: originalRequest.content,
+		};
+		const fixtureOwnerId = "user-1";
+		const actionableDeliverySource = freezeWorkflowActionableDeliverySource({
+			ownerId: fixtureOwnerId,
+			userIntentContract: { referenceResolution: { mode: "derived", referenceId: fixtureReferenceId } },
+			parentDeliveryReference: fixtureReference,
+		});
+		const acceptedTurnSource = createWorkflowAcceptedTurnSource({
+			ownerId: fixtureOwnerId,
+			sourceId: acceptedRequest.turnId ?? acceptedRequest.messageId,
+			text: acceptedRequest.content,
+		});
+
+		const historicalSnapshotPath = path.join(auditRoot, "local/latest/execution-snapshot.json");
+		const historicalSnapshot = JSON.parse(fs.readFileSync(historicalSnapshotPath, "utf8")) as unknown;
+		const historicalReferenceIds = new Set<string>();
+		const visitReferenceResolution = (value: unknown, seen = new Set<object>()): void => {
+			if (!value || typeof value !== "object" || seen.has(value)) return;
+			seen.add(value);
+			if (Array.isArray(value)) {
+				value.forEach((child) => visitReferenceResolution(child, seen));
+				return;
+			}
+			const record = value as Record<string, unknown>;
+			const resolution = record.referenceResolution;
+			if (resolution && typeof resolution === "object" && !Array.isArray(resolution)) {
+				const candidate = resolution as Record<string, unknown>;
+				if ((candidate.mode === "selected_exact" || candidate.mode === "derived") && typeof candidate.referenceId === "string") {
+					historicalReferenceIds.add(candidate.referenceId);
+				}
+			}
+			Object.values(record).forEach((child) => visitReferenceResolution(child, seen));
+		};
+		visitReferenceResolution(historicalSnapshot);
+		const historicalSelectedReferenceId = "delivery_ref_0e3f97a954d117254f314487";
+		expect(historicalReferenceIds.has(historicalSelectedReferenceId)).toBe(true);
+		expect(fixtureReferenceId).not.toBe(historicalSelectedReferenceId);
+
+		const selectedNodeId = "d9660f4a-a42b-451a-85f1-43b6655ee49b";
+		const selectedAssetId = "project-node:project:8544a2ee-bef6-4c5e-a1e7-4c6a52d7433c:d9660f4a-a42b-451a-85f1-43b6655ee49b";
+		const projectId = "8544a2ee-bef6-4c5e-a1e7-4c6a52d7433c";
+		const canvasId = "3648a3d3-2986-4b70-adec-cf2fe3ee1a90";
+		const projectContext = {
+			version: 3,
+			projectId,
+			canvasId,
+			sourceNodeId: null,
+			selectedAssetIds: [],
+			projectAssetIds: [selectedAssetId],
+			timeline: { clips: [] },
+			selection: { nodeIds: [selectedNodeId], assetIds: [], activeNodeId: selectedNodeId, groupId: null },
+			permissions: { principalId: fixtureOwnerId, projectRead: true, canvasRead: true, assetRead: true, assetWrite: true },
+			assetSnapshot: [{
+				assetId: selectedAssetId,
+				assetVersion: 3,
+				assetVersionId: `${selectedAssetId}:revision:2`,
+				contentFingerprint: "selected-asset-metadata-preserved-from-frozen-project-context",
+				projectId,
+				name: "图片-1",
+				canonicalName: "图片-1",
+				kind: "text",
+				referenceType: null,
+				approvalStatus: null,
+				origin: "project_node",
+				flowId: canvasId,
+				nodeId: selectedNodeId,
+				mediaKind: "text",
+				state: "ready",
+				assetUsage: null,
+				assetPurpose: null,
+				productionEligible: true,
+				productionExclusionReason: null,
+				styleFingerprint: null,
+				sourceFacts: {
+					referenceType: null,
+					roleName: null,
+					physicalIdentityKey: null,
+					characterAssetRole: null,
+					characterProfileVersion: null,
+					identityAnchors: [],
+					prohibitedDrift: [],
+					sourceNodeId: null,
+					workflowExecutionId: null,
+					taskId: null,
+					prompt: null,
+				},
+				updatedAt: "2026-09-26T02:54:08.690Z",
+			}],
+			capturedAt: "2026-09-26T03:17:54.029Z",
+		} satisfies WorkflowProjectContext;
+		const callerCanvasSnapshot = {
+			nodes: [{
+				id: selectedNodeId,
+				type: "taskNode",
+				data: { kind: "image", label: "图片-1", productionLayer: "expansion" },
+			}],
+			edges: [],
+		};
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("canvas-source-fixture", "tapcanvas.canvas.group.read/v1", { workflowSourceMode: "project_context" }, "once", ["canvas-facts"], undefined, ["trigger"]),
+			inputs: { trigger: [{
+				[WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD]: acceptedTurnSource,
+				workflowActionableDeliverySource: actionableDeliverySource,
+			}] },
+			flowVersionData: { workflowProjectContext: projectContext, workflowCallerCanvasSnapshot: callerCanvasSnapshot },
+		}), {
+		runAgent: vi.fn(),
+		runJavascript: vi.fn(),
+		runVideo,
+		readCanvasProjectContextFromSnapshot: async (request) => readWorkflowCanvasProjectContextFromSnapshot(request),
+		});
+		expect(result.ok).toBe(true);
+		if (!result.ok) throw new Error(`Expected source fixture success: ${JSON.stringify(result)}`);
+		const canvasFacts = result.outputRefs.artifacts?.[0]?.value as Record<string, unknown>;
+		const authoritativeSources = canvasFacts.authoritativeSources as Array<Record<string, unknown>>;
+		const selectedNodeFacts = canvasFacts.selectedNodeFacts as Array<Record<string, unknown>>;
+		const userRequest = canvasFacts.userRequest as Record<string, unknown>;
+		const source = authoritativeSources[0]!;
+		const coordinates = source.sourceCoordinates as { endOffset: number; utf16Length: number; lines: Array<[number, number]> };
+		const sourceText = source.content as string;
+		expect(authoritativeSources).toHaveLength(1);
+		expect(source).toMatchObject({
+			sourceId: `actionable-delivery:${fixtureReferenceId}`,
+			sourceType: "actionable_delivery",
+			content: approvedDelivery.content,
+			contentHash: `sha256:${contentHashHex}`,
+			sourceFingerprint: contentHashHex,
+		});
+		expect(userRequest).toMatchObject({ kind: "public_chat_turn", content: "一键成片" });
+		expect(selectedNodeFacts).toMatchObject([{ nodeId: selectedNodeId, assetIds: [selectedAssetId], metadata: { kind: "image", label: "图片-1", productionLayer: "expansion" } }]);
+		expect(coordinates).toMatchObject({ endOffset: sourceText.length, utf16Length: sourceText.length });
+		expect(coordinates.lines.map(([start, end]) => sourceText.slice(start, end)).join("")).toBe(sourceText);
+
+		const replayEvidence = {
+			protocol: "workflow-actionable-source-replay-fixture/v1",
+			kind: "pure_local_fixture_replay",
+			performedAt: new Date().toISOString(),
+			noWorkflowExecutionCreated: true,
+			noMediaInvoked: true,
+			bodySource: {
+				memoryContextFile: "local/project-session-memory-context.json",
+				messageId: approvedDelivery.messageId,
+				createdAt: approvedDelivery.createdAt,
+				characterCount: approvedDelivery.content.length,
+				unicodeCodePointCount: Array.from(approvedDelivery.content).length,
+				sha256: contentHashHex,
+				content: approvedDelivery.content,
+			},
+			historicalSelectedReference: {
+				referenceId: historicalSelectedReferenceId,
+				mode: "derived",
+				fullReceiptPresentInSnapshot: false,
+				byteEquivalenceProven: false,
+			},
+			fixtureReference: {
+				referenceId: fixtureReferenceId,
+				publicTurnId: fixturePublicTurnId,
+				deliveredAt: fixtureReference.deliveredAt,
+				contentHash: fixtureReference.contentHash,
+				metadataIsSynthetic: true,
+			},
+			replayedCanvasFacts: {
+				authoritativeSources,
+				userRequest,
+				selectedNodeFacts,
+				sourceCoordinates: coordinates,
+			},
+		};
+		const replayOutputPath = process.env.TAPCANVAS_WORKFLOW_SOURCE_REPLAY_OUT;
+		if (replayOutputPath) fs.writeFileSync(replayOutputPath, `${JSON.stringify(replayEvidence, null, 2)}\n`, "utf8");
+	});
+
 	it("keeps the chapter as story authority while projecting the accepted public-chat turn as userRequest", async () => {
-		const readCanvasProjectContextFromFlow = vi.fn(async () => ({
+		const readCanvasProjectContextFromSnapshot = vi.fn(async () => ({
 			sourceMode: "project_context" as const,
 			flowId: "chapter-36",
 			sourceNodeIds: ["chapter-seed-36"],
@@ -2593,11 +3813,11 @@ describe("workflow node executor registry", () => {
 			runAgent: vi.fn(),
 			runJavascript: vi.fn(),
 			runVideo,
-			readCanvasProjectContextFromFlow,
+			readCanvasProjectContextFromSnapshot,
 		});
 
 		expect(result.ok).toBe(true);
-		expect(readCanvasProjectContextFromFlow).toHaveBeenCalledWith(expect.objectContaining({
+		expect(readCanvasProjectContextFromSnapshot).toHaveBeenCalledWith(expect.objectContaining({
 			flowId: "chapter-36",
 			chapterId: "chapter-36",
 		}));
@@ -2617,7 +3837,7 @@ describe("workflow node executor registry", () => {
 	});
 
 	it("rejects a forged accepted-turn source before reading project canvas content", async () => {
-		const readCanvasProjectContextFromFlow = vi.fn();
+		const readCanvasProjectContextFromSnapshot = vi.fn();
 		const result = await executeRegisteredWorkflowNode({
 			...context({
 				node: node("canvas-source", "tapcanvas.canvas.group.read/v1", {
@@ -2662,7 +3882,7 @@ describe("workflow node executor registry", () => {
 			runAgent: vi.fn(),
 			runJavascript: vi.fn(),
 			runVideo,
-			readCanvasProjectContextFromFlow,
+			readCanvasProjectContextFromSnapshot,
 		});
 
 		expect(result).toMatchObject({
@@ -2670,7 +3890,7 @@ describe("workflow node executor registry", () => {
 			errorCode: "workflow_node_runtime_failed",
 			errorMessage: expect.stringContaining("workflow_accepted_turn_source_invalid"),
 		});
-		expect(readCanvasProjectContextFromFlow).not.toHaveBeenCalled();
+		expect(readCanvasProjectContextFromSnapshot).not.toHaveBeenCalled();
 	});
 
 	it("rejects an Agent node without an explicit real Agent identity", async () => {
@@ -2720,6 +3940,67 @@ describe("workflow node executor registry", () => {
 			modelKey: "gpt-5.6-luna",
 		}));
 		expect(result).toMatchObject({ ok: true });
+	});
+
+	it.each(["priority", "default"] as const)("inherits the complete user selection over conflicting node settings (%s)", async (serviceTier) => {
+		const runAgent = vi.fn(async () => ({
+			taskId: "agent-inherited-model",
+			text: "继承模型后的完整结果",
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: { items: [{ evidenceId: "e-inherited" }] },
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			flowVersionData: {
+				workflowInitiatingAgentExecution: {
+					model: "gpt-5.6-luna",
+					apiStyle: "responses",
+					reasoningEffort: "xhigh", serviceTier,
+				},
+			},
+			node: node("agent", "agents.logical-task/v2", {
+				workflowInstruction: "生成报告",
+				workflowAgentModelKey: "other-model",
+				workflowAgentReasoningEffort: "low",
+				workflowAgentOutputArtifactType: "tapcanvas.text/v1",
+				workflowAgentDeliveryRequirement: "交付完整文本",
+				workflowAgentDefinitionId: "workflow-transformer",
+			}),
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			modelKey: "gpt-5.6-luna", reasoningEffort: "xhigh", serviceTier,
+		}));
+		expect(result).toMatchObject({ ok: true });
+	});
+
+	it.each([false, true])("inherits the same parent intent without a trigger input, recovery=%s", async (resumeOnly) => {
+		const contract = workflowIntentFixture();
+		const runAgent = vi.fn(async () => ({
+			taskId: "child-intent", text: "node artifact", assets: [],
+			expectedDelivery: {}, deliveryEvidence: {}, deliveryVerification: { status: "satisfied" }, requestTerminal: { status: "succeeded" },
+		}));
+		const result = await executeRegisteredWorkflowNode({
+			...context({
+				flowVersionData: {
+					nodes: [{ data: { workflowTriggerPayload: { workflowUserIntent: freezeWorkflowUserIntent({ ownerId: "user-1", contract }) } } }],
+					workflowInitiatingAgentExecution: { model: "parent-model", apiStyle: "chat" },
+				},
+				inputs: { "item-context": [{ itemId: "slice-2" }] },
+				node: node("child", "agents.logical-task/v2", {
+					workflowInstruction: "Create this item", workflowAgentOutputArtifactType: "tapcanvas.text/v1",
+					workflowAgentDeliveryRequirement: "Deliver this node's text", workflowAgentDefinitionId: "workflow-transformer",
+				}),
+			}),
+			resumeOnly,
+		}, { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(result.ok).toBe(true);
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			userIntentContract: contract, modelKey: "parent-model", resumeOnly,
+			outputArtifactType: "tapcanvas.text/v1", inputs: { "item-context": [{ itemId: "slice-2" }] },
+		}));
 	});
 
 	it("unwraps a strictly typed Agent JSON artifact before exposing the text port", async () => {
@@ -2828,7 +4109,7 @@ describe("workflow node executor registry", () => {
 				text: "已完成视频提示词编译。",
 				assets: [],
 				expectedDelivery: { active: true },
-				deliveryEvidence: { items: [{ evidenceId: "e-summary" }] },
+				deliveryEvidence: { physicalRetryOrdinal: 2, items: [{ evidenceId: "e-summary" }] },
 				deliveryVerification: { status: "satisfied" },
 				requestTerminal: { status: "succeeded" },
 			})),
@@ -2841,7 +4122,9 @@ describe("workflow node executor registry", () => {
 			outputRefs: {
 				artifacts: [],
 				evidence: {
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
+					structuredOutputSubmissionPolicy: "repair_with_correction",
+					deliveryEvidence: { physicalRetryOrdinal: 2 },
+					outputRepair: { version: 1, sourceTurnId: "agent-summary-only", candidate: "已完成视频提示词编译。" },
 					outputContractFailure: {
 						code: "structured_output_invalid",
 						rawOutputRecorded: true,
@@ -2914,7 +4197,7 @@ describe("workflow node executor registry", () => {
 			ok: false,
 			outputRefs: {
 				evidence: {
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
+					structuredOutputSubmissionPolicy: "repair_with_correction",
 					outputContractFailure: {
 						code: "structured_output_invalid",
 						rawOutputRecorded: true,
@@ -2980,8 +4263,40 @@ describe("workflow node executor registry", () => {
 		});
 	});
 
+	it("reports a thrown author contract failure as itself, not a later-declared projection", async () => {
+		// Regression: the catch once spread a projection declared after the try,
+		// so every thrown contract failure surfaced as a TDZ ReferenceError.
+		const runAgent = vi.fn(async () => {
+			throw Object.assign(new Error("identityBoardSpec.readableTextVisible must be true"), {
+				code: "structured_output_invalid",
+			});
+		});
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("chapter-assets-author", "agents.logical-task/v2", {
+				workflowInstruction: "交付资产",
+				workflowAgentOutputArtifactType: "tapcanvas.identity-board/v1",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: { allowedFields: ["title"], requiredStringFields: ["title"] },
+				workflowAgentDeliveryRequirement: "一次交稿",
+				workflowAgentDefinitionId: "writer",
+				workflowAgentModelKey: "gemini-3.8-flash",
+				workflowAgentFailurePolicy: "single_submission",
+			}),
+		}), { runAgent, runJavascript: vi.fn(), runVideo: vi.fn() });
+
+		expect(runAgent).toHaveBeenCalledTimes(1);
+		expect(result).toMatchObject({
+			ok: false,
+			errorMessage: "identityBoardSpec.readableTextVisible must be true",
+			outputRefs: { evidence: { outputContractFailure: {
+				code: "structured_output_invalid",
+				rawOutputRecorded: "agents_cli_trace",
+			} } },
+		});
+	});
+
 	it("freezes BeatSheet clip count and durations from the model-max provider topology", async () => {
-		const runAgent = vi.fn(async () => ({
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
 			taskId: "beat-sheet-format-task",
 			text: JSON.stringify({
 				protocolVersion: "tapcanvas.beat-sheet/v2",
@@ -3035,7 +4350,7 @@ describe("workflow node executor registry", () => {
 
 		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
 			jsonObjectContract: expect.objectContaining({
-				requiredArrayFields: ["objectRegistry", "beats"],
+				requiredArrayFields: ["objectRegistry", "blockingPlans", "beats"],
 			}),
 		}));
 		expect(runAgent.mock.calls[0]?.[0].jsonObjectContract).toEqual(expect.objectContaining({
@@ -3058,7 +4373,7 @@ describe("workflow node executor registry", () => {
 			ok: false,
 			outputRefs: {
 				evidence: {
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
+					structuredOutputSubmissionPolicy: "repair_with_correction",
 					outputContractFailure: {
 						code: "structured_output_invalid",
 						message: expect.stringContaining("objectRegistry must be a non-empty array"),
@@ -3069,8 +4384,189 @@ describe("workflow node executor registry", () => {
 		});
 	});
 
+	it("states the frozen physical-clip capacity arithmetic to the BeatSheet author", async () => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "beat-sheet-capacity-task",
+			text: JSON.stringify({
+				protocolVersion: "tapcanvas.beat-sheet/v2",
+				beats: [{ durationSeconds: 15 }],
+			}),
+			assets: [],
+			expectedDelivery: { version: 1 },
+			deliveryEvidence: { version: 1 },
+			deliveryVerification: { version: 2, status: "satisfied" },
+			requestTerminal: { status: "succeeded", reason: "delivery_verification_satisfied" },
+		}));
+		await executeRegisteredWorkflowNode(context({
+			node: node("beat-sheet-author", "agents.logical-task/v2", {
+				workflowInstruction: "创作整章 BeatSheet",
+				workflowAgentOutputArtifactType: "tapcanvas.beat-sheet/v2",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: {
+					requiredStringFields: ["protocolVersion"],
+					requiredArrayFields: ["beats"],
+					allowedFields: ["protocolVersion", "beats"],
+				},
+				workflowAgentDeliveryRequirement: "交付整章 BeatSheet",
+				workflowAgentDefinitionId: "writer",
+				workflowAgentModelKey: "deepseek-v4-flash",
+			}),
+				inputs: {
+					"delivery-contract": [{
+						canvasFacts: {
+							authoritativeSources: [{ sourceId: "source:chapter-1", content: "冻结第一章正文" }],
+						},
+						targetDurationSeconds: 60,
+						sourceProfile: {
+							protocolVersion: "tapcanvas.beat-sheet-source-profile/v2",
+							sourceQuotedChars: 2088,
+							sourceQuotedUnits: [{ verbatim: "纸上文字", startOffset: 0, endOffset: 4 }],
+						},
+						generationContract: {
+							videoModel: "minimax-h3-dmc",
+							durationOptions: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+							maxDurationSeconds: 15,
+							clipPlanningPolicy: "agent_semantic_duration_budget",
+						},
+					}],
+			},
+			flowVersionData: {
+				nodes: [
+					{ id: "beat-sheet-author", data: { workflowAtomicSpec: { executorRef: "agents.logical-task/v2" } } },
+					{ id: "max-clip", data: { workflowAtomicSpec: { executorRef: BEAT_SHEET_TAKE_EXECUTOR_REF }, workflowBeatSheetTakeCount: 24 } },
+				],
+			},
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		const authorInstruction = String(runAgent.mock.calls[0]?.[0].instruction ?? "");
+		expect(authorInstruction).toContain("创作整章 BeatSheet");
+		expect(authorInstruction).toContain("durationOptions=[4,5,6,7,8,9,10,11,12,13,14,15]");
+		expect(authorInstruction).not.toContain("物理下限");
+		expect(authorInstruction).not.toContain("物理语速上限");
+		expect(authorInstruction).not.toContain("2088 字");
+		expect(authorInstruction).not.toContain("任何速率下都念不完");
+		expect(authorInstruction).toContain("本次交付范围的用户冻结总时长为 60 秒");
+		expect(authorInstruction).toContain("本次执行只生产这 4 个 clip（与窗口时长一致）");
+		expect(authorInstruction).toContain("增加 beat 数量，不要拉长单个 beat");
+	});
+
+	it("invents no physical-clip capacity arithmetic when the frozen contract carries none", async () => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "beat-sheet-no-capacity-task",
+			text: JSON.stringify({
+				protocolVersion: "tapcanvas.beat-sheet/v2",
+				beats: [{ durationSeconds: 15 }],
+			}),
+			assets: [],
+			expectedDelivery: { version: 1 },
+			deliveryEvidence: { version: 1 },
+			deliveryVerification: { version: 2, status: "satisfied" },
+			requestTerminal: { status: "succeeded", reason: "delivery_verification_satisfied" },
+		}));
+		await executeRegisteredWorkflowNode(context({
+			node: node("beat-sheet-author", "agents.logical-task/v2", {
+				workflowInstruction: "创作整章 BeatSheet",
+				workflowAgentOutputArtifactType: "tapcanvas.beat-sheet/v2",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: {
+					requiredStringFields: ["protocolVersion"],
+					requiredArrayFields: ["beats"],
+					allowedFields: ["protocolVersion", "beats"],
+				},
+				workflowAgentDeliveryRequirement: "交付整章 BeatSheet",
+				workflowAgentDefinitionId: "writer",
+				workflowAgentModelKey: "deepseek-v4-flash",
+			}),
+			inputs: {
+				"delivery-contract": [{
+					canvasFacts: {
+						authoritativeSources: [{ sourceId: "source:chapter-1", content: "冻结第一章正文" }],
+					},
+					generationContract: {
+						videoModel: "minimax-h3-dmc",
+						durationOptions: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+						maxDurationSeconds: 15,
+						clipPlanningPolicy: "agent_semantic_duration_budget",
+					},
+				}],
+			},
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		const authorInstruction = String(runAgent.mock.calls[0]?.[0].instruction ?? "");
+		expect(authorInstruction).toContain("创作整章 BeatSheet");
+		// 时长窗口来自冻结合同，必须陈述；人声容量与生产预算没有冻结来源时不得编造。
+		expect(authorInstruction).toContain("durationOptions=[4,5,6,7,8,9,10,11,12,13,14,15]");
+		expect(authorInstruction).not.toContain("计划总时长");
+		expect(authorInstruction).not.toContain("本次执行只生产前");
+	});
+
+	it("states the frozen nested structural contract to the BeatSheet author", async () => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "beat-sheet-structure-task",
+			text: JSON.stringify({ protocolVersion: "tapcanvas.beat-sheet/v2", beats: [{ durationSeconds: 15 }] }),
+			assets: [],
+			expectedDelivery: { version: 1 },
+			deliveryEvidence: { version: 1 },
+			deliveryVerification: { version: 2, status: "satisfied" },
+			requestTerminal: { status: "succeeded", reason: "delivery_verification_satisfied" },
+		}));
+		await executeRegisteredWorkflowNode(context({
+			node: node("beat-sheet-author", "agents.logical-task/v2", {
+				workflowInstruction: "创作整章 BeatSheet",
+				workflowAgentOutputArtifactType: "tapcanvas.beat-sheet/v2",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: {
+					requiredStringFields: ["protocolVersion"],
+					requiredArrayFields: ["objectRegistry", "assetPlans", "blockingPlans", "beats"],
+					allowedFields: ["protocolVersion", "objectRegistry", "assetPlans", "blockingPlans", "beats"],
+				},
+				workflowAgentDeliveryRequirement: "交付整章 BeatSheet",
+				workflowAgentDefinitionId: "writer",
+				workflowAgentModelKey: "deepseek-v4-flash",
+			}),
+			inputs: {
+				"delivery-contract": [{
+					canvasFacts: { authoritativeSources: [{ sourceId: "source:chapter-1", content: "冻结第一章正文" }] },
+					generationContract: {
+						videoModel: "minimax-h3-dmc",
+						durationOptions: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+						maxDurationSeconds: 15,
+						clipPlanningPolicy: "agent_semantic_duration_budget",
+					},
+				}],
+			},
+		}), { runAgent, runJavascript: vi.fn(), runVideo: vi.fn() });
+
+		const authorInstruction = String(runAgent.mock.calls[0]?.[0].instruction ?? "");
+		// 校验器里的嵌套结构要求必须对作者可见，否则同一份计划会在多个窗口间反复补同一个键。
+		expect(authorInstruction).toContain("运行时结构合同清单");
+		expect(authorInstruction).toContain('"referenceAssetBindings"');
+		expect(authorInstruction).toContain('"compositionContract"');
+		expect(authorInstruction).toContain('"sceneLightingSpec"');
+		expect(authorInstruction).toContain('"startState"');
+		expect(authorInstruction).toContain("forbiddenTransfer/scale 是可省略字段");
+		expect(authorInstruction).toContain("referenceAssetIds/referenceImageNodeIds 均为空");
+		// 同一批要求还必须进入机器合同（模型看到的对象结构合同），而不是只留在散文里。
+		const contract = runAgent.mock.calls[0]?.[0].jsonObjectContract as Record<string, unknown>;
+		expect(contract.requiredObjectPaths).toEqual(expect.arrayContaining([
+			"blockingPlans[].backgroundPlan",
+		]));
+		expect(contract.requiredArrayPaths).toEqual(expect.arrayContaining([
+			"blockingPlans[].backgroundPlan.referenceAssetBindings",
+			"beats[].objectStates",
+		]));
+		/*
+		 * sceneCard 的要求不得出现在合同路径里：路径语法只表达"每个条目都成立"的普适要求，
+		 * 而 kind 限定路径（assetPlans[role=scene|environment].sceneCard）会被模型当成字段名
+		 * 原样输出成一个不存在的顶层键，场景计划因此永远落不到 assetPlans 里。逐计划的
+		 * kind 校验由 inspectSceneReferencePlan 承担，并给出具体下标。
+		 */
+		expect(JSON.stringify(contract)).not.toContain("[role=");
+		expect(contract.optionalNonEmptyStringPaths).toEqual(expect.arrayContaining(["objectRegistry[].scale"]));
+	});
+
 	it("freezes an exact BeatSheet count without inventing per-clip durations", async () => {
-		const runAgent = vi.fn(async () => ({
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
 			taskId: "beat-sheet-fixed-count-task",
 			text: JSON.stringify({
 				protocolVersion: "tapcanvas.beat-sheet/v2",
@@ -3175,7 +4671,7 @@ describe("workflow node executor registry", () => {
 			outputRefs: {
 				artifacts: [],
 				evidence: {
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
+					structuredOutputSubmissionPolicy: "repair_with_correction",
 					outputContractFailure: {
 						code: "structured_output_invalid",
 						rawOutputRecorded: true,
@@ -3184,6 +4680,21 @@ describe("workflow node executor registry", () => {
 			},
 		});
 	});
+
+	it("does not accept planned-only receipts for a dependency-ready delivery", async () => {
+      for (const result of [
+        { deliveryVerification: { status: "satisfied", scope: "planned_nodes_only" } },
+        { deliveryVerification: { status: "satisfied" }, deliveryEvidence: { persisted: true, promptPersisted: true,
+          requiredDependencyIds: ["image-1"], dependencies: [] } },
+      ]) {
+        const verdict = await executeRegisteredWorkflowNode(context({
+          node: node("ready-delivery", "agents.delivery.verify/v2", {
+            workflowDeliveryRequiredFacts: ["persisted", "promptPersisted", "dependenciesReady"],
+          }), inputs: { result: [result] },
+        }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+        expect(verdict).toMatchObject({ ok: false, errorMessage: expect.stringContaining("unmet persisted delivery facts") });
+      }
+    });
 
 	it("allows delivery completion only from satisfied agents-cli verification", async () => {
 		const runAgent = vi.fn();
@@ -3204,6 +4715,37 @@ describe("workflow node executor registry", () => {
 
 		expect(satisfied).toMatchObject({ ok: true });
 		expect(unsatisfied).toMatchObject({ ok: false, errorCode: "workflow_node_runtime_failed" });
+	});
+
+	it("accepts text delivery only after the configured flow target is read back", async () => {
+		const targetNodeId = "expanded-source";
+		const nodeConfig = {
+			workflowDeliveryTargetNodeId: targetNodeId,
+			workflowDeliveryRequirement: "扩写正文已写回目标节点",
+		};
+		const accepted = await executeRegisteredWorkflowNode(context({
+			node: node("delivery", "agents.delivery.verify/v2", nodeConfig, "collect", ["delivery-evidence"], undefined, ["result"]),
+			inputs: {
+				result: [{
+					ok: true,
+					updatedAt: "2026-09-02T10:35:00.000Z",
+					patchedNodeSnapshots: [{ id: targetNodeId, data: { kind: "text", content: "完整扩写正文" } }],
+				}],
+			},
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+		const missingReadback = await executeRegisteredWorkflowNode(context({
+			node: node("delivery", "agents.delivery.verify/v2", nodeConfig, "collect", ["delivery-evidence"], undefined, ["result"]),
+			inputs: { result: [{ ok: true, stats: { patchedNodes: 1 }, patchedNodeSnapshots: [] }] },
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+
+		expect(accepted).toMatchObject({
+			ok: true,
+			outputRefs: { evidence: { flowPatchTargetNodeId: targetNodeId, flowPatchContentLength: 6 } },
+		});
+		expect(missingReadback).toMatchObject({
+			ok: false,
+			errorMessage: expect.stringContaining("persisted flow patch receipt"),
+		});
 	});
 
 	it("does not release an Agent node whose local delivery verification is unsatisfied", async () => {
@@ -3708,7 +5250,7 @@ describe("workflow node executor registry", () => {
 		});
 	});
 
-	it("fairly reconciles every persisted waiting item before pausing untouched collection work", async () => {
+	it("fairly reconciles every persisted waiting item and fills unused slots with independent collection work", async () => {
 		const collection = createWorkflowCollection({
 			collectionId: "agent-waiting-frontier",
 			producerNodeId: "split",
@@ -3771,9 +5313,9 @@ describe("workflow node executor registry", () => {
 		expect(result).toMatchObject({
 			ok: false,
 			waitingExternal: true,
-			outputRefs: { evidence: { waitingItems: 2, settledItems: 2, totalItems: 3 } },
+			outputRefs: { evidence: { waitingItems: 3, settledItems: 3, totalItems: 3 } },
 		});
-		expect(resumeAgent).toHaveBeenCalledTimes(2);
+		expect(resumeAgent).toHaveBeenCalledTimes(3);
 		expect(resumeAgent).toHaveBeenCalledWith(expect.objectContaining({
 			nodeId: "agent::item::clip-1",
 			resumeOnly: true,
@@ -3782,12 +5324,12 @@ describe("workflow node executor registry", () => {
 			nodeId: "agent::item::clip-2",
 			resumeOnly: true,
 		}));
-		expect(resumeAgent).not.toHaveBeenCalledWith(expect.objectContaining({
+		expect(resumeAgent).toHaveBeenCalledWith(expect.objectContaining({
 			nodeId: "agent::item::clip-3",
 		}));
 	});
 
-	it("terminalizes a collection immediately when one provider item fails while accepted siblings remain recoverable", async () => {
+	it("keeps accepted siblings owned by the collection while retaining exact failed-item evidence", async () => {
 		const collection = createWorkflowCollection({
 			collectionId: "video-provider-mixed-terminal",
 			producerNodeId: "writer",
@@ -3824,7 +5366,7 @@ describe("workflow node executor registry", () => {
 
 		expect(result).toMatchObject({
 			ok: false,
-			errorMessage: "Workflow node video failed 1/2 item executions: 内容审核未通过：1 个参考素材被拒",
+			waitingExternal: true,
 			outputRefs: {
 				evidence: { failedItems: 1, waitingItems: 1, totalItems: 2 },
 				itemRuns: [
@@ -3847,7 +5389,32 @@ describe("workflow node executor registry", () => {
 		expect(mixedVideoRun).toHaveBeenCalledTimes(2);
 	});
 
-	it("preserves a terminal media failure without re-entering a paid executor", async () => {
+	it("refreshes failed receipts alongside waiting siblings during explicit recovery without new submissions", async () => {
+		const collection = createWorkflowCollection({ collectionId: "recover-mixed", producerNodeId: "writer",
+			producerPortId: "prompts", values: [{ text: "first" }, { text: "second" }], itemIds: ["clip-1", "clip-2"] });
+		const videoNode = node("video", "tapcanvas.video.generate/v1", { workflowVideoModelKey: "video-model",
+			workflowVideoDurationSeconds: 5, workflowVideoResolution: "480p", workflowVideoAspectRatio: "16:9" }, "each", ["video"], 2);
+		const lookup = vi.fn(async (input: { itemIndex: number; resumeOnly?: boolean }) => ({
+			status: "waiting_external" as const, nodeId: `retry-${input.itemIndex}`, taskId: `accepted-${input.itemIndex}`, reused: true,
+		}));
+		const result = await executeRegisteredWorkflowNode({
+			...context({ node: videoNode, inputs: { prompt: [collection] } }), resumeOnly: true, recoveryOfExecutionId: "prior",
+			resumeOutputRefs: { protocolVersion: "1", executorRef: "tapcanvas.video.generate/v1", nodeId: "video",
+				executionMode: "each", ports: {}, artifacts: [], evidence: { failedItems: 1, waitingItems: 1 },
+				itemRuns: ["failed", "waiting_external"].map((status, index) => ({
+					itemId: `clip-${index + 1}`, index, status: status as "failed" | "waiting_external",
+					runtimeNodeId: `video::item::clip-${index + 1}`, lineage: [], ports: {}, artifacts: [],
+					evidence: { taskId: `original-${index}`, canvasNodeId: `original-node-${index}` },
+				})),
+			},
+		}, { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: lookup });
+		expect(lookup).toHaveBeenCalledTimes(2);
+		for (const [input] of lookup.mock.calls) expect(input.resumeOnly).toBe(true);
+		expect(result).toMatchObject({ ok: false, waitingExternal: true,
+			outputRefs: { evidence: { waitingItems: 2, failedItems: 0, totalItems: 2 } } });
+	});
+
+	it.each([false, true])("explicit recovery refreshes a receipt in resume-only mode; ordinary polls retain failures: %s", async (recover) => {
 		const assets = createWorkflowCollection({
 			collectionId: "asset-inputs",
 			producerNodeId: "asset-plan",
@@ -3875,6 +5442,7 @@ describe("workflow node executor registry", () => {
 		const resumed = await executeRegisteredWorkflowNode({
 			...context({ node: imageNode, inputs: { "asset-items": [assets] } }),
 			resumeOnly: true,
+			...(recover ? { recoveryOfExecutionId: "previous-execution" } : {}),
 			resumeOutputRefs: {
 				protocolVersion: "1",
 				executorRef: "tapcanvas.image.generate/v1",
@@ -3910,6 +5478,12 @@ describe("workflow node executor registry", () => {
 			},
 		}, { runAgent: vi.fn(), runJavascript: vi.fn(), runImage, runVideo });
 
+		if (recover) {
+			expect(resumed.ok).toBe(true);
+			expect(runImage).toHaveBeenCalledTimes(1);
+			expect(runImage).toHaveBeenCalledWith(expect.objectContaining({ resumeOnly: true }));
+			return;
+		}
 		expect(resumed.ok).toBe(false);
 		expect(runImage).not.toHaveBeenCalled();
 		if (resumed.ok) throw new Error("Expected the terminal media collection failure to remain terminal");
@@ -3944,15 +5518,53 @@ describe("workflow node executor registry", () => {
 	});
 });
 
-describe("workflow delivery scope and single-submission failure recording", () => {
-	it("writes media nodes to the caller delivery flow instead of the workflow flow", async () => {
+describe("workflow delivery scope and structured-output failure recording", () => {
+	it("preserves the authored image brief and metadata without rebuilding a second prompt", async () => {
+		const runImage = vi.fn(async () => ({
+			status: "success" as const,
+			nodeId: "character-image-output",
+			taskId: "character-image-task",
+			imageUrl: "https://example.com/character.png",
+			assetId: "character-asset",
+			reused: false,
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("character-image", "tapcanvas.image.generate/v1", {
+				workflowImageModelKey: "nano-banana-pro",
+				workflowImageAspectRatio: "1:1",
+				workflowImageSize: "1024x1024",
+				workflowImageReferenceAssetBindings: [],
+			}),
+			inputs: {
+				"asset-items": [{
+					role: "character://hero",
+					displayName: "Hero",
+					prompt: "中年女性面试官的中性四视图身份板，灰色职业装，保留独有衣领与发髻结构",
+					negativePrompt: "不要出现街口和裂隙",
+					referenceType: "character",
+					roleName: "hero",
+					characterAssetRole: "identity_anchor",
+					characterProfileVersion: "character-card/v3",
+					identityAnchors: ["稳定骨相", "固定发型剪影"],
+					prohibitedDrift: ["不得改变脸型"],
+				}],
+			},
+			}), { runAgent: vi.fn(), runJavascript: vi.fn(), runImage, runVideo });
+		if (!result.ok) throw new Error("errorMessage" in result ? result.errorMessage : "Unexpected external wait");
+		expect(runImage).toHaveBeenCalledWith(expect.objectContaining({
+			prompt: "中年女性面试官的中性四视图身份板，灰色职业装，保留独有衣领与发髻结构",
+			negativePrompt: "不要出现街口和裂隙",
+		}));
+	});
+
+	it.each([false, true])("writes media to the caller flow and identifies generated assets when receipt reuse is %s", async (receiptReused) => {
 		const runImage = vi.fn(async () => ({
 			status: "success" as const,
 			nodeId: "workflow-1:asset-image-generate::item::asset-1::output::image",
 			taskId: "task-1",
 			imageUrl: "https://example.com/a.png",
 			assetId: "asset-1",
-			reused: false,
+			reused: receiptReused,
 		}));
 		const result = await executeRegisteredWorkflowNode(context({
 			node: node("image-node", "tapcanvas.image.generate/v1", {
@@ -3974,6 +5586,9 @@ describe("workflow delivery scope and single-submission failure recording", () =
 			runVideo,
 		});
 		expect(result.ok).toBe(true);
+		expect(result).toMatchObject({ outputRefs: { evidence: {
+			assetOrigin: "workflow_generation", taskReceiptReused: receiptReused,
+		} } });
 		expect(runImage).toHaveBeenCalledWith(expect.objectContaining({
 			flowId: "flow-1",
 			projectId: "project-1",
@@ -4047,7 +5662,7 @@ describe("workflow delivery scope and single-submission failure recording", () =
 		expect(runImage).not.toHaveBeenCalled();
 		expect(result).toMatchObject({
 			outputRefs: {
-				evidence: { reused: true, reuseSource: "caller_asset", canvasNodeId: "caller-node-hero" },
+				evidence: { assetOrigin: "existing_asset", reuseSource: "caller_asset", canvasNodeId: "caller-node-hero" },
 				artifacts: [{ type: "tapcanvas.image/v1", identity: "asset-hero", value: "https://caller.tapcanvas.test/hero.png" }],
 			},
 		});
@@ -4059,7 +5674,7 @@ describe("workflow delivery scope and single-submission failure recording", () =
 		});
 	});
 
-	it("resolves an ID-only material-library asset at execution time without requiring a canvas node", async () => {
+	it.each([false, true])("resolves exact existing assets without generating, including explicit adoption=%s", async (adopt) => {
 		const runImage = vi.fn();
 		const resolveProjectAsset = vi.fn(async () => ({
 			assetId: "asset-library-hero",
@@ -4069,6 +5684,7 @@ describe("workflow delivery scope and single-submission failure recording", () =
 			mimeType: "image/png",
 			nodeId: null,
 			flowId: null,
+			styleFingerprint: null,
 		}));
 		const projectContext = {
 			version: 3 as const,
@@ -4101,7 +5717,7 @@ describe("workflow delivery scope and single-submission failure recording", () =
 		};
 		const result = await executeRegisteredWorkflowNode({
 			...context({
-				node: node("image-node", "tapcanvas.image.generate/v1", {
+				node: node("image-node::item::entry", "tapcanvas.image.generate/v1", {
 					workflowImageModelKey: "nano-banana-pro",
 					workflowImageAspectRatio: "16:9",
 					workflowImageSize: "1024x1024",
@@ -4113,12 +5729,13 @@ describe("workflow delivery scope and single-submission failure recording", () =
 						prompt: "正向",
 						negativePrompt: "负向",
 						consumerClipIds: ["clip-a"],
-						existingAssetId: "asset-library-hero",
+						existingAssetId: adopt ? "incorrect-old-reference" : "asset-library-hero",
 						existingProjectId: "caller-project-1",
 					}],
 				},
 			}),
-			flowVersionData: { workflowProjectContext: projectContext },
+			flowVersionData: { workflowProjectContext: projectContext,
+				...(adopt ? { workflowMediaAdoptions: [{ nodeId: "image-node", itemId: "entry", assetId: "asset-library-hero" }] } : {}) },
 		}, {
 			runAgent: vi.fn(),
 			runJavascript: vi.fn(),
@@ -4179,11 +5796,11 @@ describe("workflow delivery scope and single-submission failure recording", () =
 		expect(runImage).not.toHaveBeenCalled();
 	});
 
-	it("fails a typed Agent immediately when the provider rejects its only submission with 429", async () => {
+	it("defers a typed Agent after a provider 429", async () => {
 		const rateLimitError = Object.assign(new Error("provider rejected this request"), {
 			code: "llm_http_429",
 		});
-		const runAgent = vi.fn(async () => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => {
 			throw rateLimitError;
 		});
 		const result = await executeRegisteredWorkflowNode(context({
@@ -4207,30 +5824,148 @@ describe("workflow delivery scope and single-submission failure recording", () =
 
 		expect(result).toMatchObject({
 			ok: false,
-			errorCode: "workflow_node_runtime_failed",
-			errorMessage: expect.stringContaining("before its single structured submission: llm_http_429"),
+			waitingExternal: true,
 			outputRefs: {
 				evidence: {
 					executorCompleted: false,
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
-					requestTerminal: { terminal: true, status: "failed", reason: "llm_http_429" },
-					agentExecutionFailure: {
-						code: "llm_http_429",
-						phase: "before_structured_submission",
-						retryable: false,
+					deliveryEvidence: {
+						retryablePhysicalFailure: true,
+						physicalFailureReason: "llm_http_429",
+						physicalRetryOrdinal: 1,
+						rateLimitDeferralCount: 1,
 					},
 				},
 			},
 		});
-		expect("waitingExternal" in result).toBe(false);
 		expect(runAgent).toHaveBeenCalledTimes(1);
 		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
-			allowedTools: [],
+			allowedTools: [
+				"skill_search",
+				"skill_candidates_page",
+				"retrieval_rank",
+				"Skill",
+				"knowledge_search",
+				"knowledge_candidates_page",
+        "tapcanvas_execution_node_runs_get",
+				"knowledge_read",
+				"prompt_example_search",
+				"prompt_example_read",
+			],
 		}));
-		expect(runAgent.mock.calls[0]?.[0]).not.toHaveProperty("promptExampleRetrievalScope");
+		expect(runAgent.mock.calls[0]?.[0]).toMatchObject({
+			promptExampleRetrievalScope: {
+				version: 3,
+				mediaType: "video",
+				searchPolicy: "required_non_blocking",
+			},
+		});
 	});
 
-	it("keeps a typed terminal 429 failed instead of converting it into backpressure", async () => {
+	it("defers a typed Agent when the bridge returns a terminal pre-submission 429", async () => {
+		const runAgent = vi.fn(async () => ({
+			taskId: "typed-terminal-rate-limit",
+			text: "",
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: {
+				version: 1,
+				source: "agents_cli_durable_turn_status",
+				state: "failed",
+			},
+			deliveryVerification: null,
+			requestTerminal: { status: "failed", reason: "llm_http_429" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("agent-terminal-rate-limit", "agents.logical-task/v2", {
+				workflowInstruction: "输出一个完整 clip",
+				workflowAgentOutputArtifactType: "tapcanvas.clip-plan/v1",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: {
+					requiredArrayFields: ["clips"],
+					expectedArrayLengths: { clips: 1 },
+					allowedFields: ["clips"],
+				},
+				workflowAgentDeliveryRequirement: "交付一个完整 clip",
+				workflowAgentDefinitionId: "writer",
+				workflowAgentModelKey: "gpt-5.6-sol",
+			}),
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result).toMatchObject({
+			ok: false,
+			waitingExternal: true,
+			outputRefs: {
+				evidence: {
+					executorCompleted: false,
+					deliveryEvidence: {
+						retryablePhysicalFailure: true,
+						physicalFailureReason: "llm_http_429",
+						physicalRetryOrdinal: 1,
+						rateLimitDeferralCount: 1,
+					},
+				},
+			},
+		});
+		expect(runAgent).toHaveBeenCalledTimes(1);
+	});
+
+	it("reopens the same typed item for a rate-limit retry", async () => {
+		const runAgent = vi.fn(async (request: { resumeOnly: boolean }) => ({
+			taskId: "typed-rate-limit-recovered",
+			text: '{"clips":[{"clipIndex":0}]}',
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: { resumed: request.resumeOnly },
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded", reason: "done" },
+		}));
+		const result = await executeRegisteredWorkflowNode({
+			...context({
+				node: node("agent-rate-limit-retry", "agents.logical-task/v2", {
+					workflowInstruction: "输出一个完整 clip",
+					workflowAgentOutputArtifactType: "tapcanvas.clip-plan/v1",
+					workflowAgentOutputEncoding: "json_object",
+					workflowAgentJsonObjectContract: {
+						requiredArrayFields: ["clips"],
+						expectedArrayLengths: { clips: 1 },
+						allowedFields: ["clips"],
+					},
+					workflowAgentDeliveryRequirement: "交付一个完整 clip",
+					workflowAgentDefinitionId: "writer",
+					workflowAgentModelKey: "gpt-5.6-sol",
+				}),
+			}),
+			resumeOnly: true,
+			resumeOutputRefs: {
+				protocolVersion: "1",
+				executorRef: "agents.logical-task/v2",
+				nodeId: "agent-rate-limit-retry",
+				executionMode: "once",
+				ports: {},
+				artifacts: [],
+				itemRuns: [],
+				evidence: {
+					executorCompleted: false,
+					deliveryEvidence: {
+						retryablePhysicalFailure: true,
+						physicalFailureReason: "llm_http_429",
+						physicalRetryOrdinal: 1,
+						rateLimitDeferralCount: 1,
+						retryNotBeforeAt: new Date(Date.now() - 1).toISOString(),
+					},
+				},
+			},
+		}, { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result.ok).toBe(true);
+		expect(runAgent).toHaveBeenCalledTimes(1);
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			resumeOnly: true,
+			previousEvidence: expect.objectContaining({ executorCompleted: false }),
+		}));
+	});
+
+	it("retains typed rate-limited work after three deferrals", async () => {
 		const runAgent = vi.fn(async () => ({
 			taskId: "workflow:execution-1:agent-1",
 			text: "",
@@ -4239,7 +5974,9 @@ describe("workflow delivery scope and single-submission failure recording", () =
 			deliveryEvidence: {
 				version: 1,
 				source: "agents_cli_durable_turn_status",
-				physicalRetryOrdinal: 2,
+				physicalFailureReason: "llm_http_429",
+				physicalRetryOrdinal: 3,
+				rateLimitDeferralCount: 3,
 			},
 			deliveryVerification: null,
 			requestTerminal: { status: "failed", reason: "llm_http_429" },
@@ -4260,30 +5997,79 @@ describe("workflow delivery scope and single-submission failure recording", () =
 			inputs: { "clip-contexts": [frozenSingleClipContext()] },
 		}), { runAgent, runJavascript: vi.fn(), runVideo });
 
-		expect(result).toMatchObject({
-			ok: false,
-			errorCode: "workflow_node_runtime_failed",
-			errorMessage: expect.stringContaining("before its single structured submission: llm_http_429"),
-			outputRefs: {
-				evidence: {
-					requestTerminal: { terminal: true, status: "failed", reason: "llm_http_429" },
-					agentExecutionFailure: {
-						code: "llm_http_429",
-						phase: "before_structured_submission",
-						retryable: false,
-					},
-				},
-			},
-		});
-		expect("waitingExternal" in result).toBe(false);
+		expect(result).toMatchObject({ ok: false, waitingExternal: true, outputRefs: { evidence: {
+			deliveryEvidence: { physicalFailureReason: "llm_http_429", rateLimitDeferralCount: 4 },
+		} } });
 		expect(runAgent).toHaveBeenCalledTimes(1);
-		if (result.ok || !result.outputRefs) throw new Error("Expected typed terminal failure evidence");
-		expect(result.outputRefs.evidence).not.toHaveProperty("outputContractFailure");
-		expect(result.outputRefs.evidence).not.toHaveProperty("deliveryEvidence");
+		expect(runVideo).not.toHaveBeenCalled();
 	});
 
-	it("closes a legacy typed physical-retry checkpoint without reopening the model", async () => {
-		const runAgent = vi.fn();
+	it("reopens the same typed submission window after a runtime restart when no candidate was recorded", async () => {
+		const runAgent = vi.fn(async (request: { resumeOnly: boolean }) => ({
+			taskId: "typed-runtime-restart-recovered",
+			text: '{"clips":[{"clipIndex":0}]}',
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: { resumed: request.resumeOnly },
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded", reason: "done" },
+		}));
+		const result = await executeRegisteredWorkflowNode({
+			...context({
+				node: node("agent-typed-runtime-restart", "agents.logical-task/v2", {
+					workflowInstruction: "输出一个完整 clip",
+					workflowAgentOutputArtifactType: "tapcanvas.clip-plan/v1",
+					workflowAgentOutputEncoding: "json_object",
+					workflowAgentJsonObjectContract: {
+						requiredArrayFields: ["clips"],
+						expectedArrayLengths: { clips: 1 },
+						allowedFields: ["clips"],
+					},
+					workflowAgentDeliveryRequirement: "交付一个完整 clip",
+					workflowAgentDefinitionId: "writer",
+					workflowAgentModelKey: "deepseek-v4-flash",
+				}),
+			}),
+			resumeOnly: true,
+			resumeOutputRefs: {
+				protocolVersion: "1",
+				executorRef: "agents.logical-task/v2",
+				nodeId: "agent-typed-runtime-restart",
+				executionMode: "once",
+				ports: {},
+				artifacts: [],
+				itemRuns: [],
+				evidence: {
+					executorCompleted: false,
+					requestTerminal: {
+						version: 1,
+						terminal: false,
+						status: "suspended",
+						reason: "workflow_runtime_restarted",
+					},
+					continuationReason: "workflow_runtime_restarted",
+				},
+			},
+		}, { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result.ok).toBe(true);
+		expect(runAgent).toHaveBeenCalledTimes(1);
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			resumeOnly: true,
+			previousEvidence: expect.objectContaining({ continuationReason: "workflow_runtime_restarted" }),
+		}));
+	});
+
+	it.each([{}, { deliveryEvidence: { retryablePhysicalFailure: true, physicalFailureReason: "provider_stream_interrupted", physicalRetryOrdinal: 4 } }])("continues a typed logical task from checkpoint %j", async (previousEvidence) => {
+		const runAgent = vi.fn(async () => ({
+            taskId: "typed-checkpoint-recovered",
+            text: '{"clips":[{"clipIndex":0}]}',
+            assets: [],
+            expectedDelivery: { active: true },
+            deliveryEvidence: { resumed: true },
+            deliveryVerification: { status: "satisfied" },
+            requestTerminal: { status: "succeeded", reason: "done" },
+        }));
 		const result = await executeRegisteredWorkflowNode({
 			...context({
 				node: node("agent-typed-resume", "agents.logical-task/v2", {
@@ -4309,42 +6095,21 @@ describe("workflow delivery scope and single-submission failure recording", () =
 				ports: {},
 				artifacts: [],
 				itemRuns: [],
-				evidence: {
-					deliveryEvidence: {
-						retryablePhysicalFailure: true,
-						physicalFailureReason: "provider_stream_interrupted",
-						physicalRetryOrdinal: 4,
-					},
-				},
+				evidence: previousEvidence,
 			},
 		}, { runAgent, runJavascript: vi.fn(), runVideo });
 
-		expect(result).toMatchObject({
-			ok: false,
-			errorCode: "workflow_node_runtime_failed",
-			errorMessage: expect.stringContaining("cannot reopen a typed submission window"),
-			outputRefs: {
-				evidence: {
-					requestTerminal: {
-						terminal: true,
-						status: "failed",
-						reason: "structured_submission_window_closed",
-					},
-					agentExecutionFailure: {
-						code: "structured_submission_window_closed",
-						retryable: false,
-					},
-				},
-			},
-		});
-		expect("waitingExternal" in result).toBe(false);
-		expect(runAgent).not.toHaveBeenCalled();
-	});
+        expect(result.ok).toBe(true);
+        expect(runAgent).toHaveBeenCalledTimes(1);
+        expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+            previousEvidence,
+        }));
+    });
 
-	it("fails a recorded typed candidate immediately even when the Agent terminal claims suspension", async () => {
+	it.each(['{"clips":[]}', "任务仍在处理中，系统会自动继续，无需重复提交。"])("keeps a typed Agent physical window resumable before parsing %s", async (text) => {
 		const runAgent = vi.fn(async () => ({
 			taskId: "typed-candidate-suspended-1",
-			text: '{"clips":[]}',
+			text,
 			assets: [],
 			expectedDelivery: { active: true },
 			deliveryEvidence: {
@@ -4373,29 +6138,86 @@ describe("workflow delivery scope and single-submission failure recording", () =
 
 		expect(result).toMatchObject({
 			ok: false,
-			errorCode: "workflow_node_runtime_failed",
-			errorMessage: expect.stringContaining("violated its json_object output contract"),
 			outputRefs: {
 				evidence: {
 					executorCompleted: false,
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
+					structuredOutputSubmissionPolicy: "repair_with_correction",
 					requestTerminal: {
-						terminal: true,
-						status: "failed",
-						reason: "structured_output_invalid",
+						status: "suspended",
+						reason: "root_execution_budget_exhausted",
 					},
-					outputContractFailure: {
-						code: "structured_output_invalid",
-						rawOutputRecorded: true,
+					continuationReason: "root_execution_budget_exhausted",
+				},
+			},
+		});
+		expect("waitingExternal" in result).toBe(true);
+		if (!result.ok && result.outputRefs) {
+			expect(result.outputRefs.evidence).not.toHaveProperty("outputContractFailure");
+		}
+		expect(runAgent).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves a suspended provider rejection receipt for the next fenced recovery", async () => {
+		const providerReceipt = {
+			protocolVersion: "provider-response-rejection/v1",
+			reasonCode: "provider_response_rejected",
+			terminalState: "failed",
+			providerCode: "data_inspection_failed",
+			providerErrorType: null,
+			providerReason: "Output data may contain inappropriate content.",
+			partialTextChars: 4229,
+			partialToolCallCount: 0,
+			responseId: null,
+			recoveryMode: "agent_replan",
+			responseScope: "current_provider_response_only",
+			acceptedSideEffect: false,
+		};
+		const runAgent = vi.fn(async () => ({
+			taskId: "typed-provider-rejection-1",
+			text: "供应商拒绝提示不应被当作产物",
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: {
+				state: "suspended",
+				physicalFailureReason: "workflow_agent_provider_replan_required",
+			},
+			deliveryVerification: null,
+			structuredOutputFailure: {
+				protocolVersion: "structured-output-execution-failure/v1",
+				reasonCode: "provider_response_rejected",
+				recoveryMode: "agent_replan",
+				providerFailure: providerReceipt,
+			},
+			requestTerminal: { status: "suspended", reason: "provider_response_rejected" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("agent-provider-rejection", "agents.logical-task/v2", {
+				workflowInstruction: "输出一个完整 clip",
+				workflowAgentOutputArtifactType: "tapcanvas.clip-plan/v1",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: {
+					requiredArrayFields: ["clips"],
+					expectedArrayLengths: { clips: 1 },
+					allowedFields: ["clips"],
+				},
+				workflowAgentDeliveryRequirement: "交付一个完整 clip",
+				workflowAgentDefinitionId: "writer",
+				workflowAgentModelKey: "deepseek-v4-flash",
+			}),
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result).toMatchObject({
+			ok: false,
+			outputRefs: {
+				evidence: {
+					requestTerminal: { status: "suspended", reason: "provider_response_rejected" },
+					structuredOutputFailure: {
+						providerFailure: providerReceipt,
 					},
 				},
 			},
 		});
-		expect("waitingExternal" in result).toBe(false);
-		if (!result.ok && result.outputRefs) {
-			expect(result.outputRefs.evidence).not.toHaveProperty("deliveryEvidence");
-			expect(result.outputRefs.evidence).not.toHaveProperty("continuationReason");
-		}
+		expect("waitingExternal" in result).toBe(true);
 		expect(runAgent).toHaveBeenCalledTimes(1);
 	});
 
@@ -4478,7 +6300,7 @@ describe("workflow delivery scope and single-submission failure recording", () =
 			ok: false,
 			outputRefs: {
 				evidence: {
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
+					structuredOutputSubmissionPolicy: "repair_with_correction",
 					outputContractFailure: {
 						code: "structured_output_invalid",
 						message: expect.stringContaining("role must use kind://canonical-name"),
@@ -4589,7 +6411,7 @@ describe("workflow delivery scope and single-submission failure recording", () =
 			ok: false,
 			outputRefs: {
 				evidence: {
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
+					structuredOutputSubmissionPolicy: "repair_with_correction",
 					outputContractFailure: {
 						code: "structured_output_invalid",
 						message: expect.stringContaining(
@@ -4603,8 +6425,10 @@ describe("workflow delivery scope and single-submission failure recording", () =
 		expect(runAgent).toHaveBeenCalledTimes(1);
 	});
 
-	it("freezes visible ready workflow images into asset-plan reuse identities", async () => {
+	it("freezes explicitly selected ready workflow images into asset-plan reuse identities", async () => {
 		const runAgent = vi.fn();
+		const existingNodeId = "video-workflow:asset-image-generate::item::hero::output::image";
+		const existingAssetId = `project-node:project:project-1:${existingNodeId}`;
 		const base = context({
 			node: node("asset-planner", "agents.logical-task/v2", {
 				workflowInstruction: "输出资产计划",
@@ -4621,15 +6445,108 @@ describe("workflow delivery scope and single-submission failure recording", () =
 				workflowAgentModelKey: "deepseek-v4-flash",
 			}),
 			inputs: {
-				"beat-sheet": [frozenAssetBeatSheet("clip-a", [
-					{ kind: "character", name: "hero", referenceRole: "identity" },
-				])],
+				"beat-sheet": [{ text: JSON.stringify({ beats: [{ clipId: "clip-a", clipIndex: 0,
+					assetObjectContracts: [{ ...frozenWriterObjectContract({ kind: "character", name: "hero", referenceRole: "identity" }),
+						referenceImageNodeIds: [existingNodeId] }],
+				}] }) }],
 			},
 		});
+		const result = await executeRegisteredWorkflowNode({
+			...base,
+			flowVersionData: {
+				workflowProjectContext: {
+					version: 3,
+					projectId: "project-1",
+					canvasId: "flow-1",
+					sourceNodeId: null,
+					selectedAssetIds: [existingAssetId],
+					projectAssetIds: [existingAssetId],
+					timeline: { clips: [] },
+					selection: { nodeIds: [], assetIds: [existingAssetId], activeNodeId: null, groupId: null },
+					permissions: { principalId: "user-1", projectRead: true, canvasRead: true, assetRead: true, assetWrite: true },
+					assetSnapshot: [{
+						assetId: existingAssetId,
+						assetVersion: 1,
+						assetVersionId: "asset-version-1",
+						projectId: "project-1",
+						name: "Hero",
+						canonicalName: "hero",
+						kind: "image",
+						referenceType: "character",
+						approvalStatus: "approved",
+						origin: "project_node",
+						flowId: "flow-1",
+						nodeId: existingNodeId,
+						mediaKind: "image",
+						state: "ready",
+						productionEligible: true,
+						sourceFacts: { referenceType: "character", roleName: "Hero", physicalIdentityKey: "hero", mediaIdentityKey: "image-urls:sha256:asset-hero", characterAssetRole: null, characterProfileVersion: null, identityAnchors: [], prohibitedDrift: [], sourceNodeId: existingNodeId, workflowExecutionId: null, taskId: null, prompt: "Hero reference" },
+						updatedAt: "2026-08-18T00:00:00.000Z",
+					}],
+					capturedAt: "2026-08-18T00:00:00.000Z",
+				},
+			},
+		}, { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(runAgent).not.toHaveBeenCalled();
+		expect(result).toMatchObject({
+			ok: true,
+			outputRefs: {
+				ports: {
+					result: {
+						text: "[]",
+						requestTerminal: {
+							status: "succeeded",
+							reason: "all_frozen_asset_references_reused",
+						},
+					},
+				},
+			},
+		});
+	});
+
+	it("exposes unselected images to the asset Agent without imposing an automatic reuse decision", async () => {
+		const runAgent = vi.fn(async () => ({
+			taskId: "asset-plan-fresh-run",
+			text: JSON.stringify([{
+				assetId: "hero-new",
+				role: "character://hero",
+				prompt: "生成新的角色参考图",
+				negativePrompt: "身份漂移",
+				consumerClipIds: ["clip-a"],
+				referenceType: "character",
+				roleName: "hero",
+				characterAssetRole: "identity_anchor",
+				characterProfileVersion: "character-card/v3",
+				identityAnchors: ["hero identity"],
+				prohibitedDrift: ["不得改变身份"],
+			}]),
+			assets: [],
+			expectedDelivery: { version: 1 },
+			deliveryEvidence: { version: 1 },
+			deliveryVerification: { version: 2, status: "satisfied" },
+			requestTerminal: { version: 1, terminal: true, status: "succeeded", reason: "delivery_verification_satisfied" },
+		}));
 		const existingNodeId = "video-workflow:asset-image-generate::item::hero::output::image";
 		const existingAssetId = `project-node:project:project-1:${existingNodeId}`;
 		const result = await executeRegisteredWorkflowNode({
-			...base,
+			...context({
+				node: node("asset-planner", "agents.logical-task/v2", {
+					workflowInstruction: "输出资产计划",
+					workflowAgentOutputArtifactType: "tapcanvas.asset-plans/v1",
+					workflowAgentOutputEncoding: "json_array",
+					workflowAgentJsonArrayContract: {
+						itemRequiredStringFields: ["assetId", "role", "prompt", "negativePrompt"],
+						itemRequiredNonEmptyArrayFields: ["consumerClipIds"],
+						itemAllowedFields: ["assetId", "role", "prompt", "negativePrompt", "consumerClipIds", "existingAssetId", "existingNodeId", "referenceType", "roleName", "characterAssetRole", "characterProfileVersion", "identityAnchors", "prohibitedDrift"],
+					},
+					workflowAgentDeliveryRequirement: "交付资产计划",
+					workflowAgentDefinitionId: "writer",
+					workflowAgentModelKey: "deepseek-v4-flash",
+				}),
+				inputs: { "beat-sheet": [frozenAssetBeatSheet("clip-a", [
+					{ kind: "character", name: "hero", referenceRole: "identity" },
+				]) ] },
+			}),
 			flowVersionData: {
 				workflowProjectContext: {
 					version: 3,
@@ -4657,27 +6574,92 @@ describe("workflow delivery scope and single-submission failure recording", () =
 						mediaKind: "image",
 						state: "ready",
 						productionEligible: true,
+						sourceFacts: { referenceType: "character", roleName: "hero", physicalIdentityKey: "hero", mediaIdentityKey: "image-urls:sha256:hero", characterAssetRole: null, characterProfileVersion: null, identityAnchors: [], prohibitedDrift: [], sourceNodeId: existingNodeId, workflowExecutionId: null, taskId: null, prompt: "Hero reference" },
 						updatedAt: "2026-08-18T00:00:00.000Z",
 					}],
 					capturedAt: "2026-08-18T00:00:00.000Z",
 				},
 			},
 		}, { runAgent, runJavascript: vi.fn(), runVideo });
-		expect(runAgent).not.toHaveBeenCalled();
+
+		expect(result.ok).toBe(true);
+		expect(runAgent).toHaveBeenCalledTimes(1);
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			instruction: expect.stringContaining(existingAssetId),
+		}));
 		expect(result).toMatchObject({
-			ok: true,
-			outputRefs: {
-				ports: {
-					result: {
-						text: "[]",
-						requestTerminal: {
-							status: "succeeded",
-							reason: "all_frozen_asset_references_reused",
-						},
-					},
-				},
-			},
+			outputRefs: { ports: { result: { text: expect.stringContaining("hero-new") } } },
 		});
+	});
+
+	it.each([
+		["nodes", true], ["assets", true], ["mixed", true],
+		["nodes", false], ["assets", false], ["mixed", false],
+	] as const)("resolves all original views through %s references with explicit selection=%s without replacement images", async (referenceMode, explicitlySelected) => {
+		const ids = ["a", "b", "c", "d"];
+		const base = selectedAssetProjectContext(ids);
+		const projectContext = { ...base, selectedAssetIds: explicitlySelected ? ids : [], canvasId: "flow-1", assetSnapshot: base.assetSnapshot.map((asset) => ({
+			...asset, flowId: "flow-1", nodeId: `node-${asset.assetId}`,
+		})) };
+		const beatSheet = { text: JSON.stringify({ assetPlans: [], beats: [["a", "b"], ["b", "c", "d"]].map((selected, clipIndex) => ({
+			clipId: `clip-${clipIndex}`, clipIndex,
+			assetObjectContracts: [{ ...frozenWriterObjectContract({ kind: "scene", name: "产品", referenceRole: "environment" }),
+				kind: "prop", referenceRole: "identity",
+				referenceImageNodeIds: referenceMode === "assets" ? [] : selected.map((id) => `node-${id}`),
+				referenceAssetIds: referenceMode === "nodes" ? [] : selected }],
+		})) }) };
+		const runImage = vi.fn();
+		const resolveProjectAsset = vi.fn(async (request: { assetId: string }) => ({
+			assetId: request.assetId, projectId: "project-1", nodeId: `node-${request.assetId}`,
+			url: `https://assets.example/${request.assetId}.png`, mimeType: "image/png", mediaKind: "image" as const,
+			flowId: "flow-1", styleFingerprint: null,
+		}));
+		const deps = { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo, runImage, resolveProjectAsset };
+		const projected = await executeRegisteredWorkflowNode(context({
+			node: node("project", "video.asset-plans.project/v1"), inputs: { "beat-sheet": [beatSheet] },
+			flowVersionData: { workflowProjectContext: projectContext },
+		}), deps);
+		expect(projected.ok).toBe(true);
+		if (!projected.ok) throw new Error(JSON.stringify(projected));
+		const split = await executeRegisteredWorkflowNode(context({
+			node: node("split", "video.asset-plans.split/v1"),
+			inputs: { "beat-sheet": [beatSheet], "asset-plans": [projected.outputRefs.ports["asset-plans"]] },
+			flowVersionData: { workflowProjectContext: projectContext },
+		}), deps);
+		expect(split.ok).toBe(true);
+		if (!split.ok) throw new Error(JSON.stringify(split));
+		const collection = split.outputRefs.ports["asset-items"];
+		if (!isWorkflowCollection(collection)) throw new Error("missing collection");
+		expect(collection.items.map((item) => item.itemId)).toEqual(ids.map(id => assetBindingIdentity(id, "prop://产品")));
+		expect(collection.items.map((item) => (item.value as { consumerClipIds: string[] }).consumerClipIds))
+			.toEqual([["clip-0"], ["clip-0", "clip-1"], ["clip-1"], ["clip-1"]]);
+		const materialized: unknown[] = [];
+		for (const item of collection.items) {
+			const result = await executeRegisteredWorkflowNode(context({
+				node: node(`resolve-${item.itemId}`, "tapcanvas.image.generate/v1", {
+					workflowImageModelKey: "gpt-image-2", workflowImageAspectRatio: "16:9", workflowImageSize: "2K", workflowImageReferenceAssetBindings: [],
+				}), inputs: { "asset-items": [item.value] }, flowVersionData: { workflowProjectContext: projectContext },
+			}), deps);
+			expect(result).toMatchObject({ ok: true, outputRefs: { evidence: { assetOrigin: "existing_asset", assetId: (item.value as { assetId: string }).assetId } } });
+			if (!result.ok) throw new Error(JSON.stringify(result));
+			materialized.push(result.outputRefs.ports.image);
+		}
+		expect(resolveProjectAsset.mock.calls.map(([request]) => request.assetId)).toEqual(ids);
+		expect(runImage).not.toHaveBeenCalled();
+		const carried = await executeRegisteredWorkflowNode(context({
+			node: node("carry", "video.asset-plans.split/v1"),
+			inputs: { "beat-sheet": [beatSheet], "asset-plans": [{ text: "[]" }],
+				"asset-bindings": [createWorkflowCollection({ collectionId: "prior", producerNodeId: "resolved", producerPortId: "image",
+					itemIds: ids, values: materialized })] },
+			flowVersionData: { workflowProjectContext: projectContext },
+		}), deps);
+		expect(carried.ok).toBe(true);
+		if (!carried.ok) throw new Error(JSON.stringify(carried));
+		const carriedCollection = carried.outputRefs.ports["asset-items"];
+		if (!isWorkflowCollection(carriedCollection)) throw new Error("missing carry collection");
+		expect(carriedCollection.items.map((item) => item.itemId)).toEqual(ids.map(id => assetBindingIdentity(id, "prop://产品")));
+		expect(carriedCollection.items.map((item) => (item.value as { consumerClipIds: string[] }).consumerClipIds))
+			.toEqual([["clip-0"], ["clip-0", "clip-1"], ["clip-1"], ["clip-1"]]);
 	});
 
 	it("reuses an exact BeatSheet reference asset when its display name differs from the physical identity key", async () => {
@@ -4749,6 +6731,7 @@ describe("workflow delivery scope and single-submission failure recording", () =
 						mediaKind: "image",
 						state: "ready",
 						productionEligible: true,
+						sourceFacts: { referenceType: null, roleName: "刘秀", physicalIdentityKey: null, mediaIdentityKey: "image-urls:sha256:liu-xiu", characterAssetRole: null, characterProfileVersion: null, identityAnchors: [], prohibitedDrift: [], sourceNodeId: existingNodeId, workflowExecutionId: null, taskId: null, prompt: null },
 						updatedAt: "2026-08-28T00:00:00.000Z",
 					}],
 					capturedAt: "2026-08-28T00:00:00.000Z",
@@ -5028,7 +7011,7 @@ describe("workflow delivery scope and single-submission failure recording", () =
 		expect(result.ok).toBe(true);
 	});
 
-	it("persists the exact deterministic Clip writer clock failure without reopening the model", async () => {
+	it("keeps a deterministic Clip writer clock failure repairable in the same Agent chain", async () => {
 		const frozenContext = frozenSingleClipContext({ durationSeconds: 26 });
 		const runAgent = vi.fn(async () => ({
 			taskId: "agent-task-boundary-failure",
@@ -5079,26 +7062,303 @@ describe("workflow delivery scope and single-submission failure recording", () =
 		expect(runAgent).toHaveBeenCalledTimes(1);
 		expect(result).toMatchObject({
 			ok: false,
-			errorCode: "workflow_node_runtime_failed",
-			errorMessage: expect.stringContaining(
-				"clipWriter.clips[0].shots[2].depictedStoryEventIndices declares storyEvent 1 outside the shot clock interval",
-			),
+			waitingExternal: true,
 			outputRefs: {
 				evidence: {
-					structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
-					requestTerminal: {
-						terminal: true,
-						status: "failed",
-						reason: "structured_output_invalid",
-					},
+					structuredOutputSubmissionPolicy: "repair_with_correction",
+					continuationReason: "structured_output_repair_required",
 					outputContractFailure: {
 						code: "structured_output_invalid",
 						rawOutputRecorded: true,
-						message: "clipWriter.clips[0].shots[2].depictedStoryEventIndices declares storyEvent 1 outside the shot clock interval",
+						message: "clipWriter.clips[0].shots[2].depictedStoryEventIndices declares storyEvent 1 outside the shot clock interval (shot=[16,20), storyEvent=[9,16))",
 					},
 				},
 			},
 		});
+	});
+});
+
+describe("single-submission Workflow Agent terminal projection", () => {
+	const agentData = {
+		workflowInstruction: "输出结构化条目",
+		workflowAgentOutputArtifactType: "tapcanvas.test-items/v1",
+		workflowAgentOutputEncoding: "json_object",
+		workflowAgentJsonObjectContract: { requiredArrayFields: ["items"], allowedFields: ["items"] },
+		workflowAgentDeliveryRequirement: "交付条目",
+		workflowAgentDefinitionId: "writer",
+		workflowAgentModelKey: "deepseek-v4.1-flash",
+		workflowAgentFailurePolicy: "single_submission",
+	};
+	const agentResult = (text: string, status: "succeeded" | "failed") => ({
+		taskId: "single-turn", text, assets: [], expectedDelivery: { active: true },
+		deliveryEvidence: { providerAttempt: 1 }, deliveryVerification: null,
+		requestTerminal: { status, reason: status === "failed" ? "provider_stream_interrupted" : "done" },
+	});
+	it.each(["succeeded", "failed"] as const)("retains a %s invalid candidate for same-task repair", async (status) => {
+		const candidate = '{"items":42}';
+		const asset = { assetId: "accepted-image", type: "image" as const, url: "https://assets.example.com/accepted.png" };
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("agent-fail-fast-structure", "agents.logical-task/v2", agentData),
+		}), { runAgent: vi.fn(async () => ({ ...agentResult(candidate, status), assets: [asset] })),
+			runJavascript: vi.fn(), runVideo });
+		expect(result).toMatchObject({ ok: false, waitingExternal: true,
+			outputRefs: { ports: {}, artifacts: [{ type: "tapcanvas.image/v1", identity: asset.assetId, value: asset.url }],
+				evidence: { structuredOutputSubmissionPolicy: "single_submission_record_and_fail", executorCompleted: false,
+				outputContractFailure: { code: "structured_output_invalid", rawOutputRecorded: true },
+				requestTerminal: { status: "suspended", reason: "structured_output_repair_required" },
+				outputRepair: { version: 1, sourceTurnId: "single-turn", candidate, error: expect.stringContaining("items") } } } });
+	});
+	it("repairs after a physical successor checkpoint while retaining assets, input and model", async () => {
+		const candidate = '{"items":42}';
+		const corrected = '{"items":["author correction"]}';
+		const asset = { assetId: "accepted-image", type: "image" as const, url: "https://assets.example.com/accepted.png" };
+		const calls: WorkflowAgentRunRequest[] = [];
+		const checkpoints: WorkflowNodeOutputV1[] = [];
+		const runAgent = vi.fn(async (request: WorkflowAgentRunRequest) => {
+			calls.push(request);
+			if (calls.length === 1) return { ...agentResult(candidate, "succeeded"), assets: [asset] };
+			if (calls.length === 2) return { ...agentResult("", "succeeded"),
+				deliveryEvidence: { providerAttempt: 1, retryablePhysicalFailure: true,
+					physicalFailureReason: "structured_output_invalid", physicalRetryOrdinal: 1 },
+				requestTerminal: { status: "suspended", reason: "workflow_agent_physical_retry_pending" } };
+			return { ...agentResult(corrected, "succeeded"), taskId: "corrected-turn", assets: [asset] };
+		});
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("author-repair", "agents.logical-task/v2", agentData),
+			inputs: { source: ["frozen user source"] },
+			checkpointOutputRefs: async (refs) => { checkpoints.push(refs); },
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(result.ok, JSON.stringify(result)).toBe(true);
+		expect(calls).toHaveLength(3);
+		expect(checkpoints).toHaveLength(2);
+		for (const checkpoint of checkpoints) expect(checkpoint.artifacts).toContainEqual({
+			type: "tapcanvas.image/v1", identity: asset.assetId, value: asset.url,
+		});
+		for (const request of calls) expect(request).toMatchObject({ modelKey: agentData.workflowAgentModelKey,
+			failurePolicy: "single_submission", executionFamilyId: calls[0]?.executionFamilyId,
+			inputs: { source: ["frozen user source"] } });
+		for (const request of calls.slice(1)) expect(request.previousEvidence?.outputRepair).toMatchObject({
+			candidate, error: expect.stringContaining("items"), sourceTurnId: "single-turn",
+		});
+		expect(result.outputRefs?.artifacts.filter((entry) => entry.identity === asset.assetId)).toHaveLength(1);
+		expect(result.outputRefs?.evidence).toMatchObject({ immediateOutputRepair: { outcome: "accepted" },
+			requestTerminal: { status: "succeeded" } });
+	});
+	it("records an empty provider result as a failed node without a retry wait", async () => {
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("agent-fail-fast-provider", "agents.logical-task/v2", agentData),
+		}), { runAgent: vi.fn(async () => agentResult("", "failed")),
+			runJavascript: vi.fn(), runVideo });
+		expect(result).toMatchObject({ ok: false, errorCode: "workflow_node_runtime_failed",
+			outputRefs: { evidence: { structuredOutputSubmissionPolicy: "single_submission_record_and_fail",
+				agentExecutionFailure: { code: "provider_stream_interrupted", retryable: false } } } });
+		expect(result).not.toHaveProperty("waitingExternal", true);
+	});
+});
+
+describe("accepted Workflow author candidate revalidation", () => {
+	const nodeId = "author-recovery";
+	const sourceExecutionId = "source-execution";
+	const taskId = `workflow:${sourceExecutionId}:${nodeId}`;
+	const data = {
+		workflowInstruction: "提交结构化条目", workflowAgentOutputArtifactType: "tapcanvas.test-items/v1",
+		workflowAgentOutputEncoding: "json_object", workflowAgentJsonObjectContract: {
+			requiredArrayFields: ["items"], allowedFields: ["items"],
+		}, workflowAgentDeliveryRequirement: "交付条目", workflowAgentDefinitionId: "writer",
+		workflowAgentModelKey: "test-model", workflowAgentFailurePolicy: "single_submission",
+	};
+	function recoveryOutput(candidate: string): WorkflowNodeOutputV1 {
+		const contract = { kind: "json", allowedTopLevelFields: ["items"] };
+		const turnId = "accepted-author-turn";
+		const sourceContext = JSON.stringify({ inputs: { source: ["frozen source"] } });
+		const accepted = normalizeHarnessAcceptedAuthorSource({
+			version: 1, representation: AUTHOR_SOURCE_REPRESENTATION, identity: { taskId, sessionId: taskId, turnId },
+			candidate, candidateHash: authorSourceTextHash(candidate),
+			authorContract: { ref: `${turnId}#/acceptedAuthorSource/authorContract/value`, value: contract, hash: authorSourceJsonHash(contract) },
+			acceptance: { kind: "harness_accepted_candidate", receiptRef: turnId,
+				candidateHash: authorSourceTextHash(candidate), authorContractHash: authorSourceJsonHash(contract) },
+			sourceContext: { value: sourceContext, hash: authorSourceTextHash(sourceContext) },
+		});
+		if (!accepted) throw new Error("Expected accepted author source");
+		return { protocolVersion: "1", nodeId, executorRef: "agents.logical-task/v2", executionMode: "once",
+			ports: { result: { taskId, text: candidate, acceptedAuthorSource: accepted } },
+			artifacts: [{ type: "tapcanvas.image/v1", identity: "image-1", value: "https://assets.example.com/image-1.png" }], itemRuns: [],
+			evidence: { taskId, executorCompleted: false, deliveryEvidence: { logicalTaskId: taskId, sessionKey: taskId },
+				acceptedAuthorRecovery: { version: 1, sourceExecutionId, sourceNodeRunId: "original-node-run",
+					nodeId, portName: "result", sourceRecord: accepted } },
+		};
+	}
+	it("revalidates a retained accepted candidate and continues without another author call", async () => {
+		const original = recoveryOutput('{"items":["retained original"]}');
+		const runAgent = vi.fn();
+		const result = await executeRegisteredWorkflowNode({
+			...context({ node: node(nodeId, "agents.logical-task/v2", data), inputs: { source: ["frozen source"] } }),
+			recoveryOfExecutionId: sourceExecutionId, resumeOnly: true, resumeOutputRefs: original,
+		}, { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(result.ok, JSON.stringify(result)).toBe(true);
+		expect(runAgent).not.toHaveBeenCalled();
+		expect(result.outputRefs?.ports.result).toMatchObject({ text: '{"items":["retained original"]}' });
+		expect(result.outputRefs?.artifacts).toContainEqual(original.artifacts[0]);
+		expect(result.outputRefs?.evidence).toMatchObject({ acceptedAuthorRecoveryRevalidated: {
+			sourceExecutionId, sourceNodeRunId: "original-node-run", candidateHash: authorSourceTextHash('{"items":["retained original"]}'),
+		}, requestTerminal: { status: "succeeded" } });
+	});
+	it("keeps a structural revalidation failure repairable without repeatedly consuming the original candidate", async () => {
+		const original = recoveryOutput('{"items":42}');
+		const runAgent = vi.fn(async () => ({ taskId: "corrected-task", text: '{"items":["corrected"]}', assets: [],
+			expectedDelivery: null, deliveryEvidence: null, deliveryVerification: null, requestTerminal: { status: "succeeded" } }));
+		const base = { ...context({ node: node(nodeId, "agents.logical-task/v2", data), inputs: { source: ["frozen source"] } }),
+			recoveryOfExecutionId: sourceExecutionId, resumeOnly: true };
+		const rejected = await executeRegisteredWorkflowNode({ ...base, resumeOutputRefs: original },
+			{ runAgent, runJavascript: vi.fn(), runVideo });
+		expect(rejected).toMatchObject({ ok: false, waitingExternal: true, outputRefs: { evidence: {
+			acceptedAuthorRecoveryRevalidated: { sourceNodeRunId: "original-node-run" },
+			outputRepair: { sourceTurnId: taskId, candidate: '{"items":42}', error: expect.stringContaining("items") },
+		} } });
+		expect(runAgent).not.toHaveBeenCalled();
+		if (rejected.ok || !rejected.waitingExternal) throw new Error("Expected same-task correction");
+		const corrected = await executeRegisteredWorkflowNode({ ...base, resumeOutputRefs: rejected.outputRefs },
+			{ runAgent, runJavascript: vi.fn(), runVideo });
+		expect(corrected.ok).toBe(true);
+		expect(runAgent).toHaveBeenCalledTimes(1);
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({ failurePolicy: "single_submission", modelKey: "test-model",
+			previousEvidence: expect.objectContaining({ outputRepair: expect.objectContaining({ candidate: '{"items":42}' }) }) }));
+		expect(corrected.outputRefs?.artifacts).toContainEqual(original.artifacts[0]);
+	});
+	it("revalidates proven candidate bytes while preserving a damaged original contract receipt as a diagnostic", async () => {
+		const original = recoveryOutput('{"items":["retained original"]}');
+		const recovery = original.evidence.acceptedAuthorRecovery as Record<string, unknown>;
+		const accepted = recovery.sourceRecord as Record<string, unknown>;
+		const oldContract = accepted.authorContract as Record<string, unknown>;
+		const damaged = { ...accepted, authorContract: { ...oldContract, hash: `sha256:${"0".repeat(64)}` } };
+		original.evidence.acceptedAuthorRecovery = { ...recovery, sourceRecord: damaged };
+		original.ports.result = { taskId, text: '{"items":["retained original"]}', acceptedAuthorSource: damaged };
+		const runAgent = vi.fn();
+		const result = await executeRegisteredWorkflowNode({
+			...context({ node: node(nodeId, "agents.logical-task/v2", data), inputs: { source: ["frozen source"] } }),
+			recoveryOfExecutionId: sourceExecutionId, resumeOnly: true, resumeOutputRefs: original,
+		}, { runAgent, runJavascript: vi.fn(), runVideo });
+		expect(result.ok, JSON.stringify(result)).toBe(true);
+		expect(runAgent).not.toHaveBeenCalled();
+		expect(result.outputRefs?.evidence.acceptedAuthorRecoverySourceDiagnostics).toHaveLength(1);
+		expect(result.outputRefs?.ports.result).not.toHaveProperty("acceptedAuthorSource");
+		expect((original.evidence.acceptedAuthorRecovery as Record<string, unknown>).sourceRecord).toEqual(damaged);
+	});
+});
+
+describe("repairable Workflow Agent policy overrides in nested pipelines", () => {
+	it("keeps the typed candidate and verifier correction in the inline stage's execution family", async () => {
+		const rejectedCandidate = JSON.stringify({ items: 42 });
+		const correctedCandidate = JSON.stringify({ items: ["repaired"] });
+		const calls: WorkflowAgentRunRequest[] = [];
+		const checkpoints: WorkflowNodeOutputV1[] = [];
+		const runAgent = vi.fn(async (request: WorkflowAgentRunRequest) => {
+			calls.push(request);
+			return {
+				taskId: `typed-stage-turn-${String(calls.length)}`,
+				text: calls.length === 1 ? rejectedCandidate : correctedCandidate,
+				assets: [],
+				expectedDelivery: { active: true },
+				deliveryEvidence: { logicalTaskId: "typed-stage" },
+				deliveryVerification: null,
+				requestTerminal: { status: "succeeded", reason: "agent_turn_succeeded" },
+			};
+		});
+		const authorNode = node("author", "agents.logical-task/v2", {
+			workflowInstruction: "提交结构化条目",
+			workflowAgentOutputArtifactType: "tapcanvas.test-items/v1",
+			workflowAgentOutputEncoding: "json_object",
+			workflowAgentJsonObjectContract: { requiredArrayFields: ["items"], allowedFields: ["items"] },
+			workflowAgentDeliveryRequirement: "交付结构化条目",
+			workflowAgentDefinitionId: "writer",
+			workflowAgentModelKey: "test-model",
+			workflowAgentFailurePolicy: "repair_with_correction",
+			workflowAgentExecutionPolicy: "multi_inference",
+			workflowAgentToolPolicy: "none",
+			workflowRequiredSkills: ["tapcanvas-video-authoring-stages"],
+			workflowAllowedTools: ["tapcanvas_workflow_execution_inspect"],
+		}, "once", ["result"], undefined, ["source"]);
+		const pipelineNode = node("author-pipeline", "workflow.pipeline.run/v1", {
+			workflowPipeline: {
+				protocolVersion: "workflow.pipeline.run/v1",
+				inputs: [{ portId: "source", mode: "value", artifactTypes: ["tapcanvas.text/v1"] }],
+				steps: [{ stepId: "author", node: authorNode }],
+				bindings: [{ from: { kind: "input", portId: "source" }, to: { stepId: "author", portId: "source" }, mode: "value" }],
+				outputs: [{ portId: "result", from: { stepId: "author", portId: "result" }, mode: "value" }],
+			},
+		}, "once", ["result"], undefined, ["source"]);
+
+		const result = await executeRegisteredWorkflowNode(context({
+			node: pipelineNode,
+			inputs: { source: ["frozen source"] },
+			checkpointOutputRefs: async (outputRefs) => { checkpoints.push(outputRefs); },
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result.ok).toBe(true);
+		expect(runAgent).toHaveBeenCalledTimes(2);
+		expect(calls.map(({ failurePolicy, executionPolicy }) => ({ failurePolicy, executionPolicy }))).toEqual([
+			{ failurePolicy: "repair_with_correction", executionPolicy: "multi_inference" },
+			{ failurePolicy: "repair_with_correction", executionPolicy: "multi_inference" },
+		]);
+		expect(calls.map(({ allowedTools, requiredSkills }) => ({ allowedTools, requiredSkills }))).toEqual([
+			{ allowedTools: [], requiredSkills: ["tapcanvas-video-authoring-stages"] },
+			{ allowedTools: [], requiredSkills: ["tapcanvas-video-authoring-stages"] },
+		]);
+		expect(checkpoints[0]).toMatchObject({
+			evidence: {
+				pipelineState: {
+					steps: {
+						author: {
+							outputRefs: {
+								evidence: {
+									continuationReason: "structured_output_repair_required",
+									outputRepair: {
+										candidate: rejectedCandidate,
+										error: expect.stringContaining("items"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		});
+		expect(calls[1]?.previousEvidence).toMatchObject({
+			outputRepair: { candidate: rejectedCandidate, error: expect.stringContaining("items") },
+		});
+		expect(runAgent.mock.calls[1]?.[0].executionFamilyId).toBe(calls[0]?.executionFamilyId);
+	});
+
+	it.each([undefined, "scoped"])("keeps only configured tools available with policy %s", async (toolPolicy) => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "tool-policy-task",
+			text: JSON.stringify({ items: ["ready"] }),
+			assets: [],
+			expectedDelivery: { active: true },
+			deliveryEvidence: { logicalTaskId: "tool-policy-task" },
+			deliveryVerification: null,
+			requestTerminal: { status: "succeeded" as const, reason: "agent_turn_succeeded" },
+		}));
+		const authorNode = node("author", "agents.logical-task/v2", {
+			workflowInstruction: "提交结构化条目",
+			workflowAgentOutputArtifactType: "tapcanvas.test-items/v1",
+			workflowAgentOutputEncoding: "json_object",
+			workflowAgentJsonObjectContract: { requiredArrayFields: ["items"], allowedFields: ["items"] },
+			workflowAgentDeliveryRequirement: "交付结构化条目",
+			workflowAgentDefinitionId: "writer",
+			workflowAgentModelKey: "test-model",
+			workflowAllowedTools: ["tapcanvas_workflow_execution_inspect"],
+			workflowAgentToolPolicy: toolPolicy,
+		}, "once", ["result"], undefined, ["source"]);
+
+		const result = await executeRegisteredWorkflowNode(context({
+			node: authorNode,
+			inputs: { source: ["frozen source"] },
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result.ok).toBe(true);
+		expect(runAgent.mock.calls[0]?.[0].allowedTools).toContain("tapcanvas_workflow_execution_inspect");
+		expect(runAgent.mock.calls[0]?.[0].allowedTools).not.toContain("tapcanvas_video_generate_to_canvas");
 	});
 });
 
@@ -5212,4 +7472,983 @@ describe("workflow exact asset contract auto-injection", () => {
 			jsonObjectContract: expect.not.objectContaining({ itemExactAssetIds: expect.anything() }),
 		}));
 	});
+});
+
+
+describe("staged chapter authoring executors", () => {
+  it("returns a chapter asset self-reference to its author for same-chain repair before accepting the artifact", async () => {
+    const { shared } = stagedAuthoringFixture();
+    const chapterAssetSchemaProperties = chapterAssetPlanSchema.properties;
+    if (!chapterAssetSchemaProperties || typeof chapterAssetSchemaProperties !== "object" || Array.isArray(chapterAssetSchemaProperties)) {
+      throw new Error("Chapter asset schema must declare object properties");
+    }
+    const invalid = structuredClone({ ...shared,
+      backgroundPlans: shared.backgroundPlans.map(entry => ({ ...entry, plan: { ...entry.plan } })),
+    });
+    invalid.backgroundPlans[0]!.plan.referenceAssetBindings = [{ assetId: "floor", role: "layout" }];
+    const calls: WorkflowAgentRunRequest[] = [];
+    const checkpoints: WorkflowNodeOutputV1[] = [];
+    const runAgent = vi.fn(async (request: WorkflowAgentRunRequest) => {
+      calls.push(request);
+      const text = calls.length === 1 ? JSON.stringify(invalid) : JSON.stringify(shared);
+      return {
+        taskId: `chapter-assets-turn-${String(calls.length)}`,
+        text,
+        assets: [],
+        expectedDelivery: { active: true },
+        deliveryEvidence: { ok: true },
+        deliveryVerification: { status: "satisfied" },
+        requestTerminal: { status: "succeeded" },
+      };
+    });
+    const result = await executeRegisteredWorkflowNode(context({
+      node: node("chapter-assets-agent", "agents.logical-task/v2", {
+        workflowInstruction: "提交章节资产计划",
+        workflowAgentOutputArtifactType: "tapcanvas.chapter-asset-plan/v3",
+        workflowAgentOutputEncoding: "json_object",
+        workflowAgentJsonObjectContract: {
+          allowedFields: Object.keys(chapterAssetSchemaProperties),
+          jsonSchema: chapterAssetPlanSchema,
+        },
+        workflowAgentDeliveryRequirement: "交付章节资产计划",
+        workflowAgentDefinitionId: "writer",
+        workflowAgentModelKey: "test-model",
+      }, "once", ["chapter-assets"], undefined, ["delivery-contract"]),
+      inputs: { "delivery-contract": [{ sourceId: "chapter", sourceFingerprint: "source-hash" }] },
+      checkpointOutputRefs: async (outputRefs) => { checkpoints.push(outputRefs); },
+    }), { runAgent, runJavascript: vi.fn(), runVideo });
+
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(checkpoints).toHaveLength(1);
+    expect(checkpoints[0]?.evidence).toMatchObject({
+      continuationReason: "structured_output_repair_required",
+      outputRepair: {
+        candidate: JSON.stringify(invalid),
+        error: expect.stringContaining("backgroundPlans[0].plan.referenceAssetBindings[0].assetId"),
+      },
+    });
+    expect(calls[1]?.previousEvidence).toMatchObject({
+      outputRepair: {
+        candidate: JSON.stringify(invalid),
+        error: expect.stringContaining("batch"),
+      },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("Expected repaired chapter asset plan to be accepted");
+    expect(result.outputRefs.ports["chapter-assets"]).toMatchObject({ text: JSON.stringify(shared) });
+    expect(result.outputRefs.evidence).toMatchObject({ immediateOutputRepair: { outcome: "accepted", attemptCount: 1 } });
+  });
+
+  it("dispatches independent asset preparation before any clip output exists", async () => {
+    const { shared } = stagedAuthoringFixture();
+    const result = await executeRegisteredWorkflowNode({
+      ...context({ node: node("prepare", "video.chapter-assets.prepare/v1", {}, "once", ["asset-items"]), inputs: { "chapter-assets": [shared] } }),
+      projectContext: selectedAssetProjectContext([]),
+    }, { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("errorMessage" in result ? result.errorMessage : "Unexpected external wait");
+    expect(result.outputRefs.evidence).toMatchObject({ itemCount: 1, consumerBinding: "deferred_until_design" });
+  });
+
+  it("dispatches current chapter asset schema before binding frozen project image permissions", async () => {
+    const { shared } = stagedAuthoringFixture();
+    const calls: WorkflowAgentRunRequest[] = [];
+    const runAgent = vi.fn(async (request: WorkflowAgentRunRequest) => {
+      calls.push(request);
+      return { taskId: "chapter-assets-current-schema", text: JSON.stringify(shared), assets: [],
+        expectedDelivery: null, deliveryEvidence: null, deliveryVerification: null, requestTerminal: { status: "succeeded" } };
+    });
+    const result = await executeRegisteredWorkflowNode({
+      ...context({
+        node: node("chapter-assets-agent", "agents.logical-task/v2", {
+          workflowInstruction: "提交章节资产计划",
+          workflowAgentOutputArtifactType: "tapcanvas.chapter-asset-plan/v3",
+          workflowAgentOutputEncoding: "json_object",
+          workflowAgentJsonObjectContract: { allowedFields: ["objectRegistry", "backgroundPlans"], jsonSchema: { type: "object", description: "retired-shape" } },
+          workflowAgentDeliveryRequirement: "交付章节资产计划",
+          workflowAgentDefinitionId: "writer", workflowAgentModelKey: "test-model",
+          workflowAgentFailurePolicy: "single_submission",
+        }, "once", ["chapter-assets"], undefined, ["delivery-contract"]),
+        inputs: { "delivery-contract": [{ sourceId: "chapter", sourceFingerprint: "source-hash" }] },
+      }),
+      projectContext: selectedAssetProjectContext([]),
+    }, { runAgent, runJavascript: vi.fn(), runVideo });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    expect(calls).toHaveLength(1);
+    const schemaText = JSON.stringify(calls[0]?.jsonObjectContract?.jsonSchema);
+    expect(schemaText).toContain("sceneCard");
+    expect(schemaText).not.toContain("retired-shape");
+    expect(schemaText).toContain("x-referenceSource");
+    expect(schemaText).toContain("x-runtimeOnlyKeywords");
+  });
+
+  it("prepares shared backgrounds without waiting for clip designs or the assembled BeatSheet", async () => {
+    const { shared } = stagedAuthoringFixture();
+    const result = await executeRegisteredWorkflowNode(context({
+      node: node("backgrounds", "tapcanvas.chapter-backgrounds.split/v1", {}, "once", ["asset-items"]),
+      inputs: { "chapter-assets": [shared] },
+    }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("errorMessage" in result ? result.errorMessage : "Unexpected external wait");
+    const collection = result.outputRefs.ports["asset-items"];
+    expect(isWorkflowCollection(collection)).toBe(true);
+    if (!isWorkflowCollection(collection)) throw new Error("missing backgrounds");
+    expect(collection.items).toHaveLength(shared.backgroundPlans.length);
+  });
+
+  it("fans out exact clip identities and assembles persisted per-item text outputs", async () => {
+    const { chapter, shared, clip, ledger } = stagedAuthoringFixture();
+    const inputs = { "source-ledger": [ledger], "chapter-plan": [{ text: JSON.stringify(chapter) }], "chapter-assets": [{ text: JSON.stringify(shared) }] };
+    const split = await executeRegisteredWorkflowNode(context({ node: node("split", "video.clip-design-inputs/v1", {}, "once", ["clip-design-inputs"]), inputs }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+    expect(split.ok).toBe(true);
+    if (!split.ok) throw new Error("errorMessage" in split ? split.errorMessage : "Unexpected external wait");
+    const items = split.outputRefs.ports["clip-design-inputs"];
+    expect(isWorkflowCollection(items)).toBe(true);
+    if (!isWorkflowCollection(items)) throw new Error("missing collection");
+    expect(items.items[0]).toMatchObject({ itemId: "source-hash:clip:0", value: { clipIndex: 0, speechLedger: [] } });
+    const designs = createWorkflowCollection({ collectionId: "designs", producerNodeId: "designer", producerPortId: "clip-designs", itemIds: [items.items[0]!.itemId], values: [{ text: JSON.stringify(clip) }] });
+    const assembled = await executeRegisteredWorkflowNode(context({ node: node("join", "video.beat-sheet.assemble/v1", {}, "collect", ["beat-sheet"]), inputs: { ...inputs, "clip-designs": [designs] } }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+    expect(assembled.ok).toBe(true);
+    if (!assembled.ok) throw new Error("errorMessage" in assembled ? assembled.errorMessage : "Unexpected external wait");
+    expect(assembled.outputRefs.evidence).toMatchObject({ itemCount: 1, assembly: "identity_join" });
+  });
+});
+
+describe("Clip production packet authoring and collector executors", () => {
+	it("submits a nested single-item media stage with the frozen global Clip index", async () => {
+		const submitVideo = vi.fn(async () => ({ status: "waiting_external" as const,
+			nodeId: "clip-4-node", taskId: "clip-4-provider-task", reused: false }));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("video-submit", "tapcanvas.video.generate/v1", {}, "each", ["provider-receipts"], 1, ["production-plan"]),
+			inputs: { "production-plan": [{
+				promptSourceProtocol: "tapcanvas.clip-production-packets/v2", videoReferencePolicy: "forbidden",
+				itemId: "chapter:clip:4", clipIndex: 4,
+				prompt: "参考图（按上传顺序）：\n@图1：主角——角色参考，锁定五官、发型、体型和服装；若是多视图设定图，只取外观，不要把拼版画进视频\n第四段独有动作",
+				sourcePrompt: "第四段独有动作",
+				referenceHeader: "参考图（按上传顺序）：\n@图1：主角——角色参考，锁定五官、发型、体型和服装；若是多视图设定图，只取外观，不要把拼版画进视频",
+				referenceBindings: [{ nodeId: "image-node-4", name: "主角", referenceType: "character" }],
+				videoInputMode: "reference_to_video", durationSeconds: 5,
+				modelKey: "video-model", resolution: "1080p", aspectRatio: "16:9", estimateIdentity: "estimate-4",
+				referenceImageNodeIds: [], referenceAssetIds: ["image-asset-4"],
+			}] },
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: submitVideo });
+		expect(result).toMatchObject({ waitingExternal: true });
+		expect(submitVideo).toHaveBeenCalledWith(expect.objectContaining({
+			clipId: "chapter:clip:4", itemIndex: 4,
+			prompt: "参考图（按上传顺序）：\n@图1：主角——角色参考，锁定五官、发型、体型和服装；若是多视图设定图，只取外观，不要把拼版画进视频\n第四段独有动作",
+			workflowSourcePrompt: "第四段独有动作",
+			workflowReferenceBindings: [{ nodeId: "image-node-4", name: "主角", referenceType: "character" }],
+			referenceImageNodeIds: ["image-node-4"], referenceAssetIds: [],
+		}));
+	});
+
+	const sourceSegment = {
+		protocolVersion: "tapcanvas.clip-source-segment/v1",
+		clipId: "source-hash:clip:0",
+		clipIndex: 0,
+		sourceId: "chapter-source",
+		sourceFingerprint: "sha256:chapter",
+		durationSeconds: 4,
+		sourceRanges: [{
+			sourceIndex: 0,
+			startOffset: 0,
+			endOffset: 8,
+			sourceId: "chapter-source",
+			sourceFingerprint: "sha256:chapter",
+		}],
+		sourceSlices: [{
+			sourceIndex: 0,
+			startOffset: 0,
+			endOffset: 8,
+			sourceId: "chapter-source",
+			sourceFingerprint: "sha256:chapter",
+			text: "原文片段",
+		}],
+	} as const;
+	const prompt = "人物从门边退入雨夜，镜头持续向前推进。\n保持同一镜头运动与人物伤痕。 ";
+	const packet = {
+		protocolVersion: CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION,
+		clipId: sourceSegment.clipId,
+		clipIndex: sourceSegment.clipIndex,
+		durationSeconds: sourceSegment.durationSeconds,
+		videoInputMode: "image_to_video",
+		firstFrameAsset: { assetId: "character-main", state: "wet-coat-v1" },
+		referenceAssets: [{ assetId: "character-main", state: "wet-coat-v1" }],
+		sourceRanges: sourceSegment.sourceRanges,
+		videoPrompt: prompt,
+		blockingPlan: clipProductionBlockingFixture(),
+		clipFacts: { action: { start: "门边", motion: "退入雨夜", end: "镜头持续推进" } },
+		assetIntents: [{
+			assetId: "character-main",
+			state: "wet-coat-v1",
+			registryObjectId: "character-main",
+			displayName: "张羽",
+			referenceType: "character",
+			referenceAssetBindings: [],
+			imageSource: { mode: "generate", generationSpecVersion: "image-spec-v1", generationSpec: {
+				prompt: "湿外套状态下的角色全身立姿",
+				negativePrompt: "避免服装状态变化",
+				modelKey: "image-model-v1",
+				aspectRatio: "16:9",
+				size: "2K",
+			} },
+		}],
+	};
+	const chapterAssets = {
+		objectRegistry: [{ objectId: "character-main", kind: "character", name: "张羽", physicalIdentityKey: "zhangyu", imageSource: {
+			mode: "generate", referenceAssetBindings: [], plan: {
+				prompt: "湿外套状态下的角色全身立姿", negativePrompt: "避免服装状态变化",
+			},
+		} }],
+		backgroundPlans: [{ objectId: "background-main", plan: { sceneName: "大厅" } }],
+	};
+	const { firstFrameAsset: _firstFrameAsset, referenceAssets: _referenceAssets, ...draftBase } = packet;
+	const draft = { ...draftBase, firstFrameAssetIndex: 0, referenceAssetIndices: [0],
+		videoPrompt: { scene: "", shots: [{ action: prompt, camera: "", sound: "", storyEventIds: [], speechEventIds: [] },
+			{ action: "人物停在雨里", camera: "", sound: "", storyEventIds: [], speechEventIds: [] }] },
+		imageModelKey: "image-model-v1", imageAspectRatio: "16:9", imageSize: "2K",
+		blockingPlan: packet.blockingPlan,
+		assetIntents: [{ registryObjectId: "character-main", imageSource: { mode: "generate" } }],
+	};
+	const imageDeliveryContract = {
+		imageGenerationContract: { modelKey: "image-model-v1", aspectRatio: "16:9", size: "2K" },
+		generationContract: { supportsFirstLastFrame: true },
+	};
+	const sourceSegments = createWorkflowCollection({
+		collectionId: "execution-1:source-segments",
+		producerNodeId: "segment-project",
+		producerPortId: "clip-segments",
+		values: [sourceSegment],
+		itemIds: [sourceSegment.clipId],
+	});
+
+	it("binds the per-Clip authoring schema and keeps structured repair enabled", async () => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "packet-writer-task",
+			text: JSON.stringify(draft),
+			assets: [],
+			expectedDelivery: { version: 1 },
+			deliveryEvidence: { version: 1 },
+			deliveryVerification: { version: 2, status: "satisfied" as const },
+			requestTerminal: { status: "succeeded" as const, reason: "delivery_verification_satisfied" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("packet-writer", "agents.logical-task/v2", {
+				workflowInstruction: "Author the Clip packet from the frozen source item.",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentOutputArtifactType: CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION,
+				workflowAgentJsonObjectContract: { allowedFields: ["stale-field"], jsonSchema: { type: "object" } },
+				workflowAgentDeliveryRequirement: "Return the exact typed Clip production packet.",
+				workflowAgentDefinitionId: "video-prompt-writer",
+				workflowAgentModelKey: "configured-model",
+			}, "each", ["result"], 8, ["clip-segment"]),
+			inputs: { "clip-segment": [sourceSegments], "chapter-assets": [chapterAssets], "delivery-contract": [imageDeliveryContract] },
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		if (!result.ok) throw new Error("expected a valid typed Clip packet: " + ("errorMessage" in result ? result.errorMessage : "Unexpected external wait"));
+		const request = runAgent.mock.calls[0]?.[0];
+		expect(request?.jsonObjectContract?.jsonSchema).toMatchObject({
+			properties: {
+				protocolVersion: { const: CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION },
+				clipId: { const: sourceSegment.clipId },
+				clipIndex: { const: 0 },
+				durationSeconds: { const: 4 },
+			},
+		});
+		expect((request?.jsonObjectContract?.jsonSchema as { required: string[] }).required).not.toContain("sourceRanges");
+		if (!result.ok) throw new Error("expected a valid typed Clip packet");
+		expect(result.outputRefs.itemRuns[0]?.evidence.structuredOutputSubmissionPolicy).toBe("repair_with_correction");
+		const packetArtifact = result.outputRefs.artifacts.find((artifact) => artifact.type === CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION);
+		expect(packetArtifact?.value).toBeTypeOf("string");
+		const normalizedPacket = JSON.parse(packetArtifact?.value as string) as Record<string, unknown>;
+		expect(normalizedPacket).toMatchObject({
+			protocolVersion: CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION,
+			clipId: sourceSegment.clipId,
+			clipIndex: 0,
+			durationSeconds: 4,
+			videoPrompt: `镜头1：${prompt}\n镜头2：人物停在雨里`,
+		});
+		expect(normalizedPacket).not.toHaveProperty("firstFrameAssetIndex");
+		expect(normalizedPacket).not.toHaveProperty("imageModelKey");
+		expect(normalizedPacket).not.toHaveProperty("speechEvents");
+	});
+
+	it("collects typed Agent result items into exact Clip packets and deduplicated asset intents", async () => {
+		const normalizedPacket = materializeClipProductionDraft(draft, chapterAssets, "project-1");
+		const packetResults = createWorkflowCollection({
+			collectionId: "execution-1:packet-results",
+			producerNodeId: "packet-writer",
+			producerPortId: "result",
+			values: [{ taskId: "packet-writer-task", text: JSON.stringify(normalizedPacket), assets: [] }],
+			itemIds: [sourceSegment.clipId],
+		});
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("packet-collect", "video.clip-production.collect/v1", {}, "once", ["clip-production", "asset-intents"], undefined, ["packets", "clip-segments", "chapter-assets"]),
+			inputs: { packets: [packetResults], "clip-segments": [sourceSegments], "chapter-assets": [chapterAssets] },
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+		if (!result.ok) throw new Error("errorMessage" in result ? result.errorMessage : "Unexpected external wait");
+
+		const clips = result.outputRefs.ports["clip-production"];
+		const assets = result.outputRefs.ports["asset-intents"];
+		expect(isWorkflowCollection(clips)).toBe(true);
+		expect(isWorkflowCollection(assets)).toBe(true);
+		if (!isWorkflowCollection(clips) || !isWorkflowCollection(assets)) throw new Error("missing typed Clip production output collections");
+		expect(clips.items).toHaveLength(1);
+		expect(clips.items[0]?.value).toMatchObject({ videoPrompt: `镜头1：${prompt}\n镜头2：人物停在雨里` });
+		expect(clips.items[0]?.value).not.toHaveProperty("speechEvents");
+		expect(assets.items[0]?.value).toMatchObject({
+			assetId: "chapter-object:character-main:generate",
+			state: "chapter-shared:generate",
+			consumerClipIds: [sourceSegment.clipId],
+			effectAssetId: expect.stringMatching(/^clip-production-image-effect:/),
+		});
+		expect(result.outputRefs.artifacts.map((artifact) => artifact.type)).toEqual([
+			CLIP_PRODUCTION_PACKET_COLLECTION_ARTIFACT_TYPE,
+			CLIP_PRODUCTION_ASSET_INTENTS_ARTIFACT_TYPE,
+		]);
+	});
+
+	it("runs chapter speech through Agent normalization, collection, and the provider prompt renderer", async () => {
+		const speechEvent = { speechEventId: "authored-line-1", speaker: "张羽", delivery: "on_screen", voice: "onscreen" as const,
+			text: "  我来，\n现在。  ", textOrigin: "authored" as const, eventIndex: 0,
+			clipId: sourceSegment.clipId, sceneId: "rain-scene", scope: "beat" as const, storyEventId: "e1", sourceRanges: [] };
+		const clipSequence = { protocolVersion: "tapcanvas.chapter-sequence-clip/v2", clipId: sourceSegment.clipId,
+			clipIndex: sourceSegment.clipIndex, durationSeconds: sourceSegment.durationSeconds, speechEvents: [speechEvent],
+			storyEvents: [
+				{ eventId: "e1", eventIndex: 0, clipId: sourceSegment.clipId, sceneId: "rain-scene", action: "张羽开口", sourceRanges: [], performance: "dialogue" },
+				{ eventId: "e2", eventIndex: 1, clipId: sourceSegment.clipId, sceneId: "rain-scene", action: "雨中光幕亮起", sourceRanges: [], performance: "vfx" },
+			] };
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			// The author chooses descriptive shots; exact spoken lines bind by identity without a timing grid.
+			taskId: "packet-writer-with-speech", text: JSON.stringify({ ...draft,
+				videoPrompt: { scene: "", shots: [{ action: prompt, camera: "", sound: "", storyEventIds: ["e1"], speechEventIds: [speechEvent.speechEventId] },
+					{ action: "人物停在雨里", camera: "", sound: "", storyEventIds: ["e2"], speechEventIds: [] }] },
+				clipFacts: { ...draft.clipFacts, sequenceClipId: sourceSegment.clipId } }), assets: [],
+			expectedDelivery: { version: 1 }, deliveryEvidence: { version: 1 },
+			deliveryVerification: { version: 2, status: "satisfied" as const },
+			requestTerminal: { status: "succeeded" as const, reason: "delivery_verification_satisfied" },
+		}));
+		const authored = await executeRegisteredWorkflowNode(context({
+			node: node("packet-writer-with-speech", "agents.logical-task/v2", {
+				workflowInstruction: "Author the Clip audiovisual prompt; the host binds frozen speech after authoring.",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentOutputArtifactType: CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION,
+        workflowAgentJsonObjectContract: { allowedFields: ["stale-field"], jsonSchema: { type: "object" } },
+				workflowAgentDeliveryRequirement: "Return the typed Clip production packet.",
+				workflowAgentDefinitionId: "video-prompt-writer", workflowAgentModelKey: "configured-model",
+			}, "each", ["result"], 8, ["clip-segment", "clip-sequence"]),
+			inputs: { "clip-segment": [sourceSegments], "clip-sequence": [clipSequence],
+				"chapter-assets": [chapterAssets], "delivery-contract": [imageDeliveryContract] },
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+		if (!authored.ok) throw new Error("errorMessage" in authored ? authored.errorMessage : "Unexpected external wait");
+		// The window's performance modes come from its story events and reach the agent, which preloads their routes.
+		expect(runAgent.mock.calls[0]?.[0].performanceModes).toEqual(["dialogue", "vfx"]);
+		const agentPacketArtifact = authored.outputRefs.artifacts.find((artifact) => artifact.type === CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION);
+		if (typeof agentPacketArtifact?.value !== "string") throw new Error("missing normalized packet artifact");
+		const normalized = JSON.parse(agentPacketArtifact.value) as Record<string, unknown>;
+		expect(normalized.speechEvents).toEqual([speechEvent]);
+		const compiledPrompt = `镜头1：${prompt}；张羽（on_screen）说：“${speechEvent.text}”\n镜头2：人物停在雨里`;
+		expect(normalized.videoPrompt).toBe(compiledPrompt);
+		expect(normalized).not.toHaveProperty("firstFrameAssetIndex");
+
+		const packetResults = createWorkflowCollection({ collectionId: "speech-packet-results",
+			producerNodeId: "packet-writer-with-speech", producerPortId: "result",
+			values: [{ taskId: "packet-writer-with-speech", text: agentPacketArtifact.value, assets: [] }],
+			itemIds: [sourceSegment.clipId] });
+		const collected = await executeRegisteredWorkflowNode(context({
+			node: node("packet-collect-with-speech", "video.clip-production.collect/v1", {}, "once",
+				["clip-production", "asset-intents"], undefined, ["packets", "clip-segments", "chapter-assets"]),
+			inputs: { packets: [packetResults], "clip-segments": [sourceSegments], "chapter-assets": [chapterAssets] },
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+		if (!collected.ok) throw new Error("errorMessage" in collected ? collected.errorMessage : "Unexpected external wait");
+		const clipCollection = collected.outputRefs.ports["clip-production"];
+		const assetIntentCollection = collected.outputRefs.ports["asset-intents"];
+		if (!isWorkflowCollection(clipCollection) || !isWorkflowCollection(assetIntentCollection)) {
+			throw new Error("collector omitted normalized Clip or asset-intent collections");
+		}
+		expect(clipCollection.items[0]?.value).toMatchObject({ speechEvents: [speechEvent], videoPrompt: compiledPrompt });
+		const projected = projectClipProductionNodePlan({ executionId: "execution-1", executionFamilyId: "family-1",
+			nodeId: "video-node-plan", workflowKey: "workflow", clipProductionCollection: clipCollection,
+			assetIntentCollection, deliveryContract: { protocolVersion: "2", workflowKey: "workflow" } });
+		const video = projected.nodePlan.videoNodes[0]!;
+		expect(video.sourcePrompt).toBe(compiledPrompt);
+		expect(video.speechEvents).toEqual([speechEvent]);
+		expect(video.prompt).toBe(renderClipProductionReferencePrompt({ prompt: compiledPrompt, speechEvents: [speechEvent],
+			bindings: video.referenceBindings,
+			images: video.referenceImageNodeIds.map((nodeId) => ({ sourceNodeIds: [nodeId] })) }));
+		expect(video.prompt.split(speechEvent.text)).toHaveLength(2);
+	});
+});
+
+describe("Opening Clip fast lane executors", () => {
+	it("turns a parallel frame Agent artifact into a reference-bound image prompt package", async () => {
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("prepare-opening-frame", "video.opening-frame.prepare/v1", {}, "once", ["prompt-package"], undefined, ["frame-plan"]),
+			inputs: { "frame-plan": [{ text: JSON.stringify({
+				protocolVersion: "tapcanvas.opening-frame-plan/v1",
+				prompt: "A single opening composition with the lead character in the chapter scene.",
+				negativePrompt: "No character sheet or multi-frame layout.",
+				referenceAssetBindings: [{ assetId: "frame-character", role: "identity" }],
+			}) }] },
+			projectContext: selectedAssetProjectContext(["frame-character"]),
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+		if (!result.ok) throw new Error("errorMessage" in result ? result.errorMessage : "Unexpected external wait");
+		expect(result.outputRefs.ports["prompt-package"]).toMatchObject({
+			protocolVersion: "tapcanvas.opening-frame-prompt-package/v1",
+			prompt: "A single opening composition with the lead character in the chapter scene.",
+			referenceAssetBindings: [{ assetId: "frame-character", role: "identity" }],
+		});
+		expect(result.outputRefs.artifacts).toContainEqual(expect.objectContaining({
+			type: "tapcanvas.opening-frame-prompt-package/v1",
+			value: expect.objectContaining({ protocolVersion: "tapcanvas.opening-frame-prompt-package/v1" }),
+		}));
+		expect(result.outputRefs.evidence).toMatchObject({ referenceAssetCount: 1 });
+	});
+
+	it("projects a minimal opening prompt, submits it through the provider path, and binds its source receipt", async () => {
+		const sourceContent = "门打开".repeat(200);
+		const sourceId = "chapter-13";
+		const sourceFingerprint = sha256Hex(sourceContent);
+		const prompt = "A continuous cinematic shot: a wooden door opens into a dim room.";
+		const deliveryContract = {
+			protocolVersion: "2",
+			executionScope: "media_delivery",
+			targetDurationSeconds: 10,
+			generationContract: {
+				videoModel: "opening-clip-test-model",
+				resolution: "480p",
+				aspectRatio: "16:9",
+				durationOptions: [10],
+				maxDurationSeconds: 10,
+				clipPlanningPolicy: "agent_semantic_duration_budget",
+				providerSubmissionTopology: { expectedClipCount: 1, minimumClipDurations: [10], source: "model_max_duration" },
+			},
+			canvasFacts: { authoritativeSources: [{ sourceId, sourceFingerprint, content: sourceContent }] },
+		};
+		const openingClip = {
+			protocolVersion: "tapcanvas.opening-clip/v3",
+			sourceRanges: [{ sourceIndex: 0, startOffset: 0, endOffset: 410 }],
+			clipPrompt: prompt,
+		};
+		const sourceLedger = {
+			sourceId,
+			sourceFingerprint,
+			units: [{ unitId: "unit:first", sourceLineId: "source-0:source-line-1", text: sourceContent, expression: "narration", speakerName: null, delivery: null }],
+		};
+		const prepared = await executeRegisteredWorkflowNode(context({
+			node: node("prepare-opening", "video.opening-clip.prepare/v1", {}, "once", ["clip-prompts", "accepted-opening-clip"], undefined, ["opening-clip", "delivery-contract"]),
+			inputs: { "opening-clip": [openingClip], "delivery-contract": [deliveryContract] },
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+		if (!prepared.ok) throw new Error("errorMessage" in prepared ? prepared.errorMessage : "Unexpected external wait");
+		expect(Object.keys(prepared.outputRefs.ports).sort()).toEqual(["accepted-opening-clip", "clip-prompts"]);
+		const promptCollection = prepared.outputRefs.ports["clip-prompts"];
+		expect(promptCollection).toMatchObject({ items: [{ value: {
+			protocolVersion: "tapcanvas.opening-clip-prompt/v3",
+			clipId: `${sourceFingerprint}:clip:0`,
+			clipIndex: 0,
+			prompt,
+			modelKey: "opening-clip-test-model",
+			durationSeconds: 10,
+		} }] });
+
+		const submitVideo = vi.fn(async (request: { itemIndex: number }) => ({
+			status: "success" as const,
+			nodeId: `opening-video-${request.itemIndex}`,
+			taskId: `opening-video-task-${request.itemIndex}`,
+			videoUrl: `https://assets.example/opening-${request.itemIndex}.mp4`,
+			thumbnailUrl: null,
+			reused: false,
+		}));
+		const missingFrame = await executeRegisteredWorkflowNode(context({
+			node: node("opening-video-submit", "tapcanvas.video.generate/v1", {}, "each", ["provider-receipts"], 1, ["prompt", "delivery-contract", "first-frame"]),
+			inputs: { prompt: [promptCollection], "delivery-contract": [deliveryContract] },
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: submitVideo });
+		expect(missingFrame.ok).toBe(false);
+		expect(submitVideo).not.toHaveBeenCalled();
+		const submitted = await executeRegisteredWorkflowNode(context({
+			node: node("opening-video-submit", "tapcanvas.video.generate/v1", {}, "each", ["provider-receipts"], 1, ["prompt", "delivery-contract", "first-frame"]),
+			inputs: {
+				prompt: [promptCollection],
+				"delivery-contract": [deliveryContract],
+				"first-frame": [{ imageUrl: "https://assets.example/opening-frame.png", generatedAssetId: "opening-frame-asset", nodeId: "opening-frame-image" }],
+			},
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo: submitVideo });
+		if (!submitted.ok) throw new Error("errorMessage" in submitted ? submitted.errorMessage : "Unexpected external wait");
+		expect(submitVideo).toHaveBeenCalledTimes(1);
+		const request = submitVideo.mock.calls[0]?.[0];
+		expect(request).toMatchObject({
+			prompt,
+			firstFrameUrl: "https://assets.example/opening-frame.png",
+			modelKey: "opening-clip-test-model",
+			durationSeconds: 10,
+			resolution: "480p",
+			aspectRatio: "16:9",
+			referenceImageNodeIds: [],
+			referenceAssetIds: [],
+			structuredClip: {
+				clipId: `${sourceFingerprint}:clip:0`,
+				clipIndex: 0,
+				openingContentHash: expect.any(String),
+			},
+			generationContract: null,
+		});
+		expect(submitted.outputRefs.itemRuns[0]?.evidence).toMatchObject({
+			openingSubmissionReceipt: {
+				protocolVersion: "tapcanvas.opening-clip-submission/v1",
+				clipId: `${sourceFingerprint}:clip:0`,
+				prompt,
+				promptHash: sha256Hex(prompt),
+				firstFrameUrlSha256: sha256Hex("https://assets.example/opening-frame.png"),
+				sourceId,
+				sourceFingerprint,
+				provider: { videoModel: "opening-clip-test-model", durationSeconds: 10, resolution: "480p", aspectRatio: "16:9" },
+			},
+			providerStatus: "success",
+		});
+
+		const bound = await executeRegisteredWorkflowNode(context({
+			node: node("bind-opening", "video.opening-clip.bind-ledger/v1", {}, "once", ["opening-prefix"], undefined, ["accepted-opening-clip", "delivery-contract", "source-ledger"]),
+			inputs: {
+				"accepted-opening-clip": [prepared.outputRefs.ports["accepted-opening-clip"]],
+				"delivery-contract": [deliveryContract],
+				"source-ledger": [sourceLedger],
+			},
+		}), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+		if (!bound.ok) throw new Error("errorMessage" in bound ? bound.errorMessage : "Unexpected external wait");
+		expect(bound.outputRefs.ports["opening-prefix"]).toMatchObject({
+			protocolVersion: "tapcanvas.opening-prefix/v3",
+			sourceUnitRefs: [{ unitId: "unit:first", endOffset: 410 }],
+			acceptedOpeningClip: { clipId: `${sourceFingerprint}:clip:0`, contentHash: expect.any(String) },
+		});
+		expect(bound.outputRefs.evidence).toMatchObject({ sourceUnitRefCount: 1, sourceRangeCount: 1 });
+	});
+});
+
+describe("Workflow Agent Skill retrieval capability", () => {
+	it("does not remount Skill tools or force a skill-bundled role when disabled", async () => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "opening-agent-without-skills",
+			text: '{"value":"authored"}',
+			assets: [],
+			expectedDelivery: {},
+			deliveryEvidence: {},
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("opening-agent", "agents.logical-task/v2", {
+				workflowInstruction: "Create the opening artifact.",
+				workflowAgentOutputArtifactType: "tapcanvas.test-json/v1",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: { requiredStringFields: ["value"], allowedFields: ["value"] },
+				workflowAgentDeliveryRequirement: "Deliver the artifact.",
+				workflowAgentDefinitionId: "video-prompt-writer",
+				workflowAgentModelKey: "model-1",
+				workflowAgentMaxOutputTokens: 1024,
+				workflowSkillRetrieval: false,
+				workflowRequiredSkills: ["tapcanvas-video-prompt-writer"],
+				workflowAllowedTools: ["Skill", "skill_search", "custom_read_tool"],
+			}),
+			inputs: { tools: [["Skill", "skill_search"]] },
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result.ok).toBe(true);
+		const request = runAgent.mock.calls[0]?.[0];
+		expect(request).toMatchObject({ modelKey: "model-1", forcedAgentRole: "video-prompt-writer", disableRoleSkillBundle: true, requiredSkills: [] });
+		expect(request?.allowedTools).toContain("custom_read_tool");
+		expect(request?.allowedTools).not.toEqual(expect.arrayContaining(["Skill", "skill_search"]));
+		if (!result.ok) throw new Error("expected opening Agent node to execute");
+		expect(result.outputRefs.evidence).toMatchObject({
+			toolScopeDiagnostics: [{
+				code: "workflow_skill_retrieval_tools_not_mounted",
+				capability: "workflowSkillRetrieval",
+				configuredAgentRoleId: "video-prompt-writer",
+				roleSkillBundleDisabled: true,
+			}],
+		});
+	});
+});
+
+describe("Workflow Agent optional retrieval capability", () => {
+	it("omits optional retrieval tools when disabled and records the declared tool scope", async () => {
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "opening-agent",
+			text: '{"value":"authored"}',
+			assets: [],
+			expectedDelivery: {},
+			deliveryEvidence: {},
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("opening-agent", "agents.logical-task/v2", {
+				workflowInstruction: "Create the opening artifact.",
+				workflowAgentOutputArtifactType: "tapcanvas.test-json/v1",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: { requiredStringFields: ["value"], allowedFields: ["value"] },
+				workflowAgentDeliveryRequirement: "Deliver the artifact.",
+				workflowAgentDefinitionId: "video-prompt-writer",
+				workflowAgentModelKey: "model-1",
+				workflowAgentMaxOutputTokens: 16_384,
+				workflowAgentStructuredOutputTokenBudget: 16_384,
+				workflowAgentProjectContextPromptMode: "identity_only",
+				workflowKnowledgeRetrieval: false,
+				workflowPromptExampleMediaType: "video",
+			}),
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result.ok).toBe(true);
+		expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+			structuredOutputTokenBudget: 16_384,
+			projectContextPromptMode: "identity_only",
+			allowedTools: expect.arrayContaining(["skill_search", "Skill"]),
+		}));
+		const agentRequest = runAgent.mock.calls[0]?.[0];
+		expect(agentRequest?.allowedTools).not.toEqual(expect.arrayContaining([
+			"knowledge_search", "knowledge_candidates_page", "knowledge_read",
+			"prompt_example_search", "prompt_example_read",
+		]));
+		expect(agentRequest).not.toHaveProperty("promptExampleRetrievalScope");
+		if (!result.ok) throw new Error("expected opening Agent node to execute");
+		expect(result.outputRefs.evidence).toMatchObject({
+			toolScopeDiagnostics: [{
+				code: "workflow_optional_retrieval_tools_not_mounted",
+				capability: "workflowKnowledgeRetrieval",
+			}],
+		});
+	});
+
+	it("omits optional execution self-inspection when disabled without narrowing frozen inputs or Skills", async () => {
+		const frozenSource = { sourceId: "chapter-13", content: "complete frozen chapter source" };
+		const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({
+			taskId: "opening-agent-no-inspection",
+			text: '{"value":"authored"}',
+			assets: [],
+			expectedDelivery: {},
+			deliveryEvidence: {},
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		}));
+		const result = await executeRegisteredWorkflowNode(context({
+			node: node("opening-agent", "agents.logical-task/v2", {
+				workflowInstruction: "Create the opening artifact from the supplied source.",
+				workflowAgentOutputArtifactType: "tapcanvas.test-json/v1",
+				workflowAgentOutputEncoding: "json_object",
+				workflowAgentJsonObjectContract: { requiredStringFields: ["value"], allowedFields: ["value"] },
+				workflowAgentDeliveryRequirement: "Deliver the artifact.",
+				workflowAgentDefinitionId: "video-prompt-writer",
+				workflowAgentModelKey: "model-1",
+				workflowAgentMaxOutputTokens: 16_384,
+				workflowExecutionInspection: false,
+				workflowRequiredSkills: ["required-writer-skill"],
+				workflowAllowedTools: ["tapcanvas_execution_node_runs_get", "custom_read_tool"],
+			}),
+			inputs: {
+				input: [frozenSource],
+				tools: [["tapcanvas_execution_node_runs_get"]],
+			},
+		}), { runAgent, runJavascript: vi.fn(), runVideo });
+
+		expect(result.ok).toBe(true);
+		const agentRequest = runAgent.mock.calls[0]?.[0];
+		expect(agentRequest?.requiredSkills).toEqual(["required-writer-skill"]);
+		expect(agentRequest?.inputs.input).toEqual([frozenSource]);
+		expect(agentRequest?.allowedTools).toEqual(expect.arrayContaining([
+			"skill_search", "Skill", "custom_read_tool",
+		]));
+		expect(agentRequest?.allowedTools).not.toContain("tapcanvas_execution_node_runs_get");
+		if (!result.ok) throw new Error("expected opening Agent node to execute");
+		expect(result.outputRefs.evidence).toMatchObject({
+			toolScopeDiagnostics: [{
+				code: "workflow_execution_inspection_tool_not_mounted",
+				capability: "workflowExecutionInspection",
+				tools: ["tapcanvas_execution_node_runs_get"],
+			}],
+		});
+	});
+});
+
+it("runs each clip design with one item and a frozen schema instead of the whole chapter collection", async () => {
+  const { chapter, shared, clip, ledger } = stagedAuthoringFixture();
+  const runAgent = vi.fn(async (_request: WorkflowAgentRunRequest) => ({ taskId: "clip-design-task", text: JSON.stringify(clip), assets: [],
+    expectedDelivery: { version: 1 }, deliveryEvidence: { version: 1 }, deliveryVerification: { version: 2, status: "satisfied" },
+    requestTerminal: { status: "succeeded", reason: "delivery_verification_satisfied" } }));
+  const split = await executeRegisteredWorkflowNode(context({ node: node("split", "video.clip-design-inputs/v1", {}, "once", ["clip-design-inputs"]),
+    inputs: { "source-ledger": [ledger], "chapter-plan": [chapter], "chapter-assets": [shared] } }), { runAgent: vi.fn(), runJavascript: vi.fn(), runVideo });
+  if (!split.ok) throw new Error("errorMessage" in split ? split.errorMessage : "Unexpected external wait");
+  const result = await executeRegisteredWorkflowNode(context({ node: node("designer", "agents.logical-task/v2", {
+    workflowInstruction: "Design one clip", workflowAgentOutputArtifactType: "tapcanvas.clip-design/v2", workflowAgentOutputEncoding: "json_object",
+    workflowAgentJsonObjectContract: { allowedFields: ["clipIndex", "beat", "blockingPlan", "timing"], jsonSchema: { type: "object" } },
+    workflowAgentModelKey: "test-model", workflowAgentDefinitionId: "writer", workflowAgentDeliveryRequirement: "Deliver one clip",
+  }, "each", ["clip-designs"], 16, ["clip-design-inputs"]), inputs: { "clip-design-inputs": [split.outputRefs.ports["clip-design-inputs"]] } }), { runAgent, runJavascript: vi.fn(), runVideo });
+  expect(result.ok).toBe(true);
+  expect(runAgent).toHaveBeenCalledTimes(1);
+  expect(runAgent.mock.calls[0]?.[0]).toMatchObject({ inputs: { "clip-design-inputs": [{ clipIndex: 0 }] }, jsonObjectContract: { jsonSchema: {
+    properties: { clipIndex: { const: 0 }, blockingPlan: { properties: { backgroundObjectId: { enum: ["scene"] } } } },
+  } } });
+});
+
+it("materializes one shared image once and retains both object consumers through the writer join", async () => {
+  const projectContext = selectedAssetProjectContext(["shared"]);
+  const objectRegistry = ["first", "second"].map(objectId => ({ objectId, kind: "prop", name: objectId,
+    referenceRole: "prop", physicalIdentityKey: null, identityInvariant: objectId, imageSource: { mode: "reuse", assetIds: ["shared"] } }));
+  const prepared = prepareChapterAssetCollection({ assets: {objectRegistry,backgroundPlans:[]},
+    projectContext,executionId:"e",nodeId:"prepare" });
+  const resolveProjectAsset = vi.fn(async () => ({assetId:"shared",projectId:projectContext.projectId,
+    url:"https://assets.test/shared.png",mediaKind:"image" as const,mimeType:"image/png",nodeId:"shared-node",flowId:"flow-1",styleFingerprint:null}));
+  const runImage = vi.fn();
+  const outputs = await Promise.all(prepared.items.map(item => executeRegisteredWorkflowNode(context({
+    node: node(`image::item::${item.itemId}`,"tapcanvas.image.generate/v1",{
+      workflowImageModelKey:"gpt-image-2",workflowImageAspectRatio:"16:9",workflowImageSize:"2K",workflowImageReferenceAssetBindings:[],
+    }),inputs:{"asset-items":[item.value]},flowVersionData:{workflowProjectContext:projectContext},
+  }),{runAgent:vi.fn(),runJavascript:vi.fn(),runVideo,runImage,resolveProjectAsset})));
+  expect(resolveProjectAsset).toHaveBeenCalledTimes(1);
+  expect(runImage).not.toHaveBeenCalled();
+  const receipts = outputs.map(result => { if (!result.ok) throw new Error(JSON.stringify(result)); return result.outputRefs.ports.image; });
+  const bound = bindMaterializedAssetConsumers(createWorkflowCollection({collectionId:"receipts",producerNodeId:"image",producerPortId:"image",itemIds:["shared"],values:receipts}),
+    createWorkflowCollection({collectionId:"uses",producerNodeId:"consumers",producerPortId:"items",itemIds:["first","second"],
+      values:objectRegistry.map(object=>({assetId:"shared",role:`prop://${object.name}`,consumerClipIds:["clip-a"]}))}));
+  expect(bound.items).toHaveLength(2);
+  expect(bound.items.map(item => {
+    const value: unknown = item.value;
+    if (!value || typeof value !== "object" || !("nodeId" in value) || typeof value.nodeId !== "string") {
+      throw new Error("Materialized consumer receipt must contain a nodeId");
+    }
+    return value.nodeId;
+  })).toEqual(["shared-node", "shared-node"]);
+  expect(bound.items.map(item=>item.index)).toEqual([0,1]);
+  const joined = enrichVideoClipContextWithMaterializedAssets({contextItem:{beat:{clipId:"clip-a"},
+    assetObjectContracts:objectRegistry.map(object=>frozenWriterObjectContract({kind:"prop",name:object.name,referenceRole:"prop"}))},materializedAssetCollection:bound});
+  expect(joined.assetObjectContracts).toEqual([expect.objectContaining({name:"first",assetId:"shared",referenceImageNodeIds:["shared-node"]}),
+    expect.objectContaining({name:"second",assetId:"shared",referenceImageNodeIds:["shared-node"]})]);
+  expect(bound.items.map(item=>(item.value as {binding:{objectId:string}}).binding.objectId)).toEqual(["first","second"]);
+});
+
+
+describe("whole-film timeline execution", () => {
+  it("projects provider clips with ordered events and a shared in-motion boundary without assigning event timestamps", async () => {
+    const { deliveryContract, sequence } = globalSequenceFixture();
+    const runAgent = vi.fn();
+    const result = await executeRegisteredWorkflowNode(context({
+      node: node("sequence-project", "video.chapter-sequence.project/v2", {}, "once",
+        ["chapter-sequence", "clip-sequences", "clip-segments"], undefined, ["chapter-sequence", "delivery-contract"]),
+      inputs: { "chapter-sequence": [{ text: JSON.stringify(sequence) }], "delivery-contract": [deliveryContract] },
+    }), { runAgent, runJavascript: vi.fn(), runVideo });
+    if (!result.ok) throw new Error("errorMessage" in result ? result.errorMessage : "Unexpected external wait");
+    expect(result.outputRefs.ports["source-receipt"]).toMatchObject({ totalDurationSeconds: 60, clipIds: expect.any(Array) });
+    const clips = result.outputRefs.ports["clip-sequences"];
+    const sources = result.outputRefs.ports["clip-segments"];
+    if (!isWorkflowCollection(clips) || !isWorkflowCollection(sources)) throw new Error("Missing projected collections");
+    expect(clips.items).toHaveLength(2);
+    expect(sources.items.map(item => item.itemId)).toEqual(clips.items.map(item => item.itemId));
+    expect(clips.items[0]?.value).toMatchObject({
+      endBoundaryId: "in-motion", globalStartSeconds: 0, globalEndSeconds: 30,
+      endKeyframe: sequence.boundaries[1]!.keyframe,
+      storyEvents: expect.arrayContaining([expect.objectContaining({ eventId: "continuous-strike", eventIndex: 2, clipId: "clip-1" })]),
+    });
+    expect(clips.items[1]?.value).toMatchObject({
+      startBoundaryId: "in-motion", globalStartSeconds: 30, globalEndSeconds: 60,
+      startKeyframe: sequence.boundaries[1]!.keyframe,
+      storyEvents: expect.arrayContaining([expect.objectContaining({ eventId: "climax", eventIndex: 3, clipId: "clip-2" })]),
+    });
+    for (const item of clips.items) {
+      for (const event of (item.value as { storyEvents: readonly Record<string, unknown>[] }).storyEvents) {
+        expect(event).not.toHaveProperty("startSeconds");
+        expect(event).not.toHaveProperty("endSeconds");
+      }
+    }
+    expect(sources.items[0]?.value).toMatchObject({ sourceSlices: [{ text: deliveryContract.canvasFacts.authoritativeSources[0]!.content }] });
+    expect(sources.items[1]?.value).toMatchObject({ sourceSlices: [{ text: deliveryContract.canvasFacts.authoritativeSources[0]!.content }] });
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+
+  it("returns an incomplete provider Clip total to the same author without assigning event durations", async () => {
+    const { deliveryContract } = globalSequenceFixture();
+    const corrected = briefChapterScript();
+    const underfilled = { ...briefChapterScript(corrected.scenes[0]!.beats.map(beat => ({ ...beat, clipId: "clip-1" }))),
+      clips: [{ clipId: "clip-1", durationSeconds: 30 }] };
+    const calls: WorkflowAgentRunRequest[] = [];
+    const runAgent = vi.fn(async (request: WorkflowAgentRunRequest) => {
+      calls.push(request);
+      return { taskId: `time-budget-author-${calls.length}`, text: JSON.stringify(calls.length === 1 ? underfilled : corrected),
+        assets: [], expectedDelivery: { active: true }, deliveryEvidence: { logicalTaskId: "time-budget" }, deliveryVerification: null,
+        requestTerminal: { status: "succeeded" as const, reason: "agent_turn_succeeded" } };
+    });
+    const authorContext = context({ checkpointOutputRefs: vi.fn(async () => undefined),
+      node: node("time-budget-author", "agents.logical-task/v2", {
+        workflowInstruction: "按用户指定六十秒完整安排声画内容", workflowAgentOutputArtifactType: "tapcanvas.chapter-sequence/v4",
+        workflowAgentOutputEncoding: "json_object", workflowAgentJsonObjectContract: { allowedFields: Object.keys(chapterSequenceSchema.properties as object), jsonSchema: chapterSequenceSchema },
+        workflowAgentDeliveryRequirement: "完整章序列", workflowAgentDefinitionId: "writer", workflowAgentModelKey: "test-model",
+        workflowAgentFailurePolicy: "repair_with_correction", workflowAgentExecutionPolicy: "multi_inference", workflowAgentToolPolicy: "none",
+      }, "once", ["chapter-sequence"], undefined, ["delivery-contract"]), inputs: { "delivery-contract": [deliveryContract] },
+    });
+    const result = await executeRegisteredWorkflowNode(authorContext, { runAgent, runJavascript: vi.fn(), runVideo });
+    if (!result.ok) throw new Error(JSON.stringify(result));
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(calls[1]!.previousEvidence?.outputRepair).toMatchObject({ candidate: JSON.stringify(underfilled),
+      error: expect.stringContaining("expected=60:actual=30") });
+    const port = result.outputRefs.ports["chapter-sequence"];
+    if (!port || typeof port !== "object" || !("text" in port) || typeof port.text !== "string") throw new Error("Missing compiled chapter text");
+    const compiled = JSON.parse(port.text) as { totalDurationSeconds: number; storyEvents: Record<string, unknown>[] };
+    expect(compiled.totalDurationSeconds).toBe(60);
+    expect(compiled.storyEvents.at(-1)).toMatchObject({ clipId: "clip-2" });
+    expect(compiled.storyEvents.at(-1)).not.toHaveProperty("durationSeconds");
+  });
+
+  it("repairs a broken timeline reference in the same author chain before downstream projection", async () => {
+    const { deliveryContract } = globalSequenceFixture();
+    const sequence = briefChapterScript();
+    const broken = briefChapterScript(undefined, ["missing-span"]);
+    const reviewProjection = projectStructuredOutputReview({ version: 1, blocking: true });
+    const calls: WorkflowAgentRunRequest[] = [];
+    const runAgent = vi.fn(async (request: WorkflowAgentRunRequest) => {
+      calls.push(request);
+      return { taskId: `timeline-author-${calls.length}`, text: JSON.stringify(calls.length === 1 ? broken : sequence),
+        assets: [], expectedDelivery: { active: true }, deliveryEvidence: { logicalTaskId: "global-story" },
+        deliveryVerification: null, requestTerminal: { status: "succeeded", reason: "agent_turn_succeeded" },
+        ...(reviewProjection.review ? { structuredOutputReview: reviewProjection.review } : {}),
+        ...(reviewProjection.issue ? { structuredOutputReviewProjectionIssue: reviewProjection.issue } : {}) };
+    });
+    const authorContext = context({
+      checkpointOutputRefs: vi.fn(async () => undefined),
+      node: node("global-author", "agents.logical-task/v2", {
+        workflowInstruction: "依据完整来源提交全局故事时间线及其物理窗口",
+        workflowAgentOutputArtifactType: "tapcanvas.chapter-sequence/v4", workflowAgentOutputEncoding: "json_object",
+        workflowAgentJsonObjectContract: { allowedFields: Object.keys(chapterSequenceSchema.properties as object), jsonSchema: chapterSequenceSchema },
+        workflowAgentDeliveryRequirement: "交付完整全局时间线", workflowAgentDefinitionId: "writer", workflowAgentModelKey: "test-model",
+        workflowAgentFailurePolicy: "repair_with_correction", workflowAgentExecutionPolicy: "multi_inference", workflowAgentToolPolicy: "none",
+      }, "once", ["chapter-sequence"], undefined, ["delivery-contract"]),
+      inputs: { "delivery-contract": [deliveryContract] },
+    });
+    const result = await executeRegisteredWorkflowNode(authorContext, { runAgent, runJavascript: vi.fn(), runVideo });
+    if (!result.ok) throw new Error(JSON.stringify(result));
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(calls[1]?.previousEvidence).toMatchObject({ outputRepair: { candidate: JSON.stringify(broken) } });
+    expect(result.outputRefs.evidence.structuredOutputReview).toBeUndefined();
+    expect(result.outputRefs.evidence.structuredOutputReviewProjectionIssue).toEqual({
+      reason: "invalid_receipt",
+      droppedObservationCount: 0,
+    });
+  });
+});
+
+it("forwards nested each-item activity identity through the registered Agent executor", async () => {
+	const reportAgentActivity = vi.fn();
+	const runtimeNodeId = `parent::item::${"node-".repeat(70)}`;
+	const itemId = `item-${"segment-".repeat(45)}`;
+	const activity = {
+		lastActivityAt: "2026-09-29T02:30:00.000Z",
+		eventType: "status-update" as const,
+		phase: "agent_reasoning",
+		streamedOutputChars: 0,
+		observedEventCount: 1,
+	};
+	const runAgent = vi.fn(async (request: WorkflowAgentRunRequest) => {
+		await request.onAgentActivity?.(activity);
+		return {
+			taskId: "nested-item-agent",
+			text: "completed",
+			assets: [],
+			expectedDelivery: {},
+			deliveryEvidence: {},
+			deliveryVerification: { status: "satisfied" },
+			requestTerminal: { status: "succeeded" },
+		};
+	});
+	const result = await executeRegisteredWorkflowNode({
+		...context({
+			node: node(runtimeNodeId, "agents.logical-task/v2", {
+				label: "章节编排",
+				workflowInstruction: "Create this item",
+				workflowAgentOutputArtifactType: "tapcanvas.text/v1",
+				workflowAgentDeliveryRequirement: "Deliver this node's text",
+				workflowAgentDefinitionId: "workflow-transformer",
+				workflowAgentModelKey: "test-model",
+			}),
+		}),
+		runtimeItemLineage: [{ nodeId: "parent", portId: "items", itemId, index: 4 }],
+		runtimeItemIndex: 4,
+		reportAgentActivity,
+	}, { runAgent, runJavascript: vi.fn(), runVideo });
+
+	expect(result).toMatchObject({ ok: true });
+	expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+		onAgentActivity: reportAgentActivity,
+		agentActivityContext: {
+			displayName: "章节编排",
+			runtimeNodeId,
+			itemId,
+			itemIndex: 4,
+		},
+	}));
+	expect(reportAgentActivity).toHaveBeenCalledWith(activity);
+});
+
+
+it("keeps the author self-check receipt when the host compiles the reviewed script", async () => {
+  const { deliveryContract } = globalSequenceFixture();
+  const text = JSON.stringify(briefChapterScript());
+  const receipt = { version: 1 as const, status: "performed" as const,
+    scopeHash: `sha256:${"a".repeat(64)}`, candidateHash: `sha256:${createHash("sha256").update(text, "utf8").digest("hex")}`, evidenceFingerprint: "c".repeat(64),
+    criteria: [{ requirement: "Quoted line is verbatim", evidenceIds: ["immutable-node-scope"], assessment: "met" as const, rationale: "Copied from the source", revisionAction: null }],
+    execution: { model: "author-model", reasoningEffort: "low" },
+    inferenceCalls: [{ model: "author-model", reasoningEffort: "low", startedAt: "2026-10-03T00:00:00Z", finishedAt: "2026-10-03T00:00:01Z", status: "completed" as const, usage: { totalTokens: 10 } }] };
+  const outcome = normalizeWorkflowAgentOutcome({ id: "atomic-quote-1", assets: [], raw: { text, meta: {
+    runtime: normalizeAgentsRuntimeTraceSummary({ profile: "code", registeredToolNames: [], registeredTeamToolNames: [], requiredSkills: [], loadedSkills: [],
+      allowedSubagentTypes: [], requireAgentsTeamExecution: false, atomicAuthorSelfCheck: receipt }),
+    expectedDelivery: { active: true }, deliveryEvidence: { logicalTaskId: "atomic-quote-1" }, deliveryVerification: null,
+    requestTerminal: { status: "succeeded", reason: "agent_turn_succeeded" } } } });
+  const result = await executeRegisteredWorkflowNode(context({ node: node("atomic-quote-node", "agents.logical-task/v2", {
+    workflowInstruction: "Submit chapter timeline", workflowAgentOutputArtifactType: "tapcanvas.chapter-sequence/v4", workflowAgentOutputEncoding: "json_object",
+    workflowAgentJsonObjectContract: { allowedFields: Object.keys(chapterSequenceSchema.properties as object), jsonSchema: chapterSequenceSchema },
+    workflowAgentDeliveryRequirement: "Submit timeline", workflowAgentDefinitionId: "writer", workflowAgentModelKey: "author-model", workflowAgentToolPolicy: "none",
+  }, "once", ["chapter-sequence"], undefined, ["delivery-contract"]), inputs: { "delivery-contract": [deliveryContract] } }), { runAgent: vi.fn(async () => outcome), runJavascript: vi.fn(), runVideo });
+  if (!result.ok) throw new Error(JSON.stringify(result));
+  const typedArtifact = result.outputRefs.artifacts.find(artifact => artifact.type === "tapcanvas.chapter-sequence/v4");
+  const delivered = JSON.parse(String(typedArtifact?.value)) as { speechEvents: Array<{ text: string; textOrigin: string }> };
+  expect(delivered.speechEvents[0]).toMatchObject({ text: "有大招", textOrigin: "authored" });
+  expect(result.outputRefs.evidence.atomicAuthorSelfCheck).toEqual(receipt);
+  expect(result.outputRefs.evidence.atomicAuthorSelfCheckProjectionIssue).toBeUndefined();
+});
+
+it.each(["performed", "not_performed"] as const)("preserves raw HTTP atomic selfcheck through normalized outcome and typed node evidence (%s)", async (status) => {
+  const { deliveryContract } = globalSequenceFixture();
+  const script = briefChapterScript();
+  const sequence = compileChapterScript(script, deliveryContract);
+  const text = `  ${JSON.stringify(script, null, 2)}  `;
+  const receipt = { version: 1 as const, status,
+    scopeHash: `sha256:${"a".repeat(64)}`, candidateHash: `sha256:${createHash("sha256").update(text, "utf8").digest("hex")}`, evidenceFingerprint: "c".repeat(64),
+    criteria: status === "performed" ? [{ requirement: "Current node scope", evidenceIds: ["immutable-node-scope"], assessment: "diagnostic" as const, rationale: "Optional evidence missing", revisionAction: null }] : [],
+    ...(status === "not_performed" ? { reason: "disabled_by_execution_contract" } : {}),
+    execution: { model: "author-model", reasoningEffort: "high" },
+    inferenceCalls: status === "performed" ? [{ model: "author-model", reasoningEffort: "high", startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:00:01Z", status: "completed" as const, usage: { totalTokens: 10 } }] : [] };
+  const rawHttp = JSON.parse(JSON.stringify({ id: "atomic-http-1", text, trace: { runtime: {
+    profile: "code", registeredToolNames: [], registeredTeamToolNames: [], requiredSkills: [], loadedSkills: [], allowedSubagentTypes: [], requireAgentsTeamExecution: false,
+    atomicAuthorSelfCheck: receipt,
+  } } }));
+  const runtime = normalizeAgentsRuntimeTraceSummary(rawHttp.trace.runtime);
+  const normalizedAgentOutcome = normalizeWorkflowAgentOutcome({ id: rawHttp.id, assets: [], raw: { text: rawHttp.text, meta: { runtime,
+    expectedDelivery: { active: true }, deliveryEvidence: { logicalTaskId: "atomic-http-1" }, deliveryVerification: null, requestTerminal: { status: "succeeded", reason: "agent_turn_succeeded" } } } });
+  expect(normalizedAgentOutcome.atomicAuthorSelfCheck).toEqual(receipt);
+  const result = await executeRegisteredWorkflowNode(context({ node: node("atomic-proof-node", "agents.logical-task/v2", {
+    workflowInstruction: "Submit chapter timeline", workflowAgentOutputArtifactType: "tapcanvas.chapter-sequence/v4", workflowAgentOutputEncoding: "json_object",
+    workflowAgentJsonObjectContract: { allowedFields: Object.keys(chapterSequenceSchema.properties as object), jsonSchema: chapterSequenceSchema },
+    workflowAgentDeliveryRequirement: "Submit timeline", workflowAgentDefinitionId: "writer", workflowAgentModelKey: "author-model", workflowAgentToolPolicy: "none",
+  }, "once", ["chapter-sequence"], undefined, ["delivery-contract"]), inputs: { "delivery-contract": [deliveryContract] } }), { runAgent: vi.fn(async () => normalizedAgentOutcome), runJavascript: vi.fn(), runVideo });
+  if (!result.ok) throw new Error(JSON.stringify(result));
+  expect(result.outputRefs.evidence.atomicAuthorSelfCheck).toEqual(receipt);
+  expect(result.outputRefs.evidence.atomicAuthorSelfCheckProjectionIssue).toBeUndefined();
+  expect(result.outputRefs.evidence.executorCompleted).toBe(true);
+  expect(result.outputRefs.ports["chapter-sequence"]).toHaveProperty("atomicAuthorSelfCheck", receipt);
+  const typedArtifact = result.outputRefs.artifacts.find(artifact => artifact.type === "tapcanvas.chapter-sequence/v4");
+  expect(JSON.parse(String(typedArtifact?.value))).toEqual(sequence);
+  // Both observation statuses retain the exact source response identity.
+  expect(receipt.candidateHash).not.toBe(`sha256:${createHash("sha256").update(JSON.stringify(script), "utf8").digest("hex")}`);
+  expect(receipt.candidateHash).not.toBe(`sha256:${createHash("sha256").update(String(typedArtifact?.value), "utf8").digest("hex")}`);
+  expect(JSON.parse(String(typedArtifact?.value))).not.toHaveProperty("atomicAuthorSelfCheck");
+  const oldReceiptOutcome = normalizeWorkflowAgentOutcome({ id: "wrong-candidate", assets: [], raw: { text: "different candidate", meta: { runtime, requestTerminal: { status: "succeeded" } } } });
+  expect(oldReceiptOutcome.atomicAuthorSelfCheck).toBeUndefined();
+  expect(oldReceiptOutcome.atomicAuthorSelfCheckProjectionIssue?.reason).toBe("candidate_identity_mismatch");
+  expect(oldReceiptOutcome.requestTerminal).toMatchObject({ status: "succeeded" });
 });

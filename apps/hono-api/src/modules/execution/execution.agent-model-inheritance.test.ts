@@ -29,6 +29,13 @@ describe("workflow Agent model inheritance", () => {
 		})).toBe("");
 	});
 
+	it("uses the frozen direct user selection for every Agent in a manual workflow", () => {
+		expect(resolveWorkflowAgentModelKey({
+			flowVersionData: { workflowDirectAgentModelSelection: { model: " selected-text-model ", source: "user_preference" } },
+			configuredModelKey: "old-node-model",
+		})).toBe("selected-text-model");
+	});
+
 	it("records an explicit immutable model cutover without retaining the old active model", () => {
 		const snapshot = applyWorkflowAgentModelCutover({
 			nodes: [],
@@ -74,4 +81,17 @@ describe("workflow Agent model inheritance", () => {
 			requestedAt: "2026-08-23T00:00:00.000Z",
 		})).toThrow("target matches");
 	});
+});
+
+describe("frozen execution preferences", () => {
+ it.each(["priority", "default"] as const)("preserves preferences through serialization and authorized model cutover (%s)", (serviceTier) => {
+  const source = { workflowInitiatingAgentExecution: { model: "source", apiStyle: "responses", reasoningEffort: "xhigh", serviceTier } };
+  const snapshot = applyWorkflowAgentModelCutover(JSON.parse(JSON.stringify(source)), {
+   targetModelKey: "target", apiStyle: "responses", authorizedBy: "user", authorizationSource: "admin", requestedAt: "2026-09-10T00:00:00Z",
+  });
+  expect(parseWorkflowInitiatingAgentExecution(snapshot)).toEqual({ model: "target", apiStyle: "responses", reasoningEffort: "xhigh", serviceTier });
+ });
+ it("rejects malformed persisted preferences rather than silently dropping them", () => {
+  expect(() => parseWorkflowInitiatingAgentExecution({ workflowInitiatingAgentExecution: { model: "m", apiStyle: "chat", serviceTier: "invalid" } })).toThrow();
+ });
 });

@@ -1,8 +1,11 @@
+import { chatModelSettingsPayload, selectedModelCapabilities } from './chatModelCapabilities'
+import { ChatModelControl } from './ChatModelControl'
+import { useChatModelSettings } from './useChatModelSettings'
 import React from 'react'
-import { ActionIcon, Badge, Button, Group, Menu, Modal, Paper, Popover, ScrollArea, Select, Stack, Text, Textarea, Tooltip } from '@mantine/core'
+import { AsyncDialogLoading } from '../AsyncLoadingFeedback'
+import { ActionIcon, Badge, Button, Group, Menu, Modal, Paper, ScrollArea, Stack, Text, Textarea, Tooltip } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
-import { IconArrowsMaximize, IconArrowsMinimize, IconBook2, IconChevronDown, IconChevronLeft, IconChevronRight, IconFileText, IconHistory, IconMapPin, IconMessageCircle, IconMessagePlus, IconMicrophone, IconMicrophoneOff, IconPaperclip, IconPhoto, IconPhotoCog, IconPlayerStop, IconRefresh, IconSend2, IconSparkles, IconTerminal2, IconTrash, IconUpload, IconUsersGroup, IconX } from '@tabler/icons-react'
-import { GenerationPrefsModal } from './GenerationPrefsModal'
+import { IconArrowsMaximize, IconArrowsMinimize, IconBook2, IconChevronDown, IconChevronLeft, IconChevronRight, IconFileText, IconHistory, IconMapPin, IconMessageCircle, IconMessagePlus, IconMicrophone, IconMicrophoneOff, IconPhoto, IconPlayerStop, IconRefresh, IconSend2, IconSparkles, IconTerminal2, IconTrash, IconUpload, IconX } from '@tabler/icons-react'
 import { SkillPickerPopover } from './SkillPickerPopover'
 import {
   PendingUserInputChoices,
@@ -49,7 +52,7 @@ import {
 } from '../../api/server'
 import { toast } from '../toast'
 import { TapCanvasMark } from '../brand/TapCanvasMark'
-import { resolveNonOverlappingPosition, useRFStore } from '../../canvas/store'
+import { isCanvasNodeDragActive, resolveNonOverlappingPosition, useRFStore } from '../../canvas/store'
 import { isImageKind } from '../../canvas/utils/edgeRules'
 import { collectCanvasMediaUrlKeys, isMediaUrlOnCanvas } from './assistantAssetDedupe'
 import type { Node } from '@xyflow/react'
@@ -81,7 +84,7 @@ import {
   isLocallySettledTurnMessage,
   isChatTurnStateUncertain,
   reconcileRecoveredProgressMessages,
-  projectRecoveredFailedTurnMessage,
+  projectRecoveredTerminalTurnMessage,
   removeTrailingHistoryAssistantMessagesForNonterminalTurn,
   resolveRecoveredChatTurnTerminalText,
   shouldQueueAfterAuthoritativeAdmission,
@@ -90,11 +93,12 @@ import {
   shouldTerminateChatTurnForStreamError,
   terminalChatMessageKind,
 } from './chatTurnRecovery'
-import { isChatTurnResumeError, useChatTurnRecovery } from './useChatTurnRecovery'
+import { isChatTurnResumeError, suppressChatTurnRecovery, useChatTurnRecovery } from './useChatTurnRecovery'
 import {
   canSubmitChatComposer,
   shouldAwaitChatSubmissionReadiness,
   type ChatSubmissionOrigin,
+  resolveChatSubmissionText,
 } from './chatSubmissionAdmission'
 import { recoverAcceptedChatTurnAfterTransportLoss } from './durableChatTransportRecovery'
 import { resolveChatInterruptPresentation } from './chatInterruptPresentation'
@@ -126,9 +130,9 @@ import {
   type ChatAssetInputRole,
 } from './chatRequestPayload'
 import {
-  formatChatTurnVerdictSummary,
   formatTurnVerdictSummary,
   isFailedChatTurn,
+  projectTerminalTurnVerdict,
   resolveAssistantReplyText,
   readChatTurnVerdict,
   resolveChatTerminalProjection,
@@ -145,7 +149,7 @@ import {
 import { buildChatInspirationQuickActions, type ChatQuickActionPreset } from './quickActions'
 import { shouldAttachSelectedCanvasAssets } from './chatRequestAssetScope'
 import { useChatCommandStore, type ChatSendCommand, type GenerationProposalContext } from './chatCommandStore'
-import { XIAOT_ROLE, TEAM_ROLES, getTeamRole, teamRoleAvatar, teamRoleName, type TeamRole } from './teamRoster'
+import { XIAOT_ROLE, getTeamRole, teamRoleAvatar, teamRoleName, type TeamRole } from './teamRoster'
 import { getProjectRoleSkillAssignments, useProjectRoleSkillConfigStore } from './roleSkillConfigStore'
 import { chapterOverrideToChatContext } from '../../projects/chapterCreative'
 import { useVoiceInput } from './useVoiceInput'
@@ -180,7 +184,8 @@ import { terminalizeInterruptedTodos, terminalizeOpenTodos } from './todoLifecyc
 import {
   buildAgentContinuationSummary,
   buildToolProgressSummary,
-  buildToolStepSummary,
+  presentTaskExecution,
+  type PresentedTaskStatus,
   readPresentedToolName,
   resolvePresentedToolName,
   type PresentedToolStatus,
@@ -195,6 +200,8 @@ import {
   type ChatSkillReference,
 } from './chatSkillReference'
 import {
+  loadSelectedChatModel,
+  resolveAvailableChatModelOption,
   persistChatModelValue,
   readStoredChatModelValue,
   resolveSelectedChatModelRequest,
@@ -346,6 +353,10 @@ type SendOptions = {
   workflowKey?: string
   requestedWorkflowExecutionVariant?: 'full_video' | 'first_video'
   generationProposal?: GenerationProposalContext
+  /** 本地等待 Flow 创建的需求对应的队列气泡，真正发送时先移除以避免重复展示。 */
+  queuedMessageId?: string
+  queuedProjectId?: string
+  queuedChapterId?: string
 }
 
 type UploadedReferenceAssetMeta = {
@@ -1327,7 +1338,7 @@ const TOOL_STEP_LABELS: Record<string, string> = {
   // 视频
   video_generate: '调用工具生成视频',
   video_generate_to_canvas: '生成视频到画布',
-  equipped_workflow_run: '启动已装配工作流',
+  equipped_workflow_run: '启动已装配一键成片工作流',
   workflow_execution_inspect: '检查一键成片执行状态',
   workflow_resume: '恢复一键成片执行',
   video_concat: '拼接视频片段',
@@ -1345,7 +1356,7 @@ const TOOL_STEP_LABELS: Record<string, string> = {
   creategroup: '画布打组',
   reflowlayout: '整理画布布局',
   link_existing_asset: '关联已有素材',
-  capture_director_scene: '导演台机位取景',
+  director_desk: '操作导演台',
   add_director_console: '搭建导演台',
   // 分镜 / 故事板
   shot_table_critic: '校验分镜表',
@@ -1363,7 +1374,6 @@ const TOOL_STEP_LABELS: Record<string, string> = {
   memory_search: '检索经验记忆',
   memory_reflect: '复盘经验记忆',
   // 流程控制
-  record_user_intent: '确认任务目标',
   skill: '加载技能',
   skill_search: '查找技能',
   skill_lookup: '查找技能',
@@ -1493,10 +1503,10 @@ function KnowledgeTaskExternal({ steps, now }: { steps: ChatToolStep[]; now: num
   )
 }
 
-// todo/计划类与 schema 取数类工具是元操作，不进任务清单子步骤。
+// 意图记录、todo/计划与 schema 取数属于内部元操作，仅保留原始诊断，不展示为用户任务步骤。
 function shouldHideToolStep(toolName: unknown): boolean {
   const normalized = normalizeToolStepName(toolName)
-  return !normalized || normalized.includes('todo') || normalized === 'get_tool_schema' || normalized === 'update_plan'
+  return !normalized || normalized.includes('todo') || normalized === 'get_tool_schema' || normalized === 'update_plan' || normalized === 'record_user_intent'
 }
 
 function normalizeChatTodoItems(
@@ -2016,23 +2026,6 @@ function buildImplicitChatRequest(input: {
   }
 }
 
-type AttachMenuTargetProps = React.ComponentPropsWithoutRef<typeof ActionIcon> & {
-  tooltip: string
-}
-
-const AttachMenuTarget = React.forwardRef<HTMLButtonElement, AttachMenuTargetProps>(function AttachMenuTarget(
-  { tooltip, ...props },
-  ref,
-): JSX.Element {
-  return (
-    <Tooltip className="tc-ai-chat__tooltip" label={tooltip} withArrow>
-      <ActionIcon ref={ref} className="tc-ai-chat__attach" variant="subtle" aria-label="参考图" {...props}>
-        <IconPaperclip className="tc-ai-chat__attach-icon" size={16} />
-      </ActionIcon>
-    </Tooltip>
-  )
-})
-
 function ReferenceImagesStrip({
   urls,
   onClear,
@@ -2113,6 +2106,7 @@ function ChatTaskPlan({
   toolSteps,
   active,
   turnDurationMs,
+  taskStatus,
 }: {
   messageId: string
   todoItems: ChatTodoItem[]
@@ -2120,6 +2114,7 @@ function ChatTaskPlan({
   active: boolean
   /** 本轮总耗时（毫秒）；仅终态传入，渲染在清单底部 */
   turnDurationMs?: number
+  taskStatus?: PresentedTaskStatus
 }): JSX.Element | null {
   const [detailsExpanded, setDetailsExpanded] = React.useState(false)
   const [expandOverrides, setExpandOverrides] = React.useState<Record<number, boolean>>({})
@@ -2143,8 +2138,8 @@ function ChatTaskPlan({
     return () => window.clearInterval(timer)
   }, [hasRunningStage, hasRunningStep])
   React.useEffect(() => {
-    if (hasToolFailure) setDetailsExpanded(true)
-  }, [hasToolFailure])
+    setDetailsExpanded(taskStatus === 'failed' && hasToolFailure)
+  }, [hasToolFailure, taskStatus])
   // 批量出图逐张进度（"已完成 3/8 张"）：后端经画布频道推送，按 toolCallId 关联到 running 步骤。
   const progressByCall = useToolProgressStore((s) => s.byCallId)
   // Knowledge tools are shown once in their own evidence strip; production/tool steps stay attached to todo rows.
@@ -2187,17 +2182,10 @@ function ChatTaskPlan({
   }, [todoSignature])
   if (!hasTodos && !toolSteps.length) return null
 
-  const runningStep = [...toolSteps].reverse().find((step) => step.status === 'running') ?? null
-  const failedStep = [...toolSteps].reverse().find((step) =>
-    step.severity !== 'warning' &&
-    (step.status === 'failed' || step.status === 'denied' || step.status === 'blocked'),
-  ) ?? null
-  const currentStep = runningStep ?? failedStep
   const failedCount = toolSteps.filter((step) =>
     step.severity !== 'warning' &&
     (step.status === 'failed' || step.status === 'denied' || step.status === 'blocked'),
   ).length
-  const warningCount = toolSteps.filter((step) => step.severity === 'warning').length
   const completedTodoCount = todoItems.filter((item) => item.status === 'completed').length
   const executionStage = resolveChatExecutionStage({
     todoItems,
@@ -2205,22 +2193,12 @@ function ChatTaskPlan({
     active,
     observedAtMs: now,
   })
-  // 失败优先于阶段摘要：折叠态直接给出失败工具名，错误色（对齐 DSH ToolRow 的
-  // "error row 折叠摘要即失败首行" 设计），避免用户必须展开清单才能看到异常。
-  const summary = executionStage && !failedStep
-    ? `当前阶段 · ${executionStage.label}`
-    : failedStep
-      ? `执行异常 · ${failedStep.label}`
-      : toolSteps.length > 0
-      ? buildToolStepSummary({
-          totalCount: toolSteps.length,
-          currentToolLabel: currentStep?.label ?? null,
-          failedCount,
-          warningCount,
-          active: active && runningStep !== null,
-        })
-      : `任务进度 · ${completedTodoCount}/${todoItems.length}`
-  const summaryState = executionStage && !failedStep ? 'active' : failedStep ? 'failed' : 'completed'
+  const { label: summary, state: summaryState } = presentTaskExecution({
+    status: taskStatus,
+    active,
+    stageLabel: executionStage?.label,
+    totalCount: toolSteps.length,
+  })
 
   const renderSubsteps = (steps: ChatToolStep[], keyPrefix: string) => (
     <div className="tc-ai-plan__substeps">
@@ -2263,10 +2241,10 @@ function ChatTaskPlan({
         onClick={() => setDetailsExpanded((expanded) => !expanded)}
       >
         <span className={`tc-ai-plan__summary-mark tc-ai-plan__summary-mark--${summaryState}`} aria-hidden="true">
-          {summaryState === 'active' ? <span className="tc-ai-plan__spinner" /> : summaryState === 'completed' ? '✓' : '!'}
+          {summaryState === 'active' ? <span className="tc-ai-plan__spinner" /> : summaryState === 'completed' ? '✓' : summaryState === 'failed' ? '!' : '·'}
         </span>
         <span className="tc-ai-plan__summary-label">{summary}</span>
-        {failedCount > 0 ? (
+        {summaryState === 'failed' && failedCount > 0 ? (
           <span className="tc-ai-plan__summary-failed-count" aria-label={`${failedCount} 次异常`}>{failedCount}</span>
         ) : null}
         {executionStage && formatDurationMs(executionStage.elapsedMs) ? (
@@ -2281,7 +2259,7 @@ function ChatTaskPlan({
       {todoItems.map((item, index) => {
         const steps = stepsByAnchor.get(index) ?? []
         const expandable = steps.length > 0
-        const defaultExpanded = steps.some((step) => (
+        const defaultExpanded = taskStatus === 'failed' && steps.some((step) => (
           step.severity !== 'warning'
           && (step.status === 'failed' || step.status === 'denied' || step.status === 'blocked')
         ))
@@ -2327,9 +2305,9 @@ function ChatTaskPlan({
               <span className="tc-ai-plan__stats-value">{toolSteps.length}</span>
             </span>
           ) : null}
-          {failedCount > 0 ? (
-            <span className="tc-ai-plan__stats-group tc-ai-plan__stats-group--failed">
-              <span className="tc-ai-plan__stats-label">异常</span>
+          {detailsExpanded && failedCount > 0 ? (
+            <span className="tc-ai-plan__stats-group">
+              <span className="tc-ai-plan__stats-label">历史未成功调用</span>
               <span className="tc-ai-plan__stats-value">{failedCount}</span>
             </span>
           ) : null}
@@ -2405,7 +2383,9 @@ function ChatBubbleView({
   const taskPlanActive = message.kind === 'progress'
   const planToolSteps = React.useMemo(
     () => {
-      const steps = Array.isArray(message.toolSteps) ? message.toolSteps : []
+      const steps = Array.isArray(message.toolSteps)
+        ? message.toolSteps.filter((step) => !shouldHideToolStep(step.toolName))
+        : []
       if (message.kind === 'progress') return steps
       return steps.map((step) =>
         step.status === 'running' ? { ...step, status: 'failed' as const } : step,
@@ -2512,7 +2492,7 @@ function ChatBubbleView({
             ) : null}
             {!isUser && message.turnVerdict?.status === 'failed' ? (
               <Badge className="tc-ai-chat-bubble__verdict-badge" size="xs" radius="sm" variant="light" color="red">
-                {$('结构失败')}
+                {$('执行失败')}
               </Badge>
             ) : null}
           </Group>
@@ -2554,7 +2534,7 @@ function ChatBubbleView({
                 ))}
               </div>
             ) : null}
-            <ChatTaskPlan messageId={message.id} todoItems={planTodoItems} toolSteps={planToolSteps} active={taskPlanActive} />
+            <ChatTaskPlan messageId={message.id} todoItems={planTodoItems} toolSteps={planToolSteps} active={taskPlanActive} taskStatus={message.logicalTaskStatus} />
           </div>
         ) : (
           <>
@@ -2579,6 +2559,7 @@ function ChatBubbleView({
               toolSteps={planToolSteps}
               active={taskPlanActive}
               turnDurationMs={message.turnDurationMs}
+              taskStatus={message.logicalTaskStatus}
             />
           ) : null}
           <div className="tc-ai-chat-bubble__content tc-ai-chat-markdown">
@@ -2787,6 +2768,13 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
   const [mode, setMode] = React.useState<'compact' | 'expanded' | 'maximized'>(initialLayoutPreference.mode)
   const freshConversationBaseKeyRef = React.useRef<string | null>(null)
   const [bubbleVisualState, setBubbleVisualState] = React.useState<'bubble' | 'panel'>(() => resolveInitialBubbleVisualState(initialLayoutPreference))
+  const pendingChatResourceDemand = useChatCommandStore((state) => Boolean(state.pending) || state.deferredUntilFlow.length > 0)
+  const chatResourceDemand = bubbleVisualState === 'panel' || pendingChatResourceDemand
+  const [chatResourcesActivated, setChatResourcesActivated] = React.useState(chatResourceDemand)
+  const chatResourcesEnabled = chatResourceDemand || chatResourcesActivated
+  React.useEffect(() => {
+    if (chatResourceDemand) setChatResourcesActivated(true)
+  }, [chatResourceDemand])
   const modeBeforeMaximizeRef = React.useRef<'compact' | 'expanded'>(initialLayoutPreference.mode)
   const previousModeRef = React.useRef<'compact' | 'expanded' | 'maximized'>(initialLayoutPreference.mode)
   const bubbleTransitionTimerRef = React.useRef<number | null>(null)
@@ -2820,7 +2808,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     loading: chatModelsLoading,
     error: chatModelsError,
     retry: retryChatModels,
-  } = useModelOptionsState('text')
+  } = useModelOptionsState('text', { enabled: chatResourcesEnabled })
   const [selectedChatModelValue, setSelectedChatModelValue] = React.useState<string | null>(readStoredChatModelValue)
   const selectChatModel = React.useCallback((value: string | null) => {
     const normalized = typeof value === 'string' ? value.trim() : ''
@@ -2840,33 +2828,21 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
   )
   React.useEffect(() => {
     if (chatModelOptions.length === 0) return
-    if (selectedChatModelValue) return
-    const firstValue = typeof chatModelOptions[0]?.value === 'string' ? chatModelOptions[0].value.trim() : ''
-    if (firstValue) selectChatModel(firstValue)
+    const defaultOption = resolveAvailableChatModelOption(chatModelOptions, selectedChatModelValue)
+    if (defaultOption && defaultOption.value !== selectedChatModelValue) selectChatModel(defaultOption.value)
   }, [chatModelOptions, selectChatModel, selectedChatModelValue])
+  const { settings: chatModelSettings, setSettings: setChatModelSettings } = useChatModelSettings()
+  const chatModelSettingsRef = React.useRef(chatModelSettings)
+  chatModelSettingsRef.current = chatModelSettings
   const selectedChatModelRequest = React.useMemo(
     () => resolveSelectedChatModelRequest(selectedChatModelOption),
     [selectedChatModelOption],
   )
-  // 智能团手动指派：手动选中某个子 agent → 本轮/后续发送强制由该角色干活（覆盖小T自动委派）。
-  // null = 自动（默认）。持久化到 localStorage，跨会话保留用户偏好。
-  const [forcedAgentRole, setForcedAgentRole] = React.useState<string | null>(() => {
-    try { return localStorage.getItem('tapcanvas-chat-forced-role') || null } catch { return null }
-  })
-  const [rosterOpened, setRosterOpened] = React.useState(false)
-  const [genPrefsOpened, setGenPrefsOpened] = React.useState(false)
   // 预热全局生成偏好缓存；具体模型仍必须通过实时系统模型目录验证。
   React.useEffect(() => {
     void loadGenerationPrefs().catch((error: unknown) => {
       console.error('[generation-preferences] preload failed', error)
     })
-  }, [])
-  const selectForcedRole = React.useCallback((roleId: string | null) => {
-    setForcedAgentRole(roleId)
-    try {
-      if (roleId) localStorage.setItem('tapcanvas-chat-forced-role', roleId)
-      else localStorage.removeItem('tapcanvas-chat-forced-role')
-    } catch { /* ignore */ }
   }, [])
   const [messages, setMessages] = React.useState<ChatMessage[]>(() => [])
   const pendingUserInputAnswerRef = React.useRef<{
@@ -2921,6 +2897,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     projectId: sessionScopeProjectId,
     fixedTarget: 'agents',
   })
+  const deferredChatCommands = useChatCommandStore((state) => state.deferredUntilFlow)
   const codexTimeline = React.useMemo(
     () => buildCodexTimeline({
       tasks: codexDispatch.sessionTasks,
@@ -2930,11 +2907,25 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
   )
   const displayMessages = React.useMemo<ChatMessage[]>(() => {
     if (archivedConversation) return archivedConversation.messages
+    const deferredMessages: ChatMessage[] = deferredChatCommands
+      .filter((command) => (
+        command.queuedProjectId === sessionScopeProjectId
+        && (command.queuedChapterId || '') === sessionScopeChapterId
+      ))
+      .map((command) => ({
+      id: command.queuedMessageId || `m_user_queued_flow_${command.nonce}`,
+      localKey: command.queuedMessageId || `m_user_queued_flow_${command.nonce}`,
+      role: 'user',
+      ts: formatNowTime(),
+      content: command.displayText?.trim() || command.text,
+      queuedMode: 'follow_up',
+      }))
     return [
       ...messages.filter((message) => message.source !== 'codex'),
+      ...deferredMessages,
       ...codexTimeline,
     ]
-  }, [archivedConversation, codexTimeline, messages])
+  }, [archivedConversation, codexTimeline, deferredChatCommands, messages, sessionScopeChapterId, sessionScopeProjectId])
   // 会话作用域标识（project / project:flow / project:chapter），也是 base 槽位的 key。
   const conversationScopeKey = buildProjectScopedChatSessionBaseKey({
     projectId: sessionScopeProjectId,
@@ -2973,6 +2964,17 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     [liveChatRunScope, sessionScopeFlowId, sessionScopeProjectId],
   )
   const reconcileLiveChatAsyncArtifacts = useLiveChatRunStore((s) => s.reconcileAsyncArtifacts)
+  React.useEffect(() => {
+    let reconciledNodes = useRFStore.getState().nodes
+    reconcileLiveChatAsyncArtifacts(reconciledNodes)
+    return useRFStore.subscribe((state) => {
+      // Asset receipts can arrive after chat settlement. Freeze this work
+      // during drag frames, then reconcile once against the final snapshot.
+      if (state.nodes === reconciledNodes || isCanvasNodeDragActive()) return
+      reconciledNodes = state.nodes
+      reconcileLiveChatAsyncArtifacts(state.nodes)
+    })
+  }, [reconcileLiveChatAsyncArtifacts])
   const videoRunsById = useVideoRunStore((s) => s.runsById)
   const videoRunSnapshotAppliedAt = useVideoRunStore((s) => s.snapshotAppliedAt)
   const scopedVideoRuns = React.useMemo(
@@ -3113,6 +3115,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
   // conversation, so the server can replace both its public transcript and
   // agents checkpoint before the model sees the new request.
   const resetSessionOnNextSendRef = React.useRef(false)
+  const deferredFlowDispatchingNonceRef = React.useRef<number | null>(null)
   const typewriterRunIdRef = React.useRef(0)
   const shouldAutoScrollRef = React.useRef(true)
 
@@ -3191,25 +3194,6 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
   React.useEffect(() => {
     chatSessionBaseKeyRef.current = chatSessionBaseKey
   }, [chatSessionBaseKey])
-  // 对话模型目录状态的实时镜像：send 是稳定回调，闭包里的 chatModelsLoading 可能还是
-  // 目录加载完成前的旧值（首页挂起 prompt 经 setTimeout 触发），直接检查会误报
-  // 「仍在加载」/「未选择模型」；程序化发送等待目录就绪后必须用实时值构建请求。
-  const chatModelsLoadingRef = React.useRef(chatModelsLoading)
-  React.useEffect(() => {
-    chatModelsLoadingRef.current = chatModelsLoading
-  }, [chatModelsLoading])
-  const chatModelsErrorRef = React.useRef(chatModelsError)
-  React.useEffect(() => {
-    chatModelsErrorRef.current = chatModelsError
-  }, [chatModelsError])
-  const selectedChatModelOptionRef = React.useRef(selectedChatModelOption)
-  React.useEffect(() => {
-    selectedChatModelOptionRef.current = selectedChatModelOption
-  }, [selectedChatModelOption])
-  const selectedChatModelRequestRef = React.useRef(selectedChatModelRequest)
-  React.useEffect(() => {
-    selectedChatModelRequestRef.current = selectedChatModelRequest
-  }, [selectedChatModelRequest])
   const selectedChatModelValueRef = React.useRef(selectedChatModelValue)
   React.useEffect(() => {
     selectedChatModelValueRef.current = selectedChatModelValue
@@ -3270,6 +3254,13 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
           phase: 'final',
           kind: terminalChatMessageKind(turn.logicalTaskState.status),
           logicalTaskStatus: turn.logicalTaskState.status,
+          ...(projectTerminalTurnVerdict(resolveChatTerminalProjection({
+            trace: { logicalTaskState: turn.logicalTaskState },
+          })) ? {
+            turnVerdict: projectTerminalTurnVerdict(resolveChatTerminalProjection({
+              trace: { logicalTaskState: turn.logicalTaskState },
+            }))!,
+          } : null),
         })))
       } finally {
         checking = false
@@ -3468,20 +3459,23 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     })
   }, [recoveredNeedsInputTurn, sending])
 
-  // A refresh can first discover a turn only after the durable runtime has
-  // already failed it. There is then no prior local progress card for the
-  // transition effect below to patch, so materialize the complete server
-  // summary directly from the terminal snapshot.
+  // Reconcile terminal text from the authoritative snapshot even when the
+  // browser missed the active-to-terminal transition. A local final badge
+  // cannot preserve a stale progress summary over the server finalResponse.
   React.useEffect(() => {
     const terminalTurn = chatTurnSnapshot?.turn
     if (
       sending
       || chatTurnSnapshot?.activeTurn !== false
-      || terminalTurn?.state !== 'failed'
+      || !terminalTurn
+      || (terminalTurn.logicalTaskState.status !== 'succeeded'
+        && terminalTurn.logicalTaskState.status !== 'failed'
+        && terminalTurn.logicalTaskState.status !== 'cancelled')
     ) return
     activePendingIdRef.current = ''
-    setMessages((current) => projectRecoveredFailedTurnMessage(current, {
+    setMessages((current) => projectRecoveredTerminalTurnMessage(current, {
       turnId: terminalTurn.turnId,
+      status: terminalTurn.logicalTaskState.status as 'succeeded' | 'failed' | 'cancelled',
       summary: resolveRecoveredChatTurnTerminalText(terminalTurn),
       startedAt: formatMessageTime(terminalTurn.startedAt),
     }))
@@ -3507,6 +3501,10 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         kind: 'error',
         // 本地 settle 标记：防止 3210 恢复投影在后续 poll 里把它改回 thinking/progress（#8）。
         logicalTaskStatus: 'failed',
+        turnVerdict: projectTerminalTurnVerdict({
+          status: 'failed',
+          reason: unknownTurn.reasonCode || 'chat_turn_state_unknown',
+        })!,
         ...(Array.isArray(message.todoSnapshot)
           ? { todoSnapshot: terminalizeInterruptedTodos(message.todoSnapshot) }
           : null),
@@ -3534,6 +3532,15 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         kind: terminalChatMessageKind(terminalTurn.logicalTaskState.status),
         // 本地 settle 标记（同 unknown 分支）：终态回合不再被恢复投影改回进行中（#8）。
         logicalTaskStatus: terminalTurn.logicalTaskState.status,
+        ...(projectTerminalTurnVerdict({
+          status: terminalTurn.logicalTaskState.status,
+          reason: terminalTurn.logicalTaskState.reasonCode || 'logical_task_reason_missing',
+        }) ? {
+          turnVerdict: projectTerminalTurnVerdict({
+            status: terminalTurn.logicalTaskState.status,
+            reason: terminalTurn.logicalTaskState.reasonCode || 'logical_task_reason_missing',
+          })!,
+        } : null),
       })))
   }, [chatTurnSnapshot, recoveredActiveTurn])
 
@@ -3585,6 +3592,18 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
   React.useEffect(() => {
     const sessionKey = String(effectiveChatSessionKey || '').trim()
     shouldAutoScrollRef.current = true
+    // A project/flow/chapter conversation keeps one canonical session key, so
+    // starting a new conversation is represented by a server-side
+    // resetSession on the next request rather than by rotating the key. The
+    // `currentTurnActive` dependency changes as soon as that request starts;
+    // loading history at that exact point races the reset and can merge the
+    // previous transcript back in front of the new user message. Defer the
+    // snapshot until the reset request has been accepted (the flags are
+    // cleared in the stream's onOpen) and the next turn-state transition
+    // triggers this effect again.
+    if (conversationResetPendingRef.current || resetSessionOnNextSendRef.current) {
+      return
+    }
     const requestVersion = historyLoadVersionRef.current + 1
     historyLoadVersionRef.current = requestVersion
     const prevSessionKey = loadedSessionKeyRef.current
@@ -3858,8 +3877,9 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
   const reloadAgentSkill = skillLibrary.load
 
   React.useEffect(() => {
+    if (!chatResourcesEnabled) return
     void reloadAgentSkill()
-  }, [reloadAgentSkill])
+  }, [chatResourcesEnabled, reloadAgentSkill])
 
   React.useEffect(() => {
     setActiveSkill((current) => {
@@ -4349,6 +4369,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     activeStreamInterruptRef.current = null
     setSending(false)
     setInterruptingChatTurn(true)
+    suppressChatTurnRecovery(sessionKeyForInterrupt, turnId)
     activePublicTurnIdRef.current = ''
     // 点击瞬间就把当前流式气泡里仍在转圈的工具子步/任务收尾，不等异步 send() 的 catch。
     // 关键：正在跑的那次 send() 闭包可能是 HMR/旧标签页加载前的旧代码，它的 catch 收不了
@@ -4369,8 +4390,8 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
             ? {
                 toolSteps: message.toolSteps.map((step) =>
                   step.status === 'running' ? { ...step, status: 'cancelled' as const } : step,
-                ),
-              }
+                  ),
+                }
             : null),
         })),
       )
@@ -4452,17 +4473,20 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     })
   }, [activeSkillContextName, hasExplicitTargetImage, normalizedDraft, referenceImages.length, selectedCanvasNodeContext])
   const canSendMessage = Boolean(normalizedDraft || implicitSendRequest)
+  const chatFlowReady = Boolean(sessionScopeChapterId || sessionScopeFlowId || !sessionScopeProjectId)
   const canSubmitToSelectedTarget =
     codexDispatch.target === 'codex'
       ? Boolean(normalizedDraft && codexDispatch.canDispatch && sessionScopeProjectId)
-      : canSubmitChatComposer({
-          hasMessage: canSendMessage,
-          turnReady: chatTurnReadyForNewRequest,
-          modelLoading: chatModelsLoading,
-          modelError: chatModelsError,
-          hasSelectedModel: Boolean(selectedChatModelOption && selectedChatModelRequest),
-          preparing: submissionPreparing,
-        })
+      : chatFlowReady
+        ? canSubmitChatComposer({
+            hasMessage: canSendMessage,
+            turnReady: chatTurnReadyForNewRequest,
+            modelLoading: chatModelsLoading,
+            modelError: chatModelsError,
+            hasSelectedModel: Boolean(selectedChatModelOption && selectedChatModelRequest),
+            preparing: submissionPreparing,
+          })
+        : Boolean(canSendMessage && !submissionPreparing)
   const selectedTargetSendLabel =
     codexDispatch.target === 'codex' ? '发送给本地 Codex' : $('发送')
 
@@ -4470,9 +4494,22 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     queueMode: 'steering' | 'follow_up',
     options?: SendOptions,
   ): Promise<boolean> => {
-    const text = String(options?.text ?? draft ?? '').trim()
+    const text = resolveChatSubmissionText({ text: options?.text, draft })
     const sessionKey = String(effectiveChatSessionKey || '').trim()
     if (!text) return false
+    const liveQueueScope = resolveLiveChatSessionScope(useUIStore.getState())
+    if (liveQueueScope.projectId && !liveQueueScope.chapterId && !liveQueueScope.flowId) {
+      const queuedMessageId = `m_user_queued_flow_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      useChatCommandStore.getState().enqueueUntilFlow({
+        text,
+        ...(options?.displayText ? { displayText: options.displayText } : {}),
+        queuedMessageId,
+        queuedProjectId: liveQueueScope.projectId,
+      })
+      if (!options?.text) setDraft((current) => String(current || '').trim() === text ? '' : current)
+      toast('已加入队列，等待当前项目 Flow 创建完成后自动发送。', 'info')
+      return true
+    }
     if (!sessionKey) {
       toast('当前对话缺少稳定 sessionKey，无法持久化运行中消息。', 'error')
       return false
@@ -4490,6 +4527,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         sessionKey,
         queueMode,
         ...toAgentsChatModelPayload(selectedChatModelRequest),
+        ...chatModelSettingsPayload(selectedChatModelRequest.model, chatModelSettingsRef.current),
         ...(options?.generationProposal ? { chatContext: { generationProposal: options.generationProposal } } : {}),
       })
       setMessages((prev) => [...prev, {
@@ -4521,6 +4559,54 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     const startsFreshConversation = options?.freshConversation === true
     const submissionOrigin = options?.origin ?? 'programmatic'
     const shouldAwaitReadiness = shouldAwaitChatSubmissionReadiness(submissionOrigin)
+    const liveScopeBeforeIdentity = resolveLiveChatSessionScope(useUIStore.getState())
+    const projectFlowPending = Boolean(
+      liveScopeBeforeIdentity.projectId
+      && !liveScopeBeforeIdentity.chapterId
+      && !liveScopeBeforeIdentity.flowId,
+    )
+    if (projectFlowPending) {
+      const queuedText = resolveChatSubmissionText({ text: options?.text, draft }) || implicitSendRequest?.prompt || ''
+      if (!queuedText) return
+      const queuedDisplayText = String(options?.displayText ?? '').trim()
+        || String(options?.text ?? '').trim()
+        || implicitSendRequest?.displayText
+        || queuedText
+      const queuedMessageId = `m_user_queued_flow_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      useChatCommandStore.getState().enqueueUntilFlow({
+        text: queuedText,
+        ...(queuedDisplayText !== queuedText ? { displayText: queuedDisplayText } : {}),
+        ...(options?.requiredSkills ? { requiredSkills: [...options.requiredSkills] } : {}),
+        ...(options?.attachCanvasContext !== undefined ? { attachCanvasContext: options.attachCanvasContext } : {}),
+        ...(options?.freshConversation ? { freshConversation: true } : {}),
+        ...(options?.workflowKey ? { workflowKey: options.workflowKey } : {}),
+        ...(options?.requestedWorkflowExecutionVariant
+          ? { requestedWorkflowExecutionVariant: options.requestedWorkflowExecutionVariant }
+          : {}),
+        ...(options?.executionToolPolicy
+          ? {
+              executionToolPolicy: {
+                mode: options.executionToolPolicy.mode,
+                allowedTools: [...options.executionToolPolicy.allowedTools],
+              },
+            }
+          : {}),
+        ...(options?.canvasNodeId ? { canvasNodeId: options.canvasNodeId } : {}),
+        ...(options?.forcedAgentRole ? { forcedAgentRole: options.forcedAgentRole } : {}),
+        ...(options?.allowedSubagentTypes?.length
+          ? { allowedSubagentTypes: [...options.allowedSubagentTypes] }
+          : {}),
+        ...(options?.requireAgentsTeamExecution === true ? { requireAgentsTeamExecution: true } : {}),
+        ...(options?.generationProposal ? { generationProposal: options.generationProposal } : {}),
+        queuedMessageId,
+        queuedProjectId: liveScopeBeforeIdentity.projectId,
+        ...(liveScopeBeforeIdentity.chapterId ? { queuedChapterId: liveScopeBeforeIdentity.chapterId } : {}),
+      })
+      setDraft('')
+      if (mode === 'compact') setMode('expanded')
+      toast('已加入队列，等待当前项目 Flow 创建完成后自动发送。', 'info')
+      return
+    }
     // 会话身份（base key）解析完成前 snapshot 必为 null：此时直接发送会落到
     // 「空 base 临时 key」上，身份解析完成后 effectiveChatSessionKey 变化 →
     // 历史 effect 清空消息并掐断活流（恢复竞态 #1）。按钮路径已由
@@ -4570,7 +4656,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         ? chatTurnSnapshot
         : chatTurnSnapshotRef.current
     if (!startsFreshConversation && currentTurnActive) {
-      const queuedText = String(options?.text ?? '').trim()
+      const queuedText = resolveChatSubmissionText({ text: options?.text, draft })
       // 恢复快照可能刚好跨过容器重启/进程退出边界。发送前以 durable status 再验一次：
       // 旧物理回合已不存在时，本次点击必须直接创建新回合，不能把消息排进无人消费的死队列。
       if (!sending && recoveredActiveTurn) {
@@ -4587,14 +4673,14 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         }
         if (freshSnapshot && shouldQueueIntoRecoveredTurn(freshSnapshot)) {
           if (queuedText) {
-            await enqueueRunningMessage('follow_up', { ...options, text: queuedText })
+            await enqueueRunningMessage('follow_up', options)
           }
           return
         }
       } else {
         // 本浏览器确实正在发送的回合继续使用 durable follow-up，不顶替当前执行。
         if (queuedText) {
-          await enqueueRunningMessage('follow_up', { ...options, text: queuedText })
+          await enqueueRunningMessage('follow_up', options)
         }
         return
       }
@@ -4632,53 +4718,42 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
       }
       return
     }
-    const explicitText = String(options?.text ?? draft ?? '').trim()
+    const explicitText = resolveChatSubmissionText({ text: options?.text, draft })
     const requestText = explicitText || implicitSendRequest?.prompt || ''
     const explicitDisplayText = String(options?.displayText ?? '').trim()
     const displayText = explicitDisplayText || explicitText || implicitSendRequest?.displayText || ''
     if (!requestText) return
-    // 对话模型目录就绪等待（与身份等待同一模式）：send 是稳定回调，闭包里的
-    // chatModelsLoading 可能还是目录加载完成前的旧值（首页挂起 prompt 经
-    // setTimeout 触发），直接检查会误报「仍在加载」；程序化发送在这里等待目录
-    // 就绪（上限 5s），而不是失败丢消息。目录加载失败仍如实报错，不兜底。
+    let sendChatModelOption = selectedChatModelOption
+    let sendChatModelRequest = selectedChatModelRequest
     if (shouldAwaitReadiness) {
-      const modelCatalogDeadline = Date.now() + 5_000
-      while (chatModelsLoadingRef.current && Date.now() < modelCatalogDeadline) {
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 80))
+      try {
+        const selection = await loadSelectedChatModel(selectedChatModelValueRef.current)
+        selectChatModel(selection.option.value)
+        sendChatModelOption = selection.option
+        sendChatModelRequest = selection.request
+      } catch (error: unknown) {
+        console.error('[ai-chat] model admission failed', {
+          origin: submissionOrigin,
+          selectedModel: selectedChatModelValueRef.current,
+          message: error instanceof Error ? error.message : String(error),
+        })
+        toast(error instanceof Error ? error.message : String(error), 'error')
+        return
+      }
+    } else {
+      if (chatModelsError) {
+        toast(`对话模型目录加载失败：${chatModelsError.message}`, 'error')
+        return
+      }
+      if (chatModelsLoading) {
+        toast('对话模型目录仍在加载，请等待加载完成后重试。', 'error')
+        return
       }
     }
-    const sendChatModelsError = submissionOrigin === 'composer'
-      ? chatModelsError
-      : chatModelsErrorRef.current
-    const sendChatModelsLoading = submissionOrigin === 'composer'
-      ? chatModelsLoading
-      : chatModelsLoadingRef.current
-    if (sendChatModelsError) {
-      toast(`对话模型目录加载失败：${sendChatModelsError.message}`, 'error')
-      return
-    }
-    if (sendChatModelsLoading) {
-      toast('对话模型目录仍在加载，请等待加载完成后重试。', 'error')
-      return
-    }
-    const sendChatModelOption = submissionOrigin === 'composer'
-      ? selectedChatModelOption
-      : selectedChatModelOptionRef.current
-    const sendChatModelRequest = submissionOrigin === 'composer'
-      ? selectedChatModelRequest
-      : selectedChatModelRequestRef.current
     if (!sendChatModelOption || !sendChatModelRequest) {
-      const unavailableModel = String(
-        submissionOrigin === 'composer'
-          ? selectedChatModelValue
-          : selectedChatModelValueRef.current,
-      ).trim()
-      toast(
-        unavailableModel
-          ? `对话模型 ${unavailableModel} 当前不可用，请从系统模型目录重新选择。`
-          : '未选择可用对话模型，请先从系统模型目录选择。',
-        'error',
-      )
+      toast(selectedChatModelValue
+        ? `对话模型 ${selectedChatModelValue} 当前不可用，请从系统模型目录重新选择。`
+        : '未选择可用对话模型，请先从系统模型目录选择。', 'error')
       return
     }
     if (currentProjectId) {
@@ -4762,9 +4837,11 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     const explicitCanvasNodeId = String(options?.canvasNodeId || '').trim()
     const requestSelectedCanvasNodeContext = directorScopeActive || explicitCanvasNodeId
       ? null // 导演台模式不带「选中节点」的 asset 引用，避免误导；节点锚定改走下面 requestCanvasNodeId
-      : (shouldAttachCanvasContext ? selectedCanvasNodeContext : null)
+      : (shouldAttachCanvasContext && selectedCanvasNodeContext?.kind !== 'workflowExecution'
+        ? selectedCanvasNodeContext
+        : null)
     // 导演台模式：强制把 canvasNodeId 锚到「你打开的那个导演台节点」，不依赖画布选中态（支持一画布多导演台）。
-    // 小T 据此（+ tapcanvas-director-console 技能）用它当 capture_director_scene 的 id，操作这一个、不新建。
+    // 小T 据此把当前导演台节点作为宿主锚点，通过 tapcanvas_director_desk 操作已打开的导演台工程。
     const requestCanvasNodeId = explicitCanvasNodeId || (directorScopeActive
       ? (liveSendScope.directorNodeId as string)
       : (requestSelectedCanvasNodeContext?.nodeId || ''))
@@ -4968,7 +5045,11 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         ...(options?.workflowKey ? { workflowKey: options.workflowKey } : null),
       }
 
-      setMessages((prev) => [...prev, userMsg, pendingMsg])
+      setMessages((prev) => [
+        ...prev.filter((message) => message.id !== options?.queuedMessageId),
+        userMsg,
+        pendingMsg,
+      ])
 
       setDraft('')
       if (mode === 'compact') setMode('expanded')
@@ -5034,14 +5115,12 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
           })()
         : undefined
       const workflowForcedAgentRole = String(options?.forcedAgentRole || '').trim()
-      const uiForcedAgentRole = forcedAgentRole && getTeamRole(forcedAgentRole)?.assignable
-        ? forcedAgentRole
-        : ''
       const requestPayload: AgentsChatRequestDto = {
         vendor: 'agents',
         prompt: promptPayload,
         clientPendingId: pendingId,
         ...toAgentsChatModelPayload(sendChatModelRequest),
+        ...chatModelSettingsPayload(sendChatModelRequest.model, chatModelSettingsRef.current),
         ...(displayText && displayText !== requestText ? { displayPrompt: displayText } : {}),
         ...(requestSessionKey ? { sessionKey: requestSessionKey } : {}),
         ...(resetSession ? { resetSession: true } : {}),
@@ -5089,7 +5168,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
             ? {
                 selectedReference: {
                   nodeId: requestSelectedCanvasNodeContext.nodeId,
-                  label: requestSelectedCanvasNodeContext.label,
+                  label: requestSelectedCanvasNodeContext.label.slice(0, 200),
                   ...(requestSelectedCanvasNodeContext.kind ? { kind: requestSelectedCanvasNodeContext.kind } : {}),
                   ...(selectedReferenceAnchorBindings?.length
                     ? { anchorBindings: selectedReferenceAnchorBindings }
@@ -5120,8 +5199,8 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
             : {}),
         },
         mode: requestExecution.mode,
-        ...((workflowForcedAgentRole || uiForcedAgentRole)
-          ? { forcedAgentRole: workflowForcedAgentRole || uiForcedAgentRole }
+        ...((workflowForcedAgentRole)
+          ? { forcedAgentRole: workflowForcedAgentRole }
           : {}),
         ...(options?.allowedSubagentTypes?.length
           ? { allowedSubagentTypes: [...options.allowedSubagentTypes] }
@@ -5130,13 +5209,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
           ? { requireAgentsTeamExecution: true }
           : {}),
         temperature: 0.7,
-        ...((() => {
-          const DIRECTOR_SKILL = 'tapcanvas-director-console'
-          let skills = options?.requiredSkills ?? []
-          // 导演台打开时强制内联导演台技能（编辑优先 + 禁 Seedance 8 段收尾自检），不靠模型自匹配。
-          if (directorScopeActive && !skills.includes(DIRECTOR_SKILL)) skills = [DIRECTOR_SKILL, ...skills]
-          return skills.length ? { requiredSkills: skills } : {}
-        })()),
+        ...(options?.requiredSkills?.length ? { requiredSkills: [...options.requiredSkills] } : {}),
         ...(referenceImagesPayload.length ? { referenceImages: referenceImagesPayload } : {}),
         ...(assetInputsPayload.length ? { assetInputs: assetInputsPayload } : {}),
         ...(pendingUserInputAnswerRef.current ? { requestUserInputResponse: pendingUserInputAnswerRef.current } : {}),
@@ -5144,6 +5217,11 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
       pendingUserInputAnswerRef.current = null
       const resp = await new Promise<AgentsChatResponseDto>((resolve, reject) => {
         let stopStream: (() => void) | null = null
+        // Bind cancellation before admission resolves. Without this controller,
+        // a timeout or user interrupt during a 429/network retry could only
+        // call the transport's abort closure after the promise eventually
+        // returned, allowing a stale request to create a task later.
+        const streamAbortController = new AbortController()
         let settled = false
         let resultReceived = false
         let lastStreamError: (Error & { code?: string; details?: unknown }) | null = null
@@ -5192,6 +5270,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         const finalize = (resolver: () => void) => {
           if (settled) return
           settled = true
+          streamAbortController.abort()
           streamedTextBuffer.flush()
           streamedTextBuffer.dispose()
           activeStreamInterruptRef.current = null
@@ -5231,6 +5310,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         }, 30_000)
 
         activeStreamInterruptRef.current = () => {
+          streamAbortController.abort()
           finalize(() => reject(new Error(CHAT_STREAM_ABORT_ERROR)))
         }
         // 记下本条流所属的会话作用域：scope-change 时据此判断该不该掐它（见 activeStreamScopeRef）。
@@ -5238,6 +5318,9 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
 
         void agentsChatStream(requestPayload, {
           onOpen: ({ turnId }) => {
+            if (options?.queuedMessageId) {
+              useChatCommandStore.getState().ackDeferredUntilFlow(options.queuedMessageId)
+            }
             if (resetSession) {
               resetSessionOnNextSendRef.current = false
               conversationResetPendingRef.current = false
@@ -5331,7 +5414,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                 const callId = String(event.data.toolCallId || '').trim()
                 const step = liveToolSteps.find((item) => item.callId === callId)
                 if (step) {
-                  step.label = `加载 ${skillName}`
+                  step.label = resolveChatSkillToolLabel({ skill: skillName, sectionId: event.data.sectionId, resource: event.data.resource }, []) ?? `加载 ${skillName}`
                   if (event.data.phase === 'completed') {
                     const status = String(event.data.status || '').trim().toLowerCase()
                     step.status = status === 'failed'
@@ -5378,7 +5461,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                 status: completedStatus,
                 severity: event.data.severity,
               })
-              if (!streamedReply && !completedIsDeferred) {
+              if (!streamedReply && !completedIsDeferred && !shouldHideToolStep(presentedToolName)) {
                 updatePendingSummary(buildToolProgressSummary({
                   label: presentedToolLabel,
                   phase: event.data.phase,
@@ -5606,6 +5689,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
           onError: (error) => {
             finalize(() => reject(error))
           },
+          signal: streamAbortController.signal,
         }, conversationIdRef.current)
           .then((abort) => {
             if (settled) {
@@ -5622,9 +5706,11 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
       const { displayText: parsedReply, plan: canvasPlan } = parseCanvasPlanFromReply(rawReply)
       const hasWrongCanvasPlanTag = /<tcanvas_canvas_plan>/i.test(rawReply) || /tcanvas_canvas_plan/i.test(rawReply)
       const turnVerdict = readChatTurnVerdict(resp)
-      const turnVerdictSummary = formatChatTurnVerdictSummary(resp)
+      const terminalProjection = resolveChatTerminalProjection(resp)
+      const displayedTurnVerdict = projectTerminalTurnVerdict(terminalProjection) ?? turnVerdict
+      const turnVerdictSummary = formatTurnVerdictSummary(displayedTurnVerdict)
       const failedTurn = isFailedChatTurn(resp)
-      const failedTurnMessage = turnVerdictSummary || '结构失败：本轮没有形成有效结果'
+      const failedTurnMessage = turnVerdictSummary || '执行失败：本轮没有形成有效结果'
       const missingCanvasPlan = shouldShowMissingCanvasPlanError({
         hasCanvasPlan: Boolean(canvasPlan),
         hasWrongCanvasPlanTag,
@@ -5727,7 +5813,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
       if (!streamedReply && reply) {
         await animateAssistantReply(pendingId, reply)
       }
-      const projectedTerminalStatus = resolveChatTerminalProjection(resp).status
+      const projectedTerminalStatus = terminalProjection.status
       const projectedToolSteps = resolveDeferredToolSteps({
         visible: liveToolSteps,
         deferred: deferredToolFailures,
@@ -5779,7 +5865,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                 ),
               }
             : null),
-          ...(turnVerdict ? { turnVerdict } : null),
+          ...(displayedTurnVerdict ? { turnVerdict: displayedTurnVerdict } : null),
           ...(Array.isArray(resp.trace?.diagnosticFlags) ? { diagnosticFlags: resp.trace?.diagnosticFlags } : null),
           ...(resp.pendingUserInput ? { pendingUserInput: resp.pendingUserInput } : null),
           // blocks：服务端 canonical（最后一轮）与流式沉淀（含早轮 choices/tc-card）按 id 合并，
@@ -5928,9 +6014,18 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                             : 'failed' as const,
                         }
                       : step,
-                  ),
-                }
+                ),
+              }
               : null),
+            ...(projectTerminalTurnVerdict({
+              status: recoveredTurn.logicalTaskState.status,
+              reason: recoveredTurn.logicalTaskState.reasonCode || 'logical_task_reason_missing',
+            }) ? {
+              turnVerdict: projectTerminalTurnVerdict({
+                status: recoveredTurn.logicalTaskState.status,
+                reason: recoveredTurn.logicalTaskState.reasonCode || 'logical_task_reason_missing',
+              })!,
+            } : null),
           })))
           return
         }
@@ -6021,6 +6116,15 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                     phase: 'final',
                     kind: terminalChatMessageKind(terminalTurn.logicalTaskState.status),
                     logicalTaskStatus: terminalTurn.logicalTaskState.status,
+                    ...(projectTerminalTurnVerdict({
+                      status: terminalTurn.logicalTaskState.status,
+                      reason: terminalTurn.logicalTaskState.reasonCode || 'logical_task_reason_missing',
+                    }) ? {
+                      turnVerdict: projectTerminalTurnVerdict({
+                        status: terminalTurn.logicalTaskState.status,
+                        reason: terminalTurn.logicalTaskState.reasonCode || 'logical_task_reason_missing',
+                      })!,
+                    } : null),
                   }),
                 ))
                 return
@@ -6036,7 +6140,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         void refreshChatTurnStatus()
       }
     }
-  }, [activeSkill, agentSkills, aiChatWatchAssetsEnabled, animateAssistantReply, chatModelsError, chatModelsLoading, chatSessionBaseKey, chatSessionLane, chatTurnChecking, chatTurnSnapshot, chatTurnStatusError, completeLiveChatRun, creativePhase, currentChapterCreativeOverride, currentFlowId, currentProjectId, currentProjectName, currentTurnActive, directorChatScopeNodeId, draft, effectiveChatSessionKey, enqueueRunningMessage, failLiveChatRun, forcedAgentRole, implicitSendRequest, messages, mode, recordLiveChatRunEvent, recoveredActiveTurn, refreshChatTurnStatus, replicateTargetImage, selectedCanvasNodeContext, selectedChatModelOption, selectedChatModelRequest, selectedChatModelValue, sending, startLiveChatRun])
+  }, [activeSkill, agentSkills, aiChatWatchAssetsEnabled, animateAssistantReply, chatModelsError, chatModelsLoading, chatSessionBaseKey, chatSessionLane, chatTurnChecking, chatTurnSnapshot, chatTurnStatusError, completeLiveChatRun, creativePhase, currentChapterCreativeOverride, currentFlowId, currentProjectId, currentProjectName, currentTurnActive, directorChatScopeNodeId, draft, effectiveChatSessionKey, enqueueRunningMessage, failLiveChatRun, implicitSendRequest, messages, mode, recordLiveChatRunEvent, recoveredActiveTurn, refreshChatTurnStatus, replicateTargetImage, selectedCanvasNodeContext, selectedChatModelOption, selectedChatModelRequest, selectedChatModelValue, sending, startLiveChatRun])
 
   const submitToSelectedTarget = React.useCallback(async () => {
     if (codexDispatch.target === 'agents') {
@@ -6111,12 +6215,30 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
   React.useEffect(() => {
     const run = (cmd: ChatSendCommand | null) => {
       if (!cmd) return
+      if (
+        (cmd.queuedProjectId && cmd.queuedProjectId !== sessionScopeProjectId)
+        || (cmd.queuedChapterId && cmd.queuedChapterId !== sessionScopeChapterId)
+      ) {
+        submissionPreparingRef.current = false
+        toast('请求所属项目或章节已切换，未向当前对话发送原画布任务。', 'error')
+        return
+      }
+      if (!cmd.queuedMessageId) {
+        submissionPreparingRef.current = true
+        setSubmissionPreparing(true)
+      }
       if (cmd.freshConversation) {
         // This effect is declared before the UI callback that backs the
         // toolbar's "new conversation" button. Keep the production reset
         // local here so one-click film dispatch cannot hit a TDZ during the
         // first render. A new conversation id also creates a fresh server
         // session and prevents old runs/BeatSheets from being reused.
+        // Invalidate any history request that was started for the previous
+        // conversation before clearing the local projection. Project-scoped
+        // conversations keep the same canonical session key, so the stale
+        // request would otherwise still pass the key check and reinsert the
+        // old transcript while the reset request is being accepted.
+        historyLoadVersionRef.current += 1
         revokeCurrentTurnForConversationReset()
         invalidateChatTurnRecovery()
         clearCreationSession()
@@ -6152,6 +6274,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
       setMode((m) => (m === 'compact' ? 'expanded' : m))
       void send({
         text: cmd.text,
+        ...(cmd.generationProposal ? { generationProposal: cmd.generationProposal } : {}),
         freshConversation: cmd.freshConversation === true,
         ...(cmd.displayText ? { displayText: cmd.displayText } : {}),
         ...(cmd.requiredSkills ? { requiredSkills: cmd.requiredSkills } : {}),
@@ -6171,16 +6294,28 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         ...(cmd.requireAgentsTeamExecution === true
           ? { requireAgentsTeamExecution: true }
           : {}),
+        ...(cmd.queuedMessageId ? { queuedMessageId: cmd.queuedMessageId } : {}),
+        ...(cmd.queuedProjectId ? { queuedProjectId: cmd.queuedProjectId } : {}),
+        ...(cmd.queuedChapterId ? { queuedChapterId: cmd.queuedChapterId } : {}),
         ...(cmd.workflowKey ? { workflowKey: cmd.workflowKey } : {}),
         ...(cmd.requestedWorkflowExecutionVariant
           ? { requestedWorkflowExecutionVariant: cmd.requestedWorkflowExecutionVariant }
           : {}),
         attachCanvasContext: cmd.attachCanvasContext ?? true,
+      }).finally(() => {
+        if (!cmd.queuedMessageId) {
+          submissionPreparingRef.current = false
+          setSubmissionPreparing(false)
+        }
+        if (cmd.queuedMessageId && deferredFlowDispatchingNonceRef.current === cmd.nonce) {
+          deferredFlowDispatchingNonceRef.current = null
+        }
       })
       freshConversationBaseKeyRef.current = null
     }
     const consumeAndRun = () => {
-      const pending = useChatCommandStore.getState().pending
+      const commandStore = useChatCommandStore.getState()
+      const pending = commandStore.pending
       // One dialog owns one live SSE renderer. Keep an explicitly fresh task
       // queued until that local transport closes; never reinterpret it as a
       // follow-up of the previous logical task.
@@ -6188,20 +6323,33 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
       // 中断确认期间不消费画布命令：send() 的 currentTurnActive 含 interruptingChatTurn，
       // 此刻消费会把它静默排进「正在被取消的回合」的 follow_up 队列（#6）。
       // 中断落定后本 effect 重跑（deps 含 interruptingChatTurn）再消费执行。
-      if (interruptingChatTurn) return
-      run(useChatCommandStore.getState().consume())
+      if (interruptingChatTurn || (submissionPreparingRef.current && !sending)) return
+      if (pending) {
+        submissionPreparingRef.current = true
+        run(commandStore.consume())
+        return
+      }
+      const flowReady = Boolean(sessionScopeChapterId || sessionScopeFlowId || !sessionScopeProjectId)
+      if (!flowReady) return
+      const deferred = commandStore.peekDeferredUntilFlow({
+        projectId: sessionScopeProjectId,
+        chapterId: sessionScopeChapterId,
+      })
+      if (!deferred || deferredFlowDispatchingNonceRef.current === deferred.nonce) return
+      deferredFlowDispatchingNonceRef.current = deferred.nonce
+      run(deferred)
     }
     consumeAndRun()
     const unsub = useChatCommandStore.subscribe((s) => {
-      if (s.pending) consumeAndRun()
+      if (s.pending || (s.deferredUntilFlow.length > 0 && (sessionScopeChapterId || sessionScopeFlowId || !sessionScopeProjectId))) consumeAndRun()
     })
     return unsub
-  }, [clearCreationSession, interruptingChatTurn, invalidateChatTurnRecovery, revokeCurrentTurnForConversationReset, send, sending])
+  }, [clearCreationSession, interruptingChatTurn, invalidateChatTurnRecovery, revokeCurrentTurnForConversationReset, send, sending, submissionPreparing, sessionScopeChapterId, sessionScopeFlowId, sessionScopeProjectId])
 
   // 把「回合在飞」状态同步给选项卡等对话外组件（DataCardViews 据此提示"点选后排队发送"）。
   React.useEffect(() => {
-    useChatCommandStore.getState().setBusy(currentTurnActive)
-  }, [currentTurnActive])
+    useChatCommandStore.getState().setBusy(currentTurnActive || submissionPreparing)
+  }, [currentTurnActive, submissionPreparing])
 
   // 写 base：有项目作用域时只写该作用域的槽位（旋转不传染其他项目/章节）；
   // 无作用域（首页）回落到全局遗留单值。
@@ -6435,6 +6583,10 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     // 用会话作用域（章节页 = project+chapter）而非滞后的 currentProject/currentFlow，
     // 否则章节页的历史菜单会拿 flow 前缀过滤、把章节会话全部漏掉。
     if (!sessionScopeProjectId) {
+      setSessionHistory([])
+      return
+    }
+    if (!sessionScopeChapterId && !sessionScopeFlowId) {
       setSessionHistory([])
       return
     }
@@ -6761,66 +6913,6 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     referenceImages.length > 0 ? 'tc-ai-chat__composer-shell--with-refs' : '',
   ].filter(Boolean).join(' ')
 
-  const attachMenu = (
-    <Menu className="tc-ai-chat__attach-menu" position="top-start" zIndex={10050}>
-      <Menu.Target>
-        <AttachMenuTarget tooltip={$('添加参考图或文本文件（可直接拖进输入框）')} />
-      </Menu.Target>
-      <Menu.Dropdown className="tc-ai-chat__attach-dropdown">
-        <Menu.Label className="tc-ai-chat__attach-label">{$('文本')}</Menu.Label>
-        <Menu.Item
-          className="tc-ai-chat__attach-item"
-          leftSection={<IconFileText className="tc-ai-chat__attach-item-icon" size={16} />}
-          onClick={() => textFileInputRef.current?.click()}
-          disabled={currentTurnActive || importingText}
-        >
-          {$('上传文本（txt/md/docx）')}
-        </Menu.Item>
-        <Menu.Divider className="tc-ai-chat__attach-divider" />
-        <Menu.Label className="tc-ai-chat__attach-label">{$('参考图')}</Menu.Label>
-        <Menu.Item
-          className="tc-ai-chat__attach-item"
-          leftSection={<IconPhoto className="tc-ai-chat__attach-item-icon" size={16} />}
-          onClick={() => void addSelectedCanvasImagesAsReferences()}
-          disabled={currentTurnActive || refsLoading}
-        >
-          {$('使用画布选中图片')}
-        </Menu.Item>
-        <Menu.Item
-          className="tc-ai-chat__attach-item"
-          leftSection={<IconUpload className="tc-ai-chat__attach-item-icon" size={16} />}
-          onClick={() => fileInputRef.current?.click()}
-          disabled={currentTurnActive || refsLoading}
-        >
-          {$('上传参考图')}
-        </Menu.Item>
-        <Menu.Divider className="tc-ai-chat__attach-divider" />
-        <Menu.Item
-          className="tc-ai-chat__attach-item"
-          leftSection={<IconTrash className="tc-ai-chat__attach-item-icon" size={16} />}
-          onClick={clearReferenceImages}
-          disabled={currentTurnActive || refsLoading || referenceImages.length === 0}
-        >
-          {$('清空参考图')}
-        </Menu.Item>
-      </Menu.Dropdown>
-    </Menu>
-  )
-
-  // 全局生成偏好：生图模型/视频模型/规格，弹窗设置，服务端持久化（小T 上下文注入生效）。
-  const generationPrefsControl = (
-    <Tooltip className="tc-ai-chat__tooltip" label={$('生成偏好（生图/视频模型与规格）')} withArrow>
-      <ActionIcon
-        className="tc-ai-chat__attach"
-        variant="subtle"
-        aria-label="生成偏好"
-        onClick={() => setGenPrefsOpened(true)}
-      >
-        <IconPhotoCog className="tc-ai-chat__attach-icon" size={16} />
-      </ActionIcon>
-    </Tooltip>
-  )
-
   const skillLibraryControl = (
     <SkillPickerPopover
       selectionMode="single"
@@ -6859,76 +6951,6 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
     </Tooltip>
   )
 
-  // 智能团花名册 + 手动指派：查看小T与四个子 agent，可手动选「本轮由谁干活」。
-  const forcedRole = getTeamRole(forcedAgentRole)
-  const teamRosterControl = (
-    <Popover
-      opened={rosterOpened}
-      onChange={setRosterOpened}
-      position="top-start"
-      width={300}
-      withArrow
-      shadow="md"
-      zIndex={10050}
-    >
-      <Popover.Target>
-        <Tooltip className="tc-ai-chat__tooltip" label={$('智能团')} withArrow>
-          <ActionIcon
-            className={`tc-ai-chat__team-btn${forcedRole?.assignable ? ' tc-ai-chat__team-btn--active' : ''}`}
-            variant="subtle"
-            aria-label="智能团"
-            onClick={() => setRosterOpened((v) => !v)}
-          >
-            {forcedRole?.assignable ? (
-              <img className="tc-ai-chat__team-btn-avatar" src={forcedRole.avatar} alt={forcedRole.name} />
-            ) : (
-              <IconUsersGroup size={18} />
-            )}
-          </ActionIcon>
-        </Tooltip>
-      </Popover.Target>
-      <Popover.Dropdown className="tc-ai-chat__roster">
-        <div className="tc-ai-chat__roster-head">
-          <img className="tc-ai-chat__roster-lead-avatar" src={XIAOT_ROLE.avatar} alt={XIAOT_ROLE.name} />
-          <div className="tc-ai-chat__roster-lead-meta">
-            <Text className="tc-ai-chat__roster-lead-name" fw={600} size="sm">{XIAOT_ROLE.name}</Text>
-            <Text className="tc-ai-chat__roster-lead-desc" size="xs" c="dimmed">{XIAOT_ROLE.description}</Text>
-          </div>
-        </div>
-        <Text className="tc-ai-chat__roster-section" size="xs" c="dimmed">{$('本轮由谁干活')}</Text>
-        <button
-          type="button"
-          className={`tc-ai-chat__roster-item${!forcedRole?.assignable ? ' tc-ai-chat__roster-item--selected' : ''}`}
-          onClick={() => { selectForcedRole(null); setRosterOpened(false) }}
-        >
-          <span className="tc-ai-chat__roster-auto-icon"><IconSparkles size={18} /></span>
-          <span className="tc-ai-chat__roster-item-meta">
-            <span className="tc-ai-chat__roster-item-name">{$('自动（小T 智能委派）')}</span>
-            <span className="tc-ai-chat__roster-item-desc">{$('由小T按 SOP 自动分配最合适的角色')}</span>
-          </span>
-        </button>
-        {TEAM_ROLES.map((role: TeamRole) => {
-          const selected = forcedAgentRole === role.id
-          return (
-            <button
-              key={role.id}
-              type="button"
-              className={`tc-ai-chat__roster-item${selected ? ' tc-ai-chat__roster-item--selected' : ''}`}
-              style={selected ? { borderColor: role.accent } : undefined}
-              onClick={() => { selectForcedRole(selected ? null : role.id); setRosterOpened(false) }}
-            >
-              <img className="tc-ai-chat__roster-item-avatar" src={role.avatar} alt={role.name} style={{ borderColor: role.accent }} />
-              <span className="tc-ai-chat__roster-item-meta">
-                <span className="tc-ai-chat__roster-item-name">{role.name}</span>
-                <span className="tc-ai-chat__roster-item-desc">{role.description}</span>
-              </span>
-            </button>
-          )
-        })}
-      </Popover.Dropdown>
-    </Popover>
-  )
-
   const selectedChatModelUnavailable = Boolean(
     selectedChatModelValue && !selectedChatModelOption && !chatModelsLoading && !chatModelsError,
   )
@@ -6952,26 +6974,18 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         : $('无可用模型')
   const chatModelControl = (
     <div className="tc-ai-chat__model-control">
+      {chatModelsLoading ? <Text className="ai-chat-dialog__text" size="xs" role="status">正在加载对话模型…</Text> : null}
+      {chatModelsError ? <Text className="ai-chat-dialog__text" size="xs" c="red" role="alert">模型加载失败：{chatModelsError.message}</Text> : null}
       <Tooltip className="tc-ai-chat__tooltip" label={chatModelControlLabel} withArrow>
-        <Select
-          className="tc-ai-chat__model-select"
-          classNames={{
-            input: 'tc-ai-chat__model-select-input',
-            dropdown: 'tc-ai-chat__model-select-dropdown',
-            option: 'tc-ai-chat__model-select-option',
-          }}
-          data={chatModelSelectData}
-          value={selectedChatModelOption ? selectedChatModelValue : null}
-          onChange={selectChatModel}
+        <ChatModelControl
+          options={chatModelSelectData}
+          value={selectedChatModelOption?.value ?? null}
+          onModelChange={selectChatModel}
           placeholder={chatModelPlaceholder}
-          size="xs"
-          variant="unstyled"
-          allowDeselect={false}
-          searchable
+          capabilities={selectedModelCapabilities(selectedChatModelOption)}
+          settings={chatModelSettings}
+          onSettingsChange={setChatModelSettings}
           disabled={currentTurnActive || chatModelsLoading || chatModelSelectData.length === 0}
-          rightSection={<IconChevronDown className="tc-ai-chat__model-select-chevron" size={14} />}
-          rightSectionPointerEvents="none"
-          comboboxProps={{ zIndex: 10050 }}
         />
       </Tooltip>
       {chatModelsError ? (
@@ -7023,10 +7037,9 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
         multiple
         onChange={onPickTextFiles}
       />
-      <GenerationPrefsModal opened={genPrefsOpened} onClose={() => setGenPrefsOpened(false)} />
       {skillLibraryOpen ? (
         <AppErrorBoundary title="技能库加载失败" onDismiss={() => setSkillLibraryOpen(false)}>
-          <React.Suspense fallback={<div className="tc-skill-library-loading" aria-label="技能库加载中" />}>
+          <React.Suspense fallback={<AsyncDialogLoading onClose={() => setSkillLibraryOpen(false)} />}>
             <SkillLibraryDialog
               opened
               onClose={() => setSkillLibraryOpen(false)}
@@ -7139,11 +7152,10 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                         <div className="tc-ai-chat__composer-tools">
                           {codexDispatch.target === 'agents' ? (
                             <div className="tc-ai-chat__agents-tools">
-                              {attachMenu}
+
                               {skillLibraryControl}
-                              {generationPrefsControl}
                               {voiceInputControl}
-                              {teamRosterControl}
+
                               {chatModelControl}
                               {creativePhase === 'writing' ? (
                                 <Button className="tc-ai-chat__restart-prep" size="xs" variant="subtle" color="dimmed" px={6} onClick={restartPrep} disabled={currentTurnActive}>
@@ -7167,7 +7179,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                                 : codexDispatch.target === 'codex'
                                   ? '描述要在本地 workspace 完成的产品目标'
                                   : currentTurnActive
-                                    ? $('输入调整要求，再选择纠偏或续做')
+                                    ? $('输入补充说明或修改要求')
                                     : chatTurnChecking
                                       ? $('正在确认当前任务状态…')
                                       : $('描述创意或需求，可拖入 txt/docx')
@@ -7379,7 +7391,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                               key={action.key}
                               type="button"
                               className="tc-ai-chat__starter-chip"
-                              disabled={currentTurnActive}
+                              disabled={currentTurnActive || action.disabled === true}
                               onClick={() => void runQuickPreset(action)}
                             >
                               {action.label}
@@ -7504,11 +7516,10 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                   <div className="tc-ai-chat__composer-tools">
                     {codexDispatch.target === 'agents' ? (
                       <div className="tc-ai-chat__agents-tools">
-                        {attachMenu}
+
                         {skillLibraryControl}
-                        {generationPrefsControl}
                         {voiceInputControl}
-                        {teamRosterControl}
+
                         {chatModelControl}
                       </div>
                     ) : null}
@@ -7527,7 +7538,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                           : codexDispatch.target === 'codex'
                             ? '描述要在本地 workspace 完成的真实页面、游戏或应用目标'
                             : currentTurnActive
-                              ? $('输入调整要求，再选择纠偏或续做')
+                              ? $('输入补充说明或修改要求')
                               : chatTurnChecking
                                 ? $('正在确认当前任务状态…')
                                 : $('请输入你的设计需求，可拖入 txt/docx 文件')
@@ -7580,6 +7591,8 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                           : '等待 Bridge / workspace 可用；单次只执行一个任务'
                       : submissionPreparing && !sending
                         ? '正在校验会话与模型目录，准备提交请求'
+                      : !chatFlowReady && sessionScopeProjectId
+                        ? '当前项目 Flow 尚未就绪；发送内容会进入队列，创建完成后自动提交'
                       : chatTurnStatusDiagnostic
                         ? '状态同步暂不可用；发送时由服务端判定继续执行或持久排队'
                         : chatTurnStateUncertain
@@ -7606,7 +7619,7 @@ export default function AiChatDialog({ className }: { className?: string }): JSX
                         variant="subtle"
                         size="xs"
                         aria-label="重新读取任务状态"
-                        onClick={() => void refreshChatTurnStatus()}
+                        onClick={() => void refreshChatTurnStatus({ retryRecovery: true })}
                         disabled={chatTurnChecking}
                       >
                         <IconRefresh className="tc-ai-chat__status-refresh-icon" size={14} />

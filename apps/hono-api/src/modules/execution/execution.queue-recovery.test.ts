@@ -1,14 +1,47 @@
 import { describe, expect, it, vi } from "vitest";
+
+const insertExecutionEventMock = vi.hoisted(() => vi.fn(async () => 1));
+vi.mock("./execution.repo", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./execution.repo")>();
+	return { ...actual, insertExecutionEvent: insertExecutionEventMock };
+});
+
 import type { WorkerEnv } from "../../types";
 import {
 	reconcileLocallyAbandonedWorkflowExecutions,
 	recoverInterruptedWorkflowExecutions,
 	resumeQueuedWorkflowNodes,
+	resumeQueuedWorkflowExecutions,
 	resumeWaitingWorkflowNodes,
 } from "./execution.queue";
 import { freezeWorkflowExecutionSemanticsSnapshot } from "./execution.semantics-snapshot";
 
 describe("workflow queue restart recovery", () => {
+	it("automatically re-enters initialization after a claimed start persisted no nodes", async () => {
+		const fetch = vi.fn(async () => new Response("ok"));
+		const env = {
+			DB: {
+				workflow_executions: { findMany: vi.fn(async () => [{ id: "interrupted-start", status: "running", flow_version_id: "version" }]) },
+				workflow_node_runs: { findMany: vi.fn(async () => []) },
+				workflow_execution_events: { findFirst: vi.fn(async () => null) },
+			},
+			EXECUTION_DO: { idFromName: (id: string) => id, get: () => ({ fetch }) },
+		} as unknown as WorkerEnv;
+		expect(await reconcileLocallyAbandonedWorkflowExecutions(env, new Set())).toEqual({ executions: 1, recoverableNodes: 0, unsafeNodes: 0 });
+		expect(fetch).toHaveBeenCalledWith("https://do/start", { method: "POST" });
+	});
+	it("periodically dispatches queued executions and isolates unavailable starts", async () => {
+		const fetch = vi.fn().mockRejectedValueOnce(new TypeError("fetch failed"))
+			.mockResolvedValue(new Response("accepted", { status: 202 }));
+		const env = {
+			DB: { workflow_executions: { findMany: vi.fn(async () => [{ id: "a" }, { id: "b" }]) } },
+			EXECUTION_DO: { idFromName: (id: string) => id, get: () => ({ fetch }) },
+		} as unknown as WorkerEnv;
+		expect(await resumeQueuedWorkflowExecutions(env)).toBe(1);
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(await resumeQueuedWorkflowExecutions(env)).toBe(2);
+	});
+
 	it("starts persisted queued executions that crashed before Durable Object initialization", async () => {
 		const durableFetch = vi.fn(async () => new Response("ok", { status: 200 }));
 		const env = {
@@ -29,6 +62,85 @@ describe("workflow queue restart recovery", () => {
 			unsafeNodes: 0,
 		});
 		expect(durableFetch).toHaveBeenCalledWith("https://do/start", { method: "POST" });
+	});
+
+	it("isolates one failed recovery, records it, and retries it in a later scan", async () => {
+		insertExecutionEventMock.mockClear();
+		const executions = [
+			{ id: "execution-broken", flow_version_id: "version-broken", status: "running" as const },
+			{ id: "execution-healthy", flow_version_id: "version-healthy", status: "running" as const },
+		];
+		const flowDataFor = (nodeId: string) => JSON.stringify(freezeWorkflowExecutionSemanticsSnapshot({
+			nodes: [{ id: nodeId, type: "taskNode", data: {
+				kind: "workflowStage", workflowAtomicSpec: { executorRef: "workflow.input.text/v1" },
+			} }],
+			edges: [],
+		}));
+		const flowVersions: Record<string, string> = {
+			"version-broken": flowDataFor("broken-node"),
+			"version-healthy": flowDataFor("healthy-node"),
+		};
+		const durableCalls: string[] = [];
+		const db = {
+			workflow_executions: {
+				findMany: vi.fn(async () => executions),
+			},
+			workflow_node_runs: {
+				findMany: vi.fn(async (query: { where: { execution_id: string } }) => {
+					const execution = executions.find((candidate) => candidate.id === query.where.execution_id);
+					if (!execution) return [];
+					return [{ node_id: execution.id === "execution-broken" ? "broken-node" : "healthy-node", status: "running" }];
+				}),
+			},
+			flow_versions: {
+				findUnique: vi.fn(async (query: { where: { id: string } }) => ({ data: flowVersions[query.where.id] })),
+			},
+		};
+		const env = {
+			DB: db,
+			EXECUTION_DO: {
+				idFromName: (id: string) => id,
+				get: (id: string) => ({
+					fetch: vi.fn(async () => {
+						durableCalls.push(id);
+						return id === "execution-broken"
+							? new Response("chapter-sequence-project input must declare tapcanvas.chapter-sequence/v3", { status: 400 })
+							: Response.json({ recovered: true, recoverableNodes: 1, unsafeNodes: 0 });
+					}),
+				}),
+			},
+		} as unknown as WorkerEnv;
+		const reportRecoveryError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+		try {
+			await expect(recoverInterruptedWorkflowExecutions(env)).resolves.toEqual({
+				executions: 1, recoverableNodes: 1, unsafeNodes: 0,
+			});
+			await expect(recoverInterruptedWorkflowExecutions(env)).resolves.toEqual({
+				executions: 1, recoverableNodes: 1, unsafeNodes: 0,
+			});
+			expect(reportRecoveryError).toHaveBeenCalledTimes(2);
+		} finally {
+			reportRecoveryError.mockRestore();
+		}
+
+		expect(durableCalls).toEqual([
+			"execution-broken", "execution-healthy",
+			"execution-broken", "execution-healthy",
+		]);
+		expect(insertExecutionEventMock).toHaveBeenCalledTimes(2);
+		expect(insertExecutionEventMock).toHaveBeenNthCalledWith(1, db, expect.objectContaining({
+			executionId: "execution-broken",
+			eventType: "node_log",
+			level: "error",
+			nodeId: null,
+			data: expect.objectContaining({
+				protocolVersion: "tapcanvas.workflow-recovery-diagnostic/v1",
+				diagnosticType: "execution_recovery_attempt_failed",
+				recoveryReason: "process_startup",
+				error: expect.objectContaining({ message: expect.stringContaining("chapter-sequence-project input must declare") }),
+			}),
+		}));
+		expect(db.workflow_executions.findMany).toHaveBeenCalledTimes(2);
 	});
 
 	it("replays structural nodes and reconciles both persisted Agent turns and claimed video effects", async () => {
@@ -143,6 +255,57 @@ describe("workflow queue restart recovery", () => {
 				nodeId: "agent",
 				nodeRunId: "node-run-agent",
 				attempt: 2,
+				phase: "await_external",
+			}, { delaySeconds: 60 });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("wakes an older Agent no-progress signal-only receipt from its persisted retry timer", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-08-23T00:00:00.000Z"));
+		try {
+			const queueSend = vi.fn(async () => undefined);
+			const outputRefs = JSON.stringify({
+				protocolVersion: "1",
+				executorRef: "agents.logical-task/v2",
+				nodeId: "agent",
+				executionMode: "once",
+				ports: {},
+				artifacts: [],
+				evidence: {
+					deliveryEvidence: {
+						retryablePhysicalFailure: true,
+						physicalFailureReason: "workflow_agent_no_progress_window_exhausted",
+						noProgressRecoveryMode: "signal_only",
+						retryNotBeforeAt: "2026-08-23T00:01:00.000Z",
+					},
+				},
+				itemRuns: [],
+				externalCheck: { version: 1, mode: "signal_only" },
+			});
+			const env = {
+				DB: {
+					workflow_node_runs: {
+						findMany: vi.fn(async () => [{
+							id: "node-run-agent",
+							execution_id: "execution-1",
+							node_id: "agent",
+							attempt: 1,
+							output_refs: outputRefs,
+						}]),
+					},
+				},
+				WORKFLOW_NODE_QUEUE: { send: queueSend },
+			} as unknown as WorkerEnv;
+
+			await expect(resumeWaitingWorkflowNodes(env)).resolves.toBe(1);
+			expect(queueSend).toHaveBeenCalledWith({
+				executionId: "execution-1",
+				nodeId: "agent",
+				nodeRunId: "node-run-agent",
+				attempt: 1,
 				phase: "await_external",
 			}, { delaySeconds: 60 });
 		} finally {
@@ -283,7 +446,7 @@ describe("workflow queue restart recovery", () => {
 		const findNodeRuns = vi.fn(async ({ where }: { where: { execution_id: string } }) => {
 			if (where.execution_id === "execution-scan-first") {
 				activeExecutionIds.add("execution-became-active");
-				return [];
+				return [{ node_id: "accepted-node", status: "waiting_external" }];
 			}
 			return [{ node_id: "agent", status: "running" }];
 		});
@@ -387,3 +550,14 @@ describe("workflow queue restart recovery", () => {
 		expect(durableFetch).toHaveBeenCalledTimes(1);
 	});
 });
+
+ it.each(["pending", "success"])("recovers a stranded %s frontier without an active owner", async status => {
+   const fetch = vi.fn(async () => new Response("ok"));
+   const env = { DB: {
+     workflow_executions: { findMany: vi.fn(async () => [{id:"stranded",flow_version_id:"v",status:"running"}]) },
+     workflow_node_runs: { findMany: vi.fn(async () => [{node_id:"next",status}]) },
+     flow_versions: { findUnique: vi.fn(async () => ({data: JSON.stringify({nodes:[],edges:[]})})) },
+   }, EXECUTION_DO: {idFromName:(id:string)=>id,get:()=>({fetch})} } as unknown as WorkerEnv;
+   expect(await reconcileLocallyAbandonedWorkflowExecutions(env,new Set())).toMatchObject({executions:1});
+   expect(fetch).toHaveBeenCalledWith("https://do/recoverAfterRestart",expect.objectContaining({method:"POST"}));
+ });

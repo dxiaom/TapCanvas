@@ -1,7 +1,10 @@
+import { decodeWorkflowOutput } from "./execution.output-storage";
+import { applyWorkflowOutputCheckpointPacket, parseWorkflowOutputCheckpointPacket, readStoredWorkflowOutputStrict,
+	workflowOutputRootHash, type WorkflowOutputCheckpointWrite } from "./execution.output-checkpoint-packet";
+import { WorkflowOutputCheckpointStaleError } from "./execution.node-run-store";
 import type { DurableObjectState } from "@cloudflare/workers-types";
 import type { PrismaClient, WorkerEnv } from "../../types";
 import { getPrismaClient } from "../../platform/node/prisma";
-import { stripWorkflowFanoutNodes } from "./execution.flow-cleanup";
 import {
 	claimQueuedExecutionStart,
 	ensureNodeRuns,
@@ -12,7 +15,7 @@ import {
 	updateNodeRuns,
 } from "./execution.repo";
 import {
-	compileWorkflowGraph,
+	compileFrozenWorkflowGraph,
 	rebuildWorkflowExecutionGraph,
 	resolveWorkflowGraphNode,
 	resolveWorkflowNodeRestartPolicy,
@@ -34,18 +37,18 @@ import {
 } from "./execution.node-attempt";
 import { readWorkflowDurableRetryDirective } from "./execution.durable-retry";
 import { readDatabaseWithTransientRetry } from "../../platform/node/database-read-retry";
+import { buildWorkflowExternalWaitDiagnostics } from "./execution.external-wait-diagnostics";
+import { parseWorkflowNodeAgentProgress } from "./execution.agent-progress";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseStoredJson(value: unknown): unknown {
-	if (typeof value !== "string") return value;
-	try {
-		return JSON.parse(value) as unknown;
-	} catch {
-		return undefined;
-	}
+function isNormalizedCheckpointJson(value: unknown): boolean {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+	if (typeof value === "number") return Number.isFinite(value);
+	if (Array.isArray(value)) return value.every(isNormalizedCheckpointJson);
+	return isRecord(value) && Object.values(value).every(isNormalizedCheckpointJson);
 }
 
 function parseNodeIdList(value: unknown, field: string): string[] {
@@ -65,12 +68,11 @@ function parseNodeIdList(value: unknown, field: string): string[] {
 type WorkflowExecutionCancellationReason =
 	| "user_requested"
 	| "provider_balance_recovery"
-	| "agent_model_cutover"
-	| "video_production_start_deadline_exceeded";
+	| "agent_model_cutover";
 
 type WorkflowExecutionCancellationRequest = Readonly<{
 	reasonCode: WorkflowExecutionCancellationReason;
-	actorType: "owner_admin" | "owner_eval" | "owning_chat_turn" | "workflow_recovery" | "deadline_enforcer";
+	actorType: "owner_admin" | "owner_eval" | "owning_chat_turn" | "workflow_recovery";
 	actorId: string;
 }>;
 
@@ -80,21 +82,18 @@ function parseWorkflowExecutionCancellationRequest(
 	const reasonCode = body.reasonCode;
 	if (reasonCode !== "user_requested"
 		&& reasonCode !== "provider_balance_recovery"
-		&& reasonCode !== "agent_model_cutover"
-		&& reasonCode !== "video_production_start_deadline_exceeded") {
-		throw new Error("reasonCode must be user_requested, provider_balance_recovery, agent_model_cutover, or video_production_start_deadline_exceeded");
+		&& reasonCode !== "agent_model_cutover") {
+		throw new Error("reasonCode must be user_requested, provider_balance_recovery, or agent_model_cutover");
 	}
 	const actorType = body.actorType;
-	if (actorType !== "owner_admin" && actorType !== "owner_eval" && actorType !== "owning_chat_turn" && actorType !== "workflow_recovery" && actorType !== "deadline_enforcer") {
-		throw new Error("actorType must be owner_admin, owner_eval, owning_chat_turn, workflow_recovery, or deadline_enforcer");
+	if (actorType !== "owner_admin" && actorType !== "owner_eval" && actorType !== "owning_chat_turn" && actorType !== "workflow_recovery") {
+		throw new Error("actorType must be owner_admin, owner_eval, owning_chat_turn, workflow_recovery");
 	}
 	const isUserActor = actorType === "owner_admin" || actorType === "owner_eval" || actorType === "owning_chat_turn";
 	const isRecoveryReason = reasonCode === "provider_balance_recovery" || reasonCode === "agent_model_cutover";
-	const isDeadlineReason = reasonCode === "video_production_start_deadline_exceeded";
 	if ((reasonCode === "user_requested" && !isUserActor)
 		|| (reasonCode !== "user_requested" && isUserActor)
-		|| (isRecoveryReason && actorType !== "workflow_recovery")
-		|| (isDeadlineReason && actorType !== "deadline_enforcer")) {
+		|| (isRecoveryReason && actorType !== "workflow_recovery")) {
 		throw new Error("cancellation reason and actor type do not match");
 	}
 	const actorId = typeof body.actorId === "string" ? body.actorId.trim() : "";
@@ -116,12 +115,6 @@ function workflowCancellationCopy(reasonCode: WorkflowExecutionCancellationReaso
 		return {
 			nodeErrorMessage: "Canceled for Agent model cutover",
 			eventMessage: "Workflow execution fenced for Agent model cutover",
-		};
-	}
-	if (reasonCode === "video_production_start_deadline_exceeded") {
-		return {
-			nodeErrorMessage: "Canceled because video production did not start before the deadline",
-			eventMessage: "Workflow execution canceled by video production start deadline",
 		};
 	}
 	return {
@@ -180,37 +173,32 @@ export class ExecutionDO {
 		this.env = env;
 	}
 
+	/** Release only a terminal projection whose authoritative status is durable. */
+	async canRelease(): Promise<boolean> {
+		const graph = await this.loadGraphState();
+		if (graph && graph.status !== "success" && graph.status !== "failed" && graph.status !== "canceled") return false;
+		await Promise.all([this.lifecycleTail, this.scheduleTail, this.eventAppendTail]);
+		const execution = await getPrismaClient().workflow_executions.findUnique({
+			where: { id: this.executionId }, select: { status: true },
+		});
+		if (!execution || !["success", "failed", "canceled"].includes(execution.status)) return false;
+		const unsettled = await getPrismaClient().workflow_node_runs.findFirst({
+			where: { execution_id: this.executionId, status: { in: ["queued", "running", "waiting_external"] } },
+			select: { id: true },
+		});
+		return unsettled === null;
+	}
+
 	private get executionId() {
 		return this.state.id.toString();
 	}
 
-	private async stripFanoutNodesAfterTerminal(nowIso: string): Promise<void> {
-		try {
-			const execution = await getPrismaClient().workflow_executions.findUnique({
-				where: { id: this.executionId },
-				select: { flow_id: true, owner_id: true },
-			});
-			if (!execution) return;
-			const result = await stripWorkflowFanoutNodes({
-				executionId: this.executionId,
-				flowId: execution.flow_id,
-				ownerId: execution.owner_id,
-				nowIso,
-			});
-			if (result.strippedNodes > 0) {
-				await this.appendEvent({
-					eventType: "execution_fanout_nodes_stripped",
-					level: "info",
-					message: `stripped ${result.strippedNodes} fanout nodes, ${result.strippedEdges} edges`,
-				});
-			}
-		} catch {
-			// 清理失败不阻塞执行终态；污染由幂等重试或人工回滚兜底。
-		}
-	}
-
 	private async loadGraphState(): Promise<GraphState | null> {
 		const stored = await this.state.storage.get<GraphState>("graph");
+		if (stored && (!isRecord(stored.requiredInputPorts) || !isRecord(stored.activeInputPorts))) {
+			console.info(JSON.stringify({ message: "workflow_graph_port_state_requires_rehydration", executionId: this.executionId }));
+			return null;
+		}
 		return stored || null;
 	}
 
@@ -226,8 +214,11 @@ export class ExecutionDO {
 	 * edge twice.  The database attempt fence still rejects obsolete attempts; this
 	 * lane makes transitions for the current attempt linearizable as well.
 	 */
-	private runLifecycleTransition<T>(transition: () => Promise<T>): Promise<T> {
-		const current = this.lifecycleTail.then(transition);
+	private runLifecycleTransition(transition: () => Promise<Response>): Promise<Response> {
+		const current = this.lifecycleTail.then(transition).catch((error: unknown) => {
+			if (error instanceof WorkflowOutputCheckpointStaleError) return new Response(error.message, { status: 409 });
+			throw error;
+		});
 		this.lifecycleTail = current.then(() => undefined, () => undefined);
 		return current;
 	}
@@ -252,7 +243,7 @@ export class ExecutionDO {
 	/**
 	 * Node's Durable Object adapter keeps graph state in process memory. Startup
 	 * recovery normally rehydrates it before waiting jobs are dispatched, but an
-	 * already-enqueued external-check delivery can race that hydration. Rebuild
+	 * already-enqueued worker delivery can race that hydration. Rebuild
 	 * only the deterministic scheduler projection from immutable flow + persisted
 	 * node facts; do not change attempts or execute a node here.
 	 */
@@ -275,7 +266,7 @@ export class ExecutionDO {
 		if (!flowData) return new Response("Invalid flow version data", { status: 409 });
 		let compiledNodeIds: readonly string[];
 		try {
-			const compiled = compileWorkflowGraph(flowData);
+			const compiled = compileFrozenWorkflowGraph(flowData);
 			if (workflowGraphHasCycle(compiled)) return new Response("Cycle detected in workflow graph", { status: 409 });
 			compiledNodeIds = compiled.nodeIds;
 		} catch (error: unknown) {
@@ -311,7 +302,7 @@ export class ExecutionDO {
 				nodeRuns: nodeRuns.map((run) => ({
 					nodeId: run.node_id,
 					status: run.status,
-					...(run.output_refs != null ? { outputRefs: parseStoredJson(run.output_refs) } : {}),
+					...(run.output_refs != null ? { outputRefs: decodeWorkflowOutput(run.output_refs) } : {}),
 				})),
 			});
 		} catch (error: unknown) {
@@ -391,7 +382,7 @@ export class ExecutionDO {
 	private async requireCurrentNodeAttempt(
 		body: Readonly<Record<string, unknown>>,
 		nodeId: string,
-	): Promise<Readonly<{ id: string; attempt: number; status: string }> | Response> {
+	): Promise<Readonly<{ id: string; attempt: number; status: string; output_refs: string | null }> | Response> {
 		let expected: WorkflowNodeAttemptIdentity;
 		try {
 			expected = parseWorkflowNodeAttemptIdentity(body);
@@ -405,7 +396,7 @@ export class ExecutionDO {
 					node_id: nodeId,
 				},
 			},
-			select: { id: true, attempt: true, status: true },
+			select: { id: true, attempt: true, status: true, output_refs: true },
 		});
 		if (!nodeRun) return new Response("Node run not found", { status: 404 });
 		if (workflowNodeAttemptMatches(
@@ -424,10 +415,36 @@ export class ExecutionDO {
 				reportedAttempt: expected.attempt,
 				currentNodeRunId: nodeRun.id,
 				currentAttempt: nodeRun.attempt,
-				...(body.outputRefs !== undefined ? { lateOutputRefs: body.outputRefs } : {}),
 			},
 		});
 		return new Response("stale node attempt ignored", { status: 208 });
+	}
+
+	private readAcknowledgedNodeOutput(
+		body: Readonly<Record<string, unknown>>,
+		nodeRun: Readonly<{ id: string; attempt: number; output_refs: string | null }>,
+		nodeId: string,
+	): Readonly<{ outputRefs: NonNullable<ReturnType<typeof parseWorkflowNodeOutputV1>> | undefined;
+		outputCheckpoint: WorkflowOutputCheckpointWrite }> | Response {
+		if (Object.hasOwn(body, "outputRefs")) return new Response("Lifecycle callbacks require an acknowledged output root, not semantic outputRefs", { status: 400 });
+		const expected = body.expectedOutputRootHash;
+		if (!(expected === null || (typeof expected === "string" && /^[a-f0-9]{64}$/u.test(expected)))) {
+			return new Response("expectedOutputRootHash must be a SHA-256 hash or null", { status: 400 });
+		}
+		if (nodeRun.output_refs === null) {
+			if (expected !== null) return new Response("workflow_output_checkpoint_stale_base", { status: 409 });
+			return { outputRefs: undefined, outputCheckpoint: { output: null, nodeRunId: nodeRun.id, attempt: nodeRun.attempt, baseRootHash: null } };
+		}
+		if (expected === null) return new Response("workflow_output_checkpoint_stale_base", { status: 409 });
+		try {
+			const output = readStoredWorkflowOutputStrict(nodeRun.output_refs);
+			if (workflowOutputRootHash(output) !== expected) return new Response("workflow_output_checkpoint_stale_base", { status: 409 });
+			const outputRefs = parseWorkflowNodeOutputV1(output);
+			if (!outputRefs || outputRefs.nodeId !== nodeId) return new Response("Acknowledged output belongs to another node", { status: 400 });
+			return { outputRefs, outputCheckpoint: { output, nodeRunId: nodeRun.id, attempt: nodeRun.attempt, baseRootHash: expected } };
+		} catch (error: unknown) {
+			return new Response(error instanceof Error ? error.message : "Invalid acknowledged node output", { status: 400 });
+		}
 	}
 
 	private async persistNotSelectedNodeRuns(nodeIds: readonly string[], nowIso: string): Promise<void> {
@@ -547,6 +564,9 @@ export class ExecutionDO {
 		if (request.method === "POST" && path === "/nodeComplete") {
 			return this.runLifecycleTransition(() => this.handleNodeComplete(request));
 		}
+		if (request.method === "POST" && path === "/nodeCheckpointObservation") {
+			return this.runLifecycleTransition(() => this.handleNodeCheckpointObservation(request));
+		}
 		if (request.method === "POST" && path === "/cancel") {
 			return this.runLifecycleTransition(() => this.handleCancel(request));
 		}
@@ -646,7 +666,7 @@ export class ExecutionDO {
 		if (!flowData) return new Response("Invalid flow version data", { status: 400 });
 		let compiledNodeIds: readonly string[];
 		try {
-			const compiled = compileWorkflowGraph(flowData);
+			const compiled = compileFrozenWorkflowGraph(flowData);
 			if (workflowGraphHasCycle(compiled)) return new Response("Cycle detected in workflow graph", { status: 400 });
 			compiledNodeIds = compiled.nodeIds;
 		} catch (error: unknown) {
@@ -698,7 +718,8 @@ export class ExecutionDO {
 				if (latestOwnershipMs < cutoffMs) abandonedNodeIds.push(nodeId);
 			}
 			runningNodeIds = abandonedNodeIds;
-			if (runningNodeIds.length === 0) {
+			if (runningNodeIds.length === 0 && nodeRuns.some((run) =>
+				run.status === "running" || run.status === "queued" || run.status === "waiting_external")) {
 				return Response.json({
 					recovered: 0,
 					failedExplicitly: 0,
@@ -823,7 +844,7 @@ export class ExecutionDO {
 				nodeRuns: recoveredRuns.map((run) => ({
 					nodeId: run.node_id,
 					status: run.status,
-					...(run.output_refs != null ? { outputRefs: parseStoredJson(run.output_refs) } : {}),
+					...(run.output_refs != null ? { outputRefs: decodeWorkflowOutput(run.output_refs) } : {}),
 				})),
 			});
 		} catch (error: unknown) {
@@ -909,12 +930,16 @@ export class ExecutionDO {
 			},
 		});
 		if (!execution) return new Response("Execution not found", { status: 404 });
-		if (execution.status !== "queued") {
+		const interruptedInitialization = execution.status === "running"
+			&& !(await getPrismaClient().workflow_node_runs.findFirst({
+				where: { execution_id: this.executionId }, select: { id: true },
+			}));
+		if (execution.status !== "queued" && !interruptedInitialization) {
 			return new Response(`Execution already ${execution.status}`, { status: 208 });
 		}
 
 		const nowIso = new Date().toISOString();
-		const claimed = await claimQueuedExecutionStart(this.env.DB, {
+		const claimed = interruptedInitialization || await claimQueuedExecutionStart(this.env.DB, {
 			executionId: this.executionId,
 			startedAt: nowIso,
 		});
@@ -941,7 +966,7 @@ export class ExecutionDO {
 			return new Response("Invalid flow version data", { status: 400 });
 		}
 
-		const compiledGraph = compileWorkflowGraph(flowData);
+		const compiledGraph = compileFrozenWorkflowGraph(flowData);
 		const { nodeIds } = compiledGraph;
 		if (!nodeIds.length) {
 			await updateExecutionStatus(this.env.DB, {
@@ -1084,7 +1109,6 @@ export class ExecutionDO {
 	}
 
 	private async handleNodeStarted(request: Request): Promise<Response> {
-		const graph = await this.loadGraphState();
 		let body: Record<string, unknown>;
 		try {
 			body = await parseRequestBody(request);
@@ -1096,9 +1120,9 @@ export class ExecutionDO {
 		}
 		const nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
 		if (!nodeId) return new Response("bad request", { status: 400 });
-		if (!graph) {
-			return new Response("Execution graph is not initialized", { status: 409 });
-		}
+		const graphState = await this.loadOrRehydrateGraphState(nodeId);
+		if (graphState instanceof Response) return graphState;
+		const graph = graphState;
 		if (!(nodeId in graph.indeg)) {
 			return new Response("Node is outside the execution graph", { status: 404 });
 		}
@@ -1257,12 +1281,16 @@ export class ExecutionDO {
 			failureStage: null,
 			finishedAt: null,
 		});
-		await this.appendEvent({ eventType: "node_external_check_started", nodeId });
+		await this.appendEvent({
+			eventType: "node_external_check_started", nodeId,
+			data: { externalWait: buildWorkflowExternalWaitDiagnostics(nodeRun.output_refs) },
+		});
 		return new Response("accepted", { status: 202 });
 	}
 
 	private async handleNodeWaiting(request: Request): Promise<Response> {
-		const graph = await this.loadGraphState();
+		const loadedGraph = await this.loadGraphState();
+		const graph = loadedGraph === null ? null : structuredClone(loadedGraph);
 		let body: Record<string, unknown>;
 		try {
 			body = await parseRequestBody(request);
@@ -1275,21 +1303,27 @@ export class ExecutionDO {
 		const nodeAttempt = await this.requireCurrentNodeAttempt(body, nodeId);
 		if (nodeAttempt instanceof Response) return nodeAttempt;
 		const nodeRun = nodeAttempt;
+		const acknowledged = this.readAcknowledgedNodeOutput(body, nodeRun, nodeId);
+		if (acknowledged instanceof Response) return acknowledged;
+		if (!acknowledged.outputRefs) return new Response("External wait requires acknowledged node output", { status: 400 });
 		if (nodeRun.status === "waiting_external") return new Response("already waiting", { status: 208 });
 		if (nodeRun.status !== "running") return new Response(`Node run is ${nodeRun.status}`, { status: 409 });
-		graph.running = Math.max(0, graph.running - 1);
-		await this.saveGraphState(graph);
 		await updateNodeRun(this.env.DB, {
 			executionId: this.executionId,
 			nodeId,
 			status: "waiting_external",
-			outputRefs: body.outputRefs,
+			outputCheckpoint: acknowledged.outputCheckpoint,
 			errorMessage: null,
 			errorCode: null,
 			failureStage: null,
 			finishedAt: null,
 		});
-		await this.appendEvent({ eventType: "node_waiting_external", nodeId, data: { receiptPersisted: true } });
+		graph.running = Math.max(0, graph.running - 1);
+		await this.saveGraphState(graph);
+		await this.appendEvent({
+			eventType: "node_waiting_external", nodeId,
+			data: { receiptPersisted: true, externalWait: buildWorkflowExternalWaitDiagnostics(acknowledged.outputRefs) },
+		});
 		if (graph.status === "running") await this.schedule();
 		return new Response("accepted", { status: 202 });
 	}
@@ -1303,14 +1337,17 @@ export class ExecutionDO {
 		}
 		const nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
 		if (!nodeId) return new Response("Invalid progress node", { status: 400 });
-		let outputRefs;
+		if (body.progressKind === "agent_activity") {
+			return this.handleNodeAgentActivity(body, nodeId);
+		}
+		if (body.progressKind !== "output_checkpoint") {
+			return new Response("Invalid node progress kind", { status: 400 });
+		}
+		let packet;
 		try {
-			outputRefs = parseWorkflowNodeOutputV1(body.outputRefs);
+			packet = parseWorkflowOutputCheckpointPacket(body.outputCheckpoint);
 		} catch (error: unknown) {
 			return new Response(error instanceof Error ? error.message : "Invalid progress output refs", { status: 400 });
-		}
-		if (!outputRefs || outputRefs.nodeId !== nodeId || outputRefs.executionMode !== "each") {
-			return new Response("Progress output must belong to the running each node", { status: 400 });
 		}
 		const graph = await this.loadGraphState();
 		// 并行分支级联失败时 graph.status 会先翻为 failed，但其它仍在执行的 each
@@ -1333,11 +1370,26 @@ export class ExecutionDO {
 				message: "node_progress_rejected_attempt",
 				executionId: this.executionId,
 				nodeId,
-				attemptBody: body,
+				reportedNodeRunId: typeof body.nodeRunId === "string" ? body.nodeRunId : null,
+				reportedAttempt: typeof body.attempt === "number" ? body.attempt : null,
+				baseRootHash: packet.baseRootHash,
+				blockCount: packet.blockIds.length,
 			}));
 			return nodeAttempt;
 		}
 		const nodeRun = nodeAttempt;
+		let storedOutput;
+		let outputRefs;
+		try {
+			storedOutput = applyWorkflowOutputCheckpointPacket(nodeRun.output_refs, packet);
+			outputRefs = parseWorkflowNodeOutputV1(storedOutput);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : "Invalid progress checkpoint";
+			return new Response(message, { status: message === "workflow_output_checkpoint_stale_base" ? 409 : 400 });
+		}
+		if (!outputRefs || outputRefs.nodeId !== nodeId) {
+			return new Response("Progress output must belong to the running node", { status: 400 });
+		}
 		// each 模式节点的 item 可能交错：部分 item 进入外部等待（waiting_external）时
 		// 父节点被标 waiting_external，但其它 item 仍可能继续完成并 checkpoint（恢复
 		// 的 item 在 resume 后也会 checkpoint）。waiting_external 只是「存在外部等待
@@ -1360,7 +1412,7 @@ export class ExecutionDO {
 			executionId: this.executionId,
 			nodeId,
 			status: nodeRun.status,
-			outputRefs,
+			outputCheckpoint: { output: storedOutput, nodeRunId: nodeRun.id, attempt: nodeRun.attempt, baseRootHash: packet.baseRootHash },
 		});
 		await this.appendEvent({
 			eventType: "node_progress",
@@ -1375,8 +1427,147 @@ export class ExecutionDO {
 		return new Response("accepted", { status: 202 });
 	}
 
-	private async handleNodeComplete(request: Request): Promise<Response> {
+	/** Retain failed physical-writer observations without acquiring lifecycle authority. */
+	private async handleNodeCheckpointObservation(request: Request): Promise<Response> {
+		let body: Record<string, unknown>;
+		let identity: WorkflowNodeAttemptIdentity;
+		let nodeId: string;
+		try {
+			body = await parseRequestBody(request);
+			identity = parseWorkflowNodeAttemptIdentity(body);
+			nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
+			if (!nodeId || typeof body.failureReason !== "string" || !body.failureReason.trim() || !Array.isArray(body.snapshots)) {
+				throw new Error("Checkpoint observation requires nodeId, failureReason and snapshots");
+			}
+			if (!(body.baseRootHash === null || (typeof body.baseRootHash === "string" && /^[a-f0-9]{64}$/u.test(body.baseRootHash)))) {
+				throw new Error("Checkpoint observation baseRootHash must be a SHA-256 hash or null");
+			}
+			for (const snapshot of body.snapshots) {
+				if (!isRecord(snapshot) || snapshot.protocolVersion !== "1" || !isNormalizedCheckpointJson(snapshot)) {
+					throw new Error("Checkpoint observation snapshots must be normalized workflow outputs");
+				}
+				const output = parseWorkflowNodeOutputV1(snapshot);
+				if (!output || output.nodeId !== nodeId) throw new Error("Checkpoint observation snapshot belongs to another node");
+			}
+		} catch (error: unknown) {
+			return new Response(error instanceof Error ? error.message : "Invalid checkpoint observation", { status: 400 });
+		}
+		const attempt = await getPrismaClient().workflow_node_attempts.findUnique({
+			where: { node_run_id_attempt: { node_run_id: identity.nodeRunId, attempt: identity.attempt } },
+			select: { execution_id: true, node_id: true, node_run_id: true, attempt: true },
+		});
+		if (!attempt || attempt.execution_id !== this.executionId || attempt.node_id !== nodeId
+			|| attempt.node_run_id !== identity.nodeRunId || attempt.attempt !== identity.attempt) {
+			return new Response("Checkpoint observation attempt does not belong to this execution node", { status: 404 });
+		}
+		await this.appendEvent({
+			eventType: "node_checkpoint_observation", level: "warn", nodeId,
+			message: "Unacknowledged physical checkpoint observations retained for reconciliation",
+			data: { nodeRunId: identity.nodeRunId, attempt: identity.attempt, failureReason: body.failureReason,
+				baseRootHash: body.baseRootHash, snapshots: body.snapshots, terminalAuthority: false },
+		});
+		return new Response("observation retained", { status: 202 });
+	}
+
+	private async handleNodeAgentActivity(
+		body: Readonly<Record<string, unknown>>,
+		nodeId: string,
+	): Promise<Response> {
+		const progress = parseWorkflowNodeAgentProgress(body.agentProgress);
+		if (!progress || progress.attempt !== body.attempt) {
+			return new Response("Invalid Agent activity progress", { status: 400 });
+		}
 		const graph = await this.loadGraphState();
+		if (!graph || (graph.status !== "running" && graph.status !== "failed") || !(nodeId in graph.indeg)) {
+			console.info(JSON.stringify({
+				message: "node_agent_activity_rejected_execution_status",
+				executionId: this.executionId,
+				nodeId,
+				graphStatus: graph?.status ?? null,
+			}));
+			return new Response("Execution is not running this node", { status: 208 });
+		}
+		const nodeAttempt = await this.requireCurrentNodeAttempt(body, nodeId);
+		if (nodeAttempt instanceof Response) return nodeAttempt;
+		if (progress.attempt !== nodeAttempt.attempt) {
+			return new Response("Agent activity attempt does not match current node attempt", { status: 208 });
+		}
+		if (nodeAttempt.status !== "running" && nodeAttempt.status !== "waiting_external") {
+			console.info(JSON.stringify({
+				message: "node_agent_activity_rejected_run_status",
+				executionId: this.executionId,
+				nodeId,
+				nodeRunId: nodeAttempt.id,
+				attempt: nodeAttempt.attempt,
+				runStatus: nodeAttempt.status,
+			}));
+			return new Response(`Node run is ${nodeAttempt.status}`, { status: 208 });
+		}
+
+		// Per-Agent throttles can flush concurrently across item runs. Compare the
+		// observation time at the durable boundary so a delayed older write cannot
+		// replace the latest activity for this attempt.
+		const latestEvent = await this.env.DB.workflow_execution_events.findFirst({
+			where: {
+				execution_id: this.executionId,
+				node_id: nodeId,
+				event_type: "node_agent_activity",
+			},
+			orderBy: { seq: "desc" },
+			select: { data: true },
+		});
+		if (typeof latestEvent?.data === "string") {
+			let latest: ReturnType<typeof parseWorkflowNodeAgentProgress> = null;
+			try {
+				latest = parseWorkflowNodeAgentProgress(JSON.parse(latestEvent.data) as unknown);
+			} catch (error: unknown) {
+				console.warn(JSON.stringify({
+					message: "node_agent_activity_latest_event_invalid_json",
+					executionId: this.executionId,
+					nodeId,
+					attempt: nodeAttempt.attempt,
+					errorName: error instanceof Error ? error.name : "unknown",
+				}));
+			}
+			if (latest?.attempt === progress.attempt
+				&& Date.parse(latest.lastActivityAt) >= Date.parse(progress.lastActivityAt)) {
+				return new Response(null, { status: 204 });
+			}
+		}
+		await this.appendEvent({
+			eventType: "node_agent_activity",
+			nodeId,
+			data: progress,
+		});
+		return new Response("accepted", { status: 202 });
+	}
+
+	/** A local failure cannot terminate independent work or receipt collection. */
+	private async settleFailedExecution(graph: GraphState, nowIso: string): Promise<boolean> {
+		const runs = await this.env.DB.workflow_node_runs.findMany({
+			where: { execution_id: this.executionId },
+			select: { node_id: true, status: true, error_message: true, error_code: true, failure_stage: true },
+		});
+		if (runs.length !== Object.keys(graph.indeg).length
+			|| runs.some((run) => ["pending", "queued", "running", "waiting_external"].includes(run.status))) return false;
+		const failed = runs.find((run) => run.status === "failed");
+		if (!failed) return false;
+		graph.status = "failed";
+		graph.running = 0;
+		await this.saveGraphState(graph);
+		await updateExecutionStatus(this.env.DB, {
+			executionId: this.executionId, status: "failed", finishedAt: nowIso,
+			errorMessage: failed.error_message, errorCode: failed.error_code, failureStage: failed.failure_stage,
+		});
+		await this.appendEvent({ eventType: "execution_failed", level: "error", nodeId: failed.node_id,
+			message: "All independent work settled; unresolved node failure remains",
+			data: { errorCode: failed.error_code } });
+		return true;
+	}
+
+	private async handleNodeComplete(request: Request): Promise<Response> {
+		const loadedGraph = await this.loadGraphState();
+		const graph = loadedGraph === null ? null : structuredClone(loadedGraph);
 		let body: Record<string, unknown>;
 		try {
 			body = await parseRequestBody(request);
@@ -1395,7 +1586,6 @@ export class ExecutionDO {
 			typeof body.errorMessage === "string" ? body.errorMessage : null;
 		const errorCode =
 			typeof body.errorCode === "string" ? body.errorCode : null;
-		const outputRefs = body.outputRefs;
 		if (!nodeId) return new Response("bad request", { status: 400 });
 		if (!graph) {
 			return new Response("Execution graph is not initialized", { status: 409 });
@@ -1406,6 +1596,11 @@ export class ExecutionDO {
 		const nodeAttempt = await this.requireCurrentNodeAttempt(body, nodeId);
 		if (nodeAttempt instanceof Response) return nodeAttempt;
 		const nodeRun = nodeAttempt;
+		const acknowledged = this.readAcknowledgedNodeOutput(body, nodeRun, nodeId);
+		if (acknowledged instanceof Response) return acknowledged;
+		const outputRefs = acknowledged.outputRefs;
+		const completionCheckpoint = { ...acknowledged.outputCheckpoint, ...(!ok ? { output: null } : {}) };
+		if (ok && !outputRefs) return new Response("Successful completion requires acknowledged node output", { status: 400 });
 		if (
 			nodeRun.status === "success" ||
 			nodeRun.status === "failed" ||
@@ -1415,21 +1610,21 @@ export class ExecutionDO {
 			return new Response(`already ${nodeRun.status}`);
 		}
 		if (nodeRun.status === "canceled") {
+			await updateNodeRun(this.env.DB, {
+				executionId: this.executionId,
+				nodeId,
+				status: "canceled",
+				outputCheckpoint: completionCheckpoint,
+			});
 			if (outputRefs !== undefined) {
-				await updateNodeRun(this.env.DB, {
-					executionId: this.executionId,
-					nodeId,
-					status: "canceled",
-					outputRefs,
-				});
 				await this.appendEvent({
 					eventType: "node_output_after_cancel",
 					level: "warn",
 					nodeId,
-					message: "Late node output was preserved after workflow cancellation",
+					message: "Acknowledged node output was retained after workflow cancellation",
 				});
 			}
-			return new Response("already canceled; late output preserved");
+			return new Response("already canceled; acknowledged output retained");
 		}
 		if (nodeRun.status !== "running") {
 			return new Response(`Node run is ${nodeRun.status}`, { status: 409 });
@@ -1438,24 +1633,23 @@ export class ExecutionDO {
 		const nowIso = new Date().toISOString();
 		if (graph.status === "failed") {
 			graph.running = Math.max(0, graph.running - 1);
-			await this.saveGraphState(graph);
 			await updateNodeRun(this.env.DB, {
 				executionId: this.executionId,
 				nodeId,
 				status: ok ? "success" : "failed",
+				outputCheckpoint: completionCheckpoint,
 				...(ok
 					? {
-							outputRefs,
 							errorMessage: null,
 							errorCode: null,
 							failureStage: null,
 						}
 					: {
 							errorMessage: errorMessage || "node failed",
-							...(outputRefs !== undefined ? { outputRefs } : {}),
 						}),
 				finishedAt: nowIso,
 			});
+			await this.saveGraphState(graph);
 			await this.appendEvent({
 				eventType: ok ? "node_succeeded" : "node_failed",
 				level: ok ? "info" : "error",
@@ -1485,16 +1679,14 @@ export class ExecutionDO {
 			const retryPolicy = resolveWorkflowNodeRetryPolicy(flowData, nodeId);
 			const durableRetryDirective = readWorkflowDurableRetryDirective(outputRefs);
 			if (nodeRun.attempt < retryPolicy.maxAttempts || durableRetryDirective !== null) {
-				// Preserve the executor's latest failure evidence before incrementing the
-				// physical attempt. The next attempt must receive the exact monotonic
-				// retry cursor rather than an older checkpoint.
-				if (outputRefs !== undefined) {
-					await updateNodeRun(this.env.DB, {
-						executionId: this.executionId,
-						nodeId,
-						outputRefs,
-					});
-				}
+				// Fence the already persisted failure evidence before advancing the
+				// physical attempt. Guard-only writes never clear output or receipts.
+				await updateNodeRun(this.env.DB, {
+					executionId: this.executionId,
+					nodeId,
+					status: nodeRun.status,
+					outputCheckpoint: { ...completionCheckpoint, output: null },
+				});
 				const nextAttempt = await incrementNodeRunAttempt(this.env.DB, {
 					executionId: this.executionId,
 					nodeId,
@@ -1530,13 +1722,6 @@ export class ExecutionDO {
 				await this.schedule();
 				return new Response("retry scheduled", { status: 202 });
 			}
-			graph.status = "failed";
-			// A terminal execution cannot retain active-looking sibling node runs.
-			// Already accepted media continues in its provider/task ledger and its
-			// late output remains preservable by the canceled-node completion path;
-			// only this execution's scheduling/tracking lifecycle is closed here.
-			graph.running = 0;
-			await this.saveGraphState(graph);
 			await updateNodeRun(this.env.DB, {
 				executionId: this.executionId,
 				nodeId,
@@ -1544,23 +1729,16 @@ export class ExecutionDO {
 				errorMessage: errorMessage || "node failed",
 				errorCode: errorCode || "workflow_node_runtime_failed",
 				failureStage: retryPolicy.failureStage,
-				...(outputRefs !== undefined ? { outputRefs } : {}),
+				outputCheckpoint: completionCheckpoint,
 				finishedAt: nowIso,
 			});
+			await this.saveGraphState(graph);
 			await this.appendEvent({
 				eventType: "node_failed",
 				level: "error",
 				nodeId,
 				message: errorMessage || "node failed",
 				data: errorCode ? { errorCode } : undefined,
-			});
-			await updateExecutionStatus(this.env.DB, {
-				executionId: this.executionId,
-				status: "failed",
-				errorMessage: errorMessage || "node failed",
-				errorCode: errorCode || "workflow_node_runtime_failed",
-				failureStage: retryPolicy.failureStage,
-				finishedAt: nowIso,
 			});
 			const unsettledRuns = await this.env.DB.workflow_node_runs.findMany({
 				where: {
@@ -1570,8 +1748,18 @@ export class ExecutionDO {
 				},
 				select: { node_id: true, status: true },
 			});
-			const blockedRuns = unsettledRuns.filter((run) => run.status === "pending" || run.status === "queued");
-			const activeSiblingRuns = unsettledRuns.filter((run) => run.status === "running" || run.status === "waiting_external");
+			const descendants = new Set<string>();
+			const pending = [...(graph.adj[nodeId] ?? [])];
+			while (pending.length > 0) {
+				const next = pending.pop()!;
+				if (descendants.has(next)) continue;
+				descendants.add(next);
+				pending.push(...(graph.adj[next] ?? []));
+			}
+			const blockedRuns = unsettledRuns.filter((run) => descendants.has(run.node_id)
+				&& (run.status === "pending" || run.status === "queued"));
+			const blockedIds = new Set(blockedRuns.map((run) => run.node_id));
+			graph.ready = graph.ready.filter((id) => !blockedIds.has(id));
 			await updateNodeRuns(this.env.DB, {
 				executionId: this.executionId,
 				nodeIds: blockedRuns.map((run) => run.node_id),
@@ -1581,30 +1769,11 @@ export class ExecutionDO {
 					finishedAt: nowIso,
 				},
 			});
-			await updateNodeRuns(this.env.DB, {
-				executionId: this.executionId,
-				nodeIds: activeSiblingRuns.map((run) => run.node_id),
-				update: {
-					status: "canceled",
-					errorMessage: `Execution tracking closed because workflow node ${nodeId} failed; accepted external tasks and late assets remain preserved`,
-					errorCode: "workflow_execution_terminalized",
-					finishedAt: nowIso,
-				},
-			});
-			await this.appendEvent({
-				eventType: "execution_failed",
-				level: "error",
-				message: errorMessage || "node failed",
-				data: {
-					nodeId,
-					blockedNodeCount: blockedRuns.length,
-					terminalizedActiveNodeCount: activeSiblingRuns.length,
-					...(errorCode ? { errorCode } : {}),
-				},
-			});
-			// 执行失败同样剥离该执行的 fan-out 中间产物（可能残留部分已完成资产），
-			// 防 flow 主表污染；已受理的付费任务不受影响。
-			await this.stripFanoutNodesAfterTerminal(nowIso);
+			await this.appendEvent({ eventType: "node_failure_isolated", level: "warn", nodeId,
+				message: "Failed dependency recorded; independent work and accepted tasks remain active",
+				data: { blockedNodeCount: blockedRuns.length } });
+			await this.saveGraphState(graph);
+			if (!await this.settleFailedExecution(graph, nowIso)) await this.schedule();
 			return new Response("ok");
 		}
 
@@ -1612,7 +1781,7 @@ export class ExecutionDO {
 			executionId: this.executionId,
 			nodeId,
 			status: "success",
-			outputRefs,
+			outputCheckpoint: completionCheckpoint,
 			errorMessage: null,
 			errorCode: null,
 			failureStage: null,
@@ -1627,6 +1796,8 @@ export class ExecutionDO {
 		if (resolved.notSelectedNodeIds.length > 0) {
 			await this.persistNotSelectedNodeRuns(resolved.notSelectedNodeIds, nowIso);
 		}
+
+		if (await this.settleFailedExecution(graph, nowIso)) return new Response("ok");
 
 		const terminalRuns = await this.env.DB.workflow_node_runs.findMany({
 			where: { execution_id: this.executionId },
@@ -1646,8 +1817,7 @@ export class ExecutionDO {
 				eventType: "execution_succeeded",
 				level: "info",
 			});
-			// 执行成功：剥离 fan-out 中间产物节点，保留 concat 成片节点（防 flow 主表污染）。
-			await this.stripFanoutNodesAfterTerminal(nowIso);
+			// Generated assets and their node receipts remain available after terminal delivery.
 			return new Response("ok");
 		}
 

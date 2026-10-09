@@ -1,3 +1,15 @@
+import type { ReferenceFactObservation } from "../../../../../packages/schemas/json-schema-relations/reference-facts.mjs";
+import { inspectBeatExecutionStructure } from "../../../../../packages/schemas/video-authoring-stages/beat-structure.mjs";
+import { ASSET_OBJECT_KINDS, ASSET_REFERENCE_ROLES } from "../../../../../packages/schemas/workflow-asset-registry/index.mjs";
+import { inspectRegisteredAssetPlans } from "../../../../../packages/schemas/scene-reference-contract/index.mjs";
+import { chapterAssetPlanSchema } from "../../../../../packages/schemas/video-authoring-stages/schema.mjs";
+import { validateWorkflowToolArguments } from "./execution.json-schema-validator";
+import { projectBlockingPlans } from "../../../../../packages/schemas/blocking-plan-contract/index.mjs";
+import { blockingPlanFields, backgroundPlanSchema, compositionSchema } from "../../../../../packages/schemas/blocking-plan-contract/schema.mjs";
+import { sceneReferenceCardSchema } from "../../../../../packages/schemas/scene-reference-contract/index.mjs";
+import { validateSequenceControlPlan } from "../../../../../packages/schemas/sequence-timeline/inspection.mjs";
+import { compileSequenceTimeline } from "../../../../../packages/schemas/sequence-timeline/index.mjs";
+import { clipObjectStateFields, inspectClipReferenceSelection } from "../../../../../packages/schemas/clip-reference-selection/index.mjs";
 import {
 	WORKFLOW_AGENT_OUTPUT_ENCODINGS,
 	WORKFLOW_BEAT_SHEET_AGENT_CONTRACT_NAME,
@@ -6,12 +18,9 @@ import {
 } from "@tapcanvas/workflow-kernel-protocol";
 import {
 	validateStructuredClipExecutionContract,
-	countDialogueChars,
 	type StructuredClip,
 } from "../task/video-orchestrator.clip-shots";
 import {
-	DEFAULT_DIALOGUE_CHARS_PER_SEC,
-	DIALOGUE_PACE_CEILING,
 	parseDialoguePaceRate,
 } from "../task/video-orchestrator.dialogue-capacity";
 import {
@@ -26,6 +35,11 @@ import {
 	validateNarrativeAudioPlacement,
 	type SpokenScriptLine,
 } from "../task/video-orchestrator.spoken-script";
+import {
+	OPENING_FRAME_PLAN_ARTIFACT_TYPE,
+	OPENING_FRAME_PLAN_CONTRACT_NAME,
+	OPENING_FRAME_PLAN_CONTRACT_VERSION,
+} from "./execution.opening-frame";
 
 export type { WorkflowAgentOutputEncoding } from "@tapcanvas/workflow-kernel-protocol";
 
@@ -66,29 +80,14 @@ export type WorkflowAgentJsonArrayContract = Readonly<{
 export const WORKFLOW_AGENT_STRING_FORMATS = ["asset-role-v1"] as const;
 export type WorkflowAgentStringFormat = typeof WORKFLOW_AGENT_STRING_FORMATS[number];
 
-const WORKFLOW_ASSET_ROLE_KINDS = [
-	"character",
-	"scene",
-	"prop",
-	"vfx",
-	"palette",
-	"composition",
-] as const;
-
-const WORKFLOW_ASSET_REFERENCE_ROLES = [
-	"none",
-	"identity",
-	"wardrobe",
-	"prop",
-	"environment",
-	"palette",
-	"composition",
-	"vfx",
-] as const;
+const WORKFLOW_ASSET_OBJECT_KINDS = ASSET_OBJECT_KINDS;
+const WORKFLOW_ASSET_ROLE_KINDS = ASSET_OBJECT_KINDS;
+const WORKFLOW_ASSET_REFERENCE_ROLES = ASSET_REFERENCE_ROLES;
 
 type WorkflowAssetRoleKind = typeof WORKFLOW_ASSET_ROLE_KINDS[number];
 
 export const WORKFLOW_STRUCTURED_OUTPUT_SUBMISSION_POLICY = "single_submission_record_and_fail" as const;
+export const WORKFLOW_STRUCTURED_OUTPUT_REPAIRABLE_POLICY = "repair_with_correction" as const;
 export const WORKFLOW_STRUCTURED_OUTPUT_SINGLE_INFERENCE_POLICY =
 	"single_inference_no_tools_record_and_fail" as const;
 
@@ -98,6 +97,7 @@ function equalDurationAtContractPrecision(left: number, right: number): boolean 
 
 
 export type WorkflowAgentJsonObjectContract = Readonly<{
+	jsonSchema?: Record<string, unknown>;
 	contractName?: string;
 	contractVersion?: string;
 	requiredStringFields?: readonly string[];
@@ -105,14 +105,34 @@ export type WorkflowAgentJsonObjectContract = Readonly<{
 	// Agent 改写的运行时事实；值必须同时属于 requiredStringFields 与
 	// allowedFields，agents-cli 与 Hono 端口校验执行同一精确比较。
 	exactStringFields?: Readonly<Record<string, string>>;
+	/**
+	 * Caller-frozen identities already materialized in the current project
+	 * scope. The BeatSheet background self-reference check exempts only these
+	 * exact IDs; it never infers existence from an ID spelling or prefix.
+	 */
+	knownExistingAssetIds?: readonly string[];
 	requiredNumberFields?: readonly string[];
 	requiredObjectFields?: readonly string[];
+	// Nested structural paths whose resolved value must be a non-empty string;
+	// `[]` applies the remainder to each array item.
+	requiredNonEmptyStringPaths?: readonly string[];
+	/** 与 requiredNonEmptyStringPaths 同一套路径语义，但要求解析结果是普通对象。 */
+	requiredObjectPaths?: readonly string[];
+	/** 同上，但要求解析结果是数组（如 blockingPlans[].backgroundPlan.referenceAssetBindings）。 */
+	requiredArrayPaths?: readonly string[];
+	/** 同上；路径存在时其值必须是非空字符串（可省略字段的类型约束）。 */
+	optionalNonEmptyStringPaths?: readonly string[];
+	/** 同上；解析结果必须逐字等于调用方冻结的字符串（如 sceneCard 版本常量）。 */
+	exactStringPaths?: Readonly<Record<string, string>>;
 	requiredArrayFields?: readonly string[];
 	// 数组字段的精确长度约束（如视频工作流冻结时长计划对应的 beats 数）。
-	// 命中即强制；模型必须在唯一一次提交中满足，runtime 只记录并验收。
+	// 命中即强制；模型最终候选必须满足，结构失败证据由 agents-cli
+	// 回灌同一 ReAct 执行链修复，runtime 不改写语义字段。
 	expectedArrayLengths?: Readonly<Record<string, number>>;
 	// 顶层数组每项必须包含的非空字符串字段；只做结构校验，不解释语义。
 	arrayItemRequiredStringFields?: Readonly<Record<string, readonly string[]>>;
+	// 顶层数组每项的字符串格式约束；格式只描述可执行协议，不解释正文语义。
+	arrayItemStringFormats?: Readonly<Record<string, Readonly<Record<string, WorkflowAgentStringFormat>>>>;
 	// 顶层数组每项必须包含的字符串数组字段；允许空数组，但禁止省略、
 	// 非数组值和空白字符串元素。
 	arrayItemRequiredStringArrayFields?: Readonly<Record<string, readonly string[]>>;
@@ -127,6 +147,9 @@ export type WorkflowAgentJsonObjectContract = Readonly<{
 	// 在 agent 输出合同层强制，避免模型省略资产引用后在 prompt-package 等
 	// 确定性校验处整 run 失败。
 	itemRequiredNonEmptyArrayFields?: readonly string[];
+	// 顶层单数组视频 writer 项的冻结 storyEvent 时间窗；用于让 agents-cli
+	// 在同一结构合同内校验 depictedStoryEventIndices，避免下游才发现时钟越界。
+	itemTimelineEventIntervals?: readonly Readonly<{ startSeconds: number; endSeconds: number }>[];
 	// 顶层数组逐项冻结数字事实；数组下标即调用方冻结的物理顺序。
 	// 例如 beats[0].durationSeconds=30、beats[1].durationSeconds=10。
 	arrayItemExactNumberFields?: Readonly<
@@ -165,6 +188,8 @@ export type WorkflowAgentJsonObjectContract = Readonly<{
 
 export const VIDEO_WRITER_ARTIFACT_CONTRACT_NAME = "tapcanvas.video-writer-artifact";
 export const VIDEO_WRITER_ARTIFACT_CONTRACT_VERSION = "14";
+export const OPENING_CLIP_ARTIFACT_CONTRACT_NAME = "tapcanvas.opening-clip-artifact";
+export const OPENING_CLIP_ARTIFACT_CONTRACT_VERSION = "3";
 export const BEAT_SHEET_ARTIFACT_CONTRACT_NAME = WORKFLOW_BEAT_SHEET_AGENT_CONTRACT_NAME;
 export const BEAT_SHEET_ARTIFACT_CONTRACT_VERSION = WORKFLOW_BEAT_SHEET_AGENT_CONTRACT_VERSION;
 
@@ -175,8 +200,10 @@ const BEAT_SHEET_TOP_LEVEL_FIELDS = [
 	"sourceCoveragePlan",
 	"sourceFidelityAudit",
 	"chapterArc",
+	"sequenceControlPlan",
 	"objectRegistry",
 	"assetPlans",
+	"blockingPlans",
 	"beats",
 ] as const;
 
@@ -193,14 +220,9 @@ const BEAT_SHEET_OBJECT_REGISTRY_FIELDS = [
 	"scale",
 ] as const;
 
-const BEAT_SHEET_OBJECT_STATE_FIELDS = [
-	"objectId",
-	"startState",
-	"spatialRelation",
-	"driver",
-	"stateChange",
-	"endState",
-] as const;
+const BEAT_SHEET_OBJECT_STATE_FIELDS = clipObjectStateFields;
+
+const BEAT_SHEET_BLOCKING_PLAN_FIELDS = blockingPlanFields;
 
 const BEAT_SHEET_EXECUTION_BEAT_FIELDS = [
 	"clipId",
@@ -496,11 +518,53 @@ export function applyWorkflowAgentArrayItemExactStringArrayFields(
 	};
 }
 
+/**
+ * 从共享 schema 的 required 集合投影出嵌套的非空字符串路径。
+ * 只读取 schema 自己声明的必填键与类型，不复制任何正文要求。
+ */
+function beatSheetNestedStringPaths(prefix: string, schema: unknown): string[] {
+	if (!isRecord(schema) || !isRecord(schema.properties) || !Array.isArray(schema.required)) return [];
+	const properties = schema.properties;
+	return schema.required.flatMap((key) => {
+		if (typeof key !== "string") return [];
+		const property = properties[key];
+		if (!isRecord(property)) return [];
+		const textual = property.type === "string" || Array.isArray(property.enum);
+		return textual ? [`${prefix}.${key}`] : [];
+	});
+}
+
 export function applyWorkflowArtifactJsonObjectContract(
 	artifactType: string,
 	contract: WorkflowAgentJsonObjectContract | null,
 ): WorkflowAgentJsonObjectContract | null {
 	if (!contract) return contract;
+	if (artifactType === "tapcanvas.chapter-asset-plan/v3") {
+		const canonicalSchema = isRecord(chapterAssetPlanSchema) ? chapterAssetPlanSchema : null;
+		const batchReferenceConstraints = canonicalSchema?.["x-batchAssetReferenceConstraints"];
+		if (batchReferenceConstraints === undefined) throw new Error("chapter-asset-plan/v3 canonical schema must declare its batch reference contract");
+		return { ...contract, jsonSchema: structuredClone(chapterAssetPlanSchema) };
+	}
+	if (artifactType === "tapcanvas.opening-clip/v3") {
+		return {
+			...contract,
+			requiredStringFields: ["protocolVersion", "clipPrompt"],
+			requiredArrayFields: ["sourceRanges"],
+			contractName: OPENING_CLIP_ARTIFACT_CONTRACT_NAME,
+			contractVersion: OPENING_CLIP_ARTIFACT_CONTRACT_VERSION,
+			allowedFields: ["protocolVersion", "sourceRanges", "clipPrompt"],
+		};
+	}
+	if (artifactType === OPENING_FRAME_PLAN_ARTIFACT_TYPE) {
+		return {
+			...contract,
+			requiredStringFields: ["protocolVersion", "prompt", "negativePrompt"],
+			requiredArrayFields: ["referenceAssetBindings"],
+			contractName: OPENING_FRAME_PLAN_CONTRACT_NAME,
+			contractVersion: OPENING_FRAME_PLAN_CONTRACT_VERSION,
+			allowedFields: ["protocolVersion", "prompt", "negativePrompt", "referenceAssetBindings"],
+		};
+	}
 	if (artifactType === "tapcanvas.beat-sheet/v2" || artifactType === "tapcanvas.launch-beat-sheet/v1") {
 		const baseContract = { ...contract };
 		delete baseContract.itemRequiredNonEmptyArrayFields;
@@ -512,14 +576,53 @@ export function applyWorkflowArtifactJsonObjectContract(
 			...baseContract,
 			requiredStringFields: ["protocolVersion"],
 			requiredNumberFields: undefined,
-			requiredObjectFields: ["sourceCoveragePlan", "chapterArc"],
-			requiredArrayFields: ["objectRegistry", ...(requiresAssetPlans ? ["assetPlans"] : []), "beats"],
+			requiredObjectFields: ["sourceCoveragePlan", "sourceFidelityAudit", "chapterArc", "sequenceControlPlan"],
+			requiredNonEmptyStringPaths: Array.from(new Set([
+				...(contract.requiredNonEmptyStringPaths ?? []),
+				"sequenceControlPlan.segments[].transitionFromPrevious",
+				"sequenceControlPlan.segments[].transitionToNext",
+				...beatSheetNestedStringPaths("blockingPlans[].backgroundPlan", backgroundPlanSchema),
+				...beatSheetNestedStringPaths("blockingPlans[].compositionContract", compositionSchema),
+				/*
+				 * 场景卡（assetPlans[].sceneCard）的要求**不进这份路径清单**：它按计划自身的
+				 * kind 分别成立（只有 scene 计划才有 sceneCard），而这份清单的
+				 * 路径语法只表达"每个条目都成立"的普适要求。曾把 kind 限定写成
+				 * `assetPlans[role=scene|environment].sceneCard`，模型把这段路径当成字段名原样
+				 * 输出，场景计划因此被放进一个不存在的顶层键，而该键又不在 allowedFields 中：
+				 * 产物永远"缺少 scene 计划"，每个窗口重复同一次失败。
+				 * 逐计划的 kind 校验由 inspectSceneReferencePlan 承担，失败信息给出具体下标
+				 * （如 assetPlans[3].sceneCard），无需在合同里再声明一遍。
+				 */
+			])),
+			/*
+			 * 嵌套结构要求必须是机器合同的一部分：校验器会按共享 schema 拒绝缺键与非数组，
+			 * 只把它们留在散文里会让同一份产物在每个物理窗口反复补同一个键。
+			 */
+			requiredObjectPaths: ["blockingPlans[].backgroundPlan"],
+			requiredArrayPaths: [
+				"beats[].objectStates",
+				"blockingPlans[].characters",
+				"blockingPlans[].landmarks",
+				"blockingPlans[].backgroundPlan.referenceAssetBindings",
+			],
+			optionalNonEmptyStringPaths: ["objectRegistry[].scale", "objectRegistry[].forbiddenTransfer"],
+			requiredArrayFields: ["objectRegistry", ...(requiresAssetPlans ? ["assetPlans"] : []), "blockingPlans", "beats"],
 			arrayItemRequiredStringFields: {
 				objectRegistry: ["objectId", "kind", "name", "identityInvariant"],
-				...(requiresAssetPlans ? { assetPlans: ["role", "prompt", "negativePrompt"] } : {}),
+				/*
+				 * A plan names its object by `objectId`; the runtime compiles `role` from
+				 * that object. The field the model used to author collides by name with
+				 * objectRegistry[].referenceRole, and the model reliably wrote that enum
+				 * there, so no plan ever bound to a declared visual role.
+				 */
+				...(requiresAssetPlans ? { assetPlans: ["objectId"] } : {}),
+				blockingPlans: ["title", "sceneName"],
 				beats: ["startKeyframe", "endKeyframe", "dominantFunction", "causalEntry", "irreversibleResult", "handoffToNext"],
 			},
-			arrayItemRequiredStringArrayFields: undefined,
+			arrayItemStringFormats: {
+				...(contract.arrayItemStringFormats ?? {}),
+			},
+			arrayItemRequiredStringArrayFields: { objectRegistry: ["referenceAssetIds"] },
 			arrayItemRequiredNonEmptyStringArrayFields: requiresAssetPlans
 				? { assetPlans: ["identityAnchors", "prohibitedDrift"] }
 				: undefined,
@@ -536,8 +639,12 @@ export function applyWorkflowArtifactJsonObjectContract(
 				...contract.arrayItemAllowedFields,
 				objectRegistry: [...BEAT_SHEET_OBJECT_REGISTRY_FIELDS],
 				...(requiresAssetPlans ? {
-					assetPlans: ["role", "prompt", "negativePrompt", "identityAnchors", "prohibitedDrift"],
+					// `objectId` names the registry object a plan generates; `role` is
+					// host-compiled from it and stays allowed only so an older persisted
+					// candidate remains readable.
+					assetPlans: ["objectId", "role", "prompt", "negativePrompt", "identityBoardSpec", "sceneCard", "identityAnchors", "prohibitedDrift", "referenceAssetBindings"],
 				} : {}),
+				blockingPlans: [...BEAT_SHEET_BLOCKING_PLAN_FIELDS],
 				beats: [...BEAT_SHEET_EXECUTION_BEAT_FIELDS],
 			},
 			...(isLaunchBeatSheet
@@ -587,6 +694,7 @@ function isStringArray(value: unknown): value is string[] {
 		&& value.every((entry) => typeof entry === "string" && entry.trim().length > 0);
 }
 
+
 /**
  * Expand the Agent-authored chapter object registry into the existing typed
  * per-beat object contract consumed by downstream nodes. Stable identity and
@@ -611,13 +719,14 @@ function projectBeatSheetCompactObjectRegistry(
 			return { ok: false, errorMessage: `${path} contains unexpected field ${unexpectedField}` };
 		}
 		const objectId = nonEmptyString(rawObject.objectId);
-		const kind = nonEmptyString(rawObject.kind);
+		const rawKind = nonEmptyString(rawObject.kind);
+		const kind = rawKind;
 		const name = nonEmptyString(rawObject.name);
 		const referenceRole = nonEmptyString(rawObject.referenceRole);
 		const identityInvariant = nonEmptyString(rawObject.identityInvariant);
 		if (!objectId) return { ok: false, errorMessage: `${path}.objectId must be non-empty` };
 		if (registryById.has(objectId)) return { ok: false, errorMessage: `${path}.objectId must be unique` };
-		if (!kind || !WORKFLOW_ASSET_ROLE_KINDS.includes(kind as WorkflowAssetRoleKind)) {
+		if (!kind || !WORKFLOW_ASSET_OBJECT_KINDS.includes(kind as (typeof WORKFLOW_ASSET_OBJECT_KINDS)[number])) {
 			return { ok: false, errorMessage: `${path}.kind must use character/scene/prop/vfx/palette/composition` };
 		}
 		if (!name) return { ok: false, errorMessage: `${path}.name must be non-empty` };
@@ -645,12 +754,17 @@ function projectBeatSheetCompactObjectRegistry(
 				return { ok: false, errorMessage: `${path}.${field} must be non-empty when present` };
 			}
 		}
-		const { objectId: _objectId, ...objectContractBase } = rawObject;
+		const { objectId: _objectId, ...objectFields } = rawObject;
+		// Keep the canonical kind validated above in every downstream projection.
+		const objectContractBase = { ...objectFields, kind };
 		registryById.set(objectId, objectContractBase);
 	}
 	if (!Array.isArray(root.beats) || root.beats.length === 0) {
 		return { ok: false, errorMessage: "beats must be a non-empty array" };
 	}
+	const blockingProjection = projectBlockingPlans(root);
+	if (!blockingProjection.ok) return blockingProjection;
+	const { blockingPlans } = blockingProjection;
 	const allowedStateFields = new Set<string>(BEAT_SHEET_OBJECT_STATE_FIELDS);
 	const allowedBeatFields = new Set<string>(BEAT_SHEET_EXECUTION_BEAT_FIELDS);
 	const beats: unknown[] = [];
@@ -676,14 +790,17 @@ function projectBeatSheetCompactObjectRegistry(
 			if (unexpectedField) {
 				return { ok: false, errorMessage: `${path} contains unexpected field ${unexpectedField}` };
 			}
-			const objectId = nonEmptyString(rawState.objectId);
-			if (!objectId) return { ok: false, errorMessage: `${path}.objectId must be non-empty` };
+			const declaredObjectId = nonEmptyString(rawState.objectId);
+			if (!declaredObjectId) return { ok: false, errorMessage: `${path}.objectId must be non-empty` };
+			const objectId = declaredObjectId;
 			if (declaredObjectIds.has(objectId)) {
 				return { ok: false, errorMessage: `${path}.objectId must be unique within the beat` };
 			}
 			const objectContractBase = registryById.get(objectId);
-			if (!objectContractBase) return { ok: false, errorMessage: `${path}.objectId references unknown registry object ${objectId}` };
-			for (const field of BEAT_SHEET_OBJECT_STATE_FIELDS.slice(1)) {
+			if (!objectContractBase) return { ok: false, errorMessage: `${path}.objectId references unknown registry object ${declaredObjectId}` };
+			const referenceError = inspectClipReferenceSelection(rawState, objectContractBase, path);
+			if (referenceError) return { ok: false, errorMessage: referenceError };
+			for (const field of ["startState", "spatialRelation", "driver", "stateChange", "endState"] as const) {
 				if (!nonEmptyString(rawState[field])) {
 					return { ok: false, errorMessage: `${path}.${field} must be non-empty` };
 				}
@@ -692,14 +809,48 @@ function projectBeatSheetCompactObjectRegistry(
 			const { objectId: _stateObjectId, ...stateFields } = rawState;
 			assetObjectContracts.push({ ...objectContractBase, ...stateFields });
 		}
-		beats.push({ ...rawBeat, assetObjectContracts });
+		if (!assetObjectContracts.some((contract) => contract.kind === "scene")) {
+			return { ok: false, errorMessage: `beats[${beatIndex}].objectStates must reference a scene object from objectRegistry; scene reference is required for every video clip` };
+		}
+		const blockingPlan = blockingPlans[beatIndex]!;
+
+		beats.push({ ...rawBeat, assetObjectContracts, blockingPlan });
 	}
 	return { ok: true, value: { ...root, beats } };
 }
 
 function stripBeatSheetCompactObjectFields(root: Record<string, unknown>): Record<string, unknown> {
 	const projectedRoot = { ...root };
+	/*
+	 * 端口产物剥掉 objectRegistry 后，计划里的 objectId 就没有任何可解析身份；下游节点
+	 * （资产计划投影等）必须能独立读出角色。因此在剥离前把角色一次性编译进每个计划：
+	 * 现行合同由 objectId 编译，历史候选自带的 role 原样保留。缺 objectId 又缺 role 的
+	 * 计划保持原样，由下游显式报错，不猜身份。
+	 */
+	if (Array.isArray(projectedRoot.assetPlans)) {
+		const registryById = new Map<string, Record<string, unknown>>();
+		if (Array.isArray(projectedRoot.objectRegistry)) {
+			for (const rawObject of projectedRoot.objectRegistry) {
+				if (!isRecord(rawObject)) continue;
+				const objectId = nonEmptyString(rawObject.objectId);
+				if (objectId) registryById.set(objectId, rawObject);
+			}
+		}
+		projectedRoot.assetPlans = projectedRoot.assetPlans.map((rawPlan) => {
+			if (!isRecord(rawPlan)) return rawPlan;
+			const authoredRole = nonEmptyString(rawPlan.role);
+			if (authoredRole) return rawPlan;
+			const objectId = nonEmptyString(rawPlan.objectId);
+			const object = objectId ? registryById.get(objectId) : undefined;
+			if (!object) return rawPlan;
+			const kind = nonEmptyString(object.kind);
+			const canonical = kind === "character" ? nonEmptyString(object.physicalIdentityKey) : nonEmptyString(object.name);
+			if (!kind || !canonical) return rawPlan;
+			return { ...rawPlan, role: `${kind}://${canonical}` };
+		});
+	}
 	delete projectedRoot.objectRegistry;
+	delete projectedRoot.blockingPlans;
 	if (!Array.isArray(projectedRoot.beats)) return projectedRoot;
 	projectedRoot.beats = projectedRoot.beats.map((rawBeat) => {
 		if (!isRecord(rawBeat)) return rawBeat;
@@ -800,6 +951,7 @@ function projectBeatSheetCompilerOwnedFields(
 	const clipIdentityScope = nonEmptyString(projectedRoot.sourceFingerprint)
 		?? nonEmptyString(projectedRoot.sourceId)
 		?? "tapcanvas.beat-sheet/v2";
+	let previousBeatExitState: string | null = null;
 	const beats = rootBeats.map((candidate, clipIndex) => {
 		if (!isRecord(candidate)) return candidate;
 		const projectedDialogue = dialogueByClipIndex[clipIndex]!;
@@ -816,6 +968,29 @@ function projectBeatSheetCompilerOwnedFields(
 		if (candidate.clipIndex !== clipIndex) {
 			projectedCandidate = { ...projectedCandidate, clipIndex };
 			changed = true;
+		}
+		if (Array.isArray(projectedCandidate.storyEvents)) {
+			let previousEventExitState: string | null = null;
+			const projectedStoryEvents = projectedCandidate.storyEvents.map((rawEvent, eventIndex) => {
+				if (!isRecord(rawEvent)) return rawEvent;
+				const entryState = eventIndex === 0
+					? (clipIndex === 0 ? nonEmptyString(projectedCandidate.startKeyframe) : previousBeatExitState)
+					: previousEventExitState;
+				const projectedEvent = entryState && rawEvent.entryState !== entryState
+					? { ...rawEvent, entryState }
+					: rawEvent;
+				if (projectedEvent !== rawEvent) changed = true;
+				previousEventExitState = nonEmptyString(rawEvent.exitState);
+				return projectedEvent;
+			});
+			if (JSON.stringify(projectedStoryEvents) !== JSON.stringify(projectedCandidate.storyEvents)) {
+				projectedCandidate = { ...projectedCandidate, storyEvents: projectedStoryEvents };
+			}
+			if (previousEventExitState && projectedCandidate.exitState !== previousEventExitState) {
+				projectedCandidate = { ...projectedCandidate, exitState: previousEventExitState };
+				changed = true;
+			}
+			previousBeatExitState = previousEventExitState;
 		}
 		const dialogueScript: SpokenScriptLine[] = [];
 		for (const rawLine of projectedDialogue) {
@@ -857,7 +1032,9 @@ function projectBeatSheetCompilerOwnedFields(
 			beats,
 		}
 		: root;
-	return compiledRoot;
+	const timed = compileSequenceTimeline(compiledRoot);
+	if (timed !== compiledRoot) console.info("workflow_sequence_timeline_compiled", { source: "beats.durationSeconds", segmentCount: beats.length });
+	return timed;
 }
 
 /**
@@ -866,11 +1043,58 @@ function projectBeatSheetCompilerOwnedFields(
  * evaluated by the full inspector below as diagnostics, never as workflow
  * blockers or field-level repair targets.
  */
-function inspectBeatSheetExecutionBlocker(root: Record<string, unknown>): string | null {
+/*
+ * 同一份 BeatSheet 里，底图计划只能引用本批之外已真实存在的资产。指向本批某个
+ * backgroundPlan.assetId 时，那个对象此刻还不存在（它正是本批要生成的东西），
+ * 引用必然无法解析，整批底图生成会以全部 item 失败收场。这是身份冲突，不是语义判断。
+ * 上一批已生成的底图仍可被引用（其 assetId 不在本批计划集合里）。
+ */
+function inspectBlockingBackgroundSelfReference(
+	root: Record<string, unknown>,
+	knownExistingAssetIds: readonly string[] = [],
+): string | null {
+	if (!Array.isArray(root.blockingPlans)) return null;
+	const batchAssetIds = new Set<string>();
+	const existingAssetIds = new Set(knownExistingAssetIds);
+	for (const rawPlan of root.blockingPlans) {
+		if (!isRecord(rawPlan) || !isRecord(rawPlan.backgroundPlan)) continue;
+		const assetId = rawPlan.backgroundPlan.assetId;
+		if (typeof assetId === "string" && assetId.trim()) batchAssetIds.add(assetId.trim());
+	}
+	if (batchAssetIds.size === 0) return null;
+	for (const [planIndex, rawPlan] of root.blockingPlans.entries()) {
+		if (!isRecord(rawPlan) || !isRecord(rawPlan.backgroundPlan)) continue;
+		const bindings = rawPlan.backgroundPlan.referenceAssetBindings;
+		if (!Array.isArray(bindings)) continue;
+		for (const [bindingIndex, binding] of bindings.entries()) {
+			if (!isRecord(binding)) continue;
+			const boundId = typeof binding.assetId === "string" ? binding.assetId.trim() : "";
+			if (!boundId || !batchAssetIds.has(boundId)) continue;
+			if (existingAssetIds.has(boundId)) continue;
+			return `blockingPlans[${planIndex}].backgroundPlan.referenceAssetBindings[${bindingIndex}] references ${JSON.stringify(boundId)}, which is one of this batch's own backgroundPlan assetIds and therefore does not exist yet. A layout reference must name an already-existing canvas/project asset (real nodeId, assetId or project-node:<scope>); when there is no such asset, submit an empty referenceAssetBindings array and author the space from confirmed spatial facts`;
+		}
+	}
+	return null;
+}
+
+function inspectBeatSheetExecutionBlocker(
+	root: Record<string, unknown>,
+	knownExistingAssetIds: readonly string[] = [],
+): string | null {
 	const corruptedPath = corruptTextPath(root);
 	if (corruptedPath) return `${corruptedPath} contains corrupt Unicode replacement/control text`;
+	const backgroundSelfReference = inspectBlockingBackgroundSelfReference(root, knownExistingAssetIds);
+	if (backgroundSelfReference) return backgroundSelfReference;
 	if (!isRecord(root.chapterArc)) return "chapterArc must be an object";
+	if (!Object.prototype.hasOwnProperty.call(root.chapterArc, "endingHook")) {
+		return "chapterArc.endingHook must be explicitly null or a non-empty string";
+	}
+	if (root.chapterArc.endingHook !== null && !nonEmptyString(root.chapterArc.endingHook)) {
+		return "chapterArc.endingHook must be null or a non-empty string";
+	}
 	if (!Array.isArray(root.beats) || root.beats.length === 0) return "beats must be a non-empty array";
+	const sequenceControlPlanError = validateSequenceControlPlan(root);
+	if (sequenceControlPlanError) return sequenceControlPlanError;
 	const sourceCoveragePlan = isRecord(root.sourceCoveragePlan) ? root.sourceCoveragePlan : null;
 	if (!sourceCoveragePlan || !Array.isArray(sourceCoveragePlan.speechLedger)) {
 		return "sourceCoveragePlan.speechLedger must be an array";
@@ -888,7 +1112,7 @@ function inspectBeatSheetExecutionBlocker(root: Record<string, unknown>): string
 		if (!Number.isInteger(rawLine.clipIndex)
 			|| Number(rawLine.clipIndex) < 0
 			|| Number(rawLine.clipIndex) >= root.beats.length) {
-			return `${path}.clipIndex must reference an existing beat`;
+			return `${path}.clipIndex must be a zero-based integer in range 0..${root.beats.length - 1} and reference an existing beat`;
 		}
 		if (rawLine.delivery !== "on_screen"
 			&& rawLine.delivery !== "off_screen"
@@ -897,75 +1121,10 @@ function inspectBeatSheetExecutionBlocker(root: Record<string, unknown>): string
 		}
 	}
 	for (const [beatIndex, rawBeat] of root.beats.entries()) {
-		const path = `beats[${beatIndex}]`;
-		if (!isRecord(rawBeat)) return `${path} must be an object`;
-		if (typeof rawBeat.durationSeconds !== "number"
-			|| !Number.isFinite(rawBeat.durationSeconds)
-			|| rawBeat.durationSeconds <= 0) {
-			return `${path}.durationSeconds must be positive`;
-		}
-		if (!Array.isArray(rawBeat.dialogueScript)) return `${path}.dialogueScript must be an array`;
-		for (const [lineIndex, rawLine] of rawBeat.dialogueScript.entries()) {
-			const linePath = `${path}.dialogueScript[${lineIndex}]`;
-			if (!isRecord(rawLine)) return `${linePath} must be an object`;
-			if (!nonEmptyString(rawLine.lineId)) return `${linePath}.lineId must be non-empty`;
-			if (!nonEmptyString(rawLine.speakerName)) return `${linePath}.speakerName must be non-empty`;
-			if (!nonEmptyString(rawLine.text)) return `${linePath}.text must be non-empty`;
-			if (rawLine.delivery !== "on_screen"
-				&& rawLine.delivery !== "off_screen"
-				&& rawLine.delivery !== "voice_over") {
-				return `${linePath}.delivery must be on_screen/off_screen/voice_over`;
-			}
-		}
-		if (rawBeat.narrativeAudioPlan !== undefined) {
-			if (!isRecord(rawBeat.narrativeAudioPlan)
-				|| !Array.isArray(rawBeat.narrativeAudioPlan.lines)) {
-				return `${path}.narrativeAudioPlan.lines must be an array`;
-			}
-			const narrativeLineIds = new Set<string>();
-			for (const [lineIndex, rawLine] of rawBeat.narrativeAudioPlan.lines.entries()) {
-				const linePath = `${path}.narrativeAudioPlan.lines[${lineIndex}]`;
-				if (!isRecord(rawLine)) return `${linePath} must be an object`;
-				const lineId = nonEmptyString(rawLine.lineId);
-				if (!lineId) return `${linePath}.lineId must be non-empty`;
-				if (narrativeLineIds.has(lineId)) return `${linePath}.lineId must be unique`;
-				narrativeLineIds.add(lineId);
-				if (!nonEmptyString(rawLine.speakerName)) return `${linePath}.speakerName must be non-empty`;
-				if (!nonEmptyString(rawLine.text)) return `${linePath}.text must be non-empty`;
-				if (rawLine.delivery !== undefined
-					&& rawLine.delivery !== "on_screen"
-					&& rawLine.delivery !== "off_screen"
-					&& rawLine.delivery !== "voice_over") {
-					return `${linePath}.delivery must be on_screen/off_screen/voice_over`;
-				}
-				if (rawLine.afterSourceLineId !== null && !nonEmptyString(rawLine.afterSourceLineId)) {
-					return `${linePath}.afterSourceLineId must be a non-empty string or null`;
-				}
-				if (!Array.isArray(rawLine.sourceEvidence)
-					|| rawLine.sourceEvidence.some((value) => typeof value !== "string")) {
-					return `${linePath}.sourceEvidence must be a string array`;
-				}
-			}
-		}
-		if (!Array.isArray(rawBeat.storyEvents) || rawBeat.storyEvents.length === 0) {
-			return `${path}.storyEvents must be a non-empty array`;
-		}
-		for (const [eventIndex, rawEvent] of rawBeat.storyEvents.entries()) {
-			const eventPath = `${path}.storyEvents[${eventIndex}]`;
-			if (!isRecord(rawEvent)) return `${eventPath} must be an object`;
-			if (!nonEmptyString(rawEvent.sourceBeatId)) return `${eventPath}.sourceBeatId must be non-empty`;
-			if (!nonEmptyString(rawEvent.event)) return `${eventPath}.event must be non-empty`;
-			if (!nonEmptyString(rawEvent.entryState)) return `${eventPath}.entryState must be non-empty`;
-			if (!nonEmptyString(rawEvent.exitState)) return `${eventPath}.exitState must be non-empty`;
-			if (typeof rawEvent.startSeconds !== "number"
-				|| !Number.isFinite(rawEvent.startSeconds)
-				|| typeof rawEvent.endSeconds !== "number"
-				|| !Number.isFinite(rawEvent.endSeconds)
-				|| rawEvent.endSeconds <= rawEvent.startSeconds) {
-				return `${eventPath} must use a finite positive time interval`;
-			}
-		}
+		const issue = inspectBeatExecutionStructure(rawBeat, beatIndex);
+		if (issue) return issue;
 	}
+
 	try {
 		validateWorkflowBeatObjectContinuity(root.beats.filter(isRecord));
 	} catch (error: unknown) {
@@ -979,8 +1138,14 @@ function inspectBeatSheetArtifact(root: Record<string, unknown>): string | null 
 	if (corruptedPath) return `${corruptedPath} contains corrupt Unicode replacement/control text`;
 	const chapterArc = isRecord(root.chapterArc) ? root.chapterArc : null;
 	if (!chapterArc) return "chapterArc must be an object";
-	for (const field of ["storyPromise", "protagonistThroughline", "primaryPayoff", "endingHook"] as const) {
+	for (const field of ["storyPromise", "protagonistThroughline", "primaryPayoff"] as const) {
 		if (!nonEmptyString(chapterArc[field])) return `chapterArc.${field} must be non-empty`;
+	}
+	if (chapterArc.endingHook === undefined) {
+		return "chapterArc.endingHook must be explicitly null or a non-empty string";
+	}
+	if (chapterArc.endingHook !== null && !nonEmptyString(chapterArc.endingHook)) {
+		return "chapterArc.endingHook must be null or a non-empty string";
 	}
 	const audit = isRecord(root.sourceFidelityAudit) ? root.sourceFidelityAudit : null;
 	if (!audit || !Array.isArray(audit.sourceBeatLedger) || audit.sourceBeatLedger.length === 0) {
@@ -1019,7 +1184,7 @@ function inspectBeatSheetArtifact(root: Record<string, unknown>): string | null 
 		if (!speakerName) return `sourceCoveragePlan.speechLedger[${lineIndex}].speakerName must be non-empty`;
 		if (!text) return `sourceCoveragePlan.speechLedger[${lineIndex}].text must preserve non-empty verbatim source text`;
 		if (!Number.isInteger(clipIndex) || Number(clipIndex) < 0 || Number(clipIndex) >= root.beats.length) {
-			return `sourceCoveragePlan.speechLedger[${lineIndex}].clipIndex must reference an existing beat`;
+			return `sourceCoveragePlan.speechLedger[${lineIndex}].clipIndex must be a zero-based integer in range 0..${root.beats.length - 1} and reference an existing beat`;
 		}
 		if (delivery !== "on_screen" && delivery !== "off_screen" && delivery !== "voice_over") {
 			return `sourceCoveragePlan.speechLedger[${lineIndex}].delivery must be on_screen/off_screen/voice_over`;
@@ -1089,16 +1254,7 @@ function inspectBeatSheetArtifact(root: Record<string, unknown>): string | null 
 		if (candidate.dialoguePaceRate !== undefined && declaredPaceRate === null) {
 			return `beats[${beatIndex}].dialoguePaceRate must be a positive numeric chars-per-second fact`;
 		}
-		const effectivePaceRate = Math.min(
-			declaredPaceRate ?? DEFAULT_DIALOGUE_CHARS_PER_SEC,
-			DIALOGUE_PACE_CEILING,
-		);
-		const minimumDialogueSeconds = beatSpokenScript.reduce((total, line) => (
-			total + Math.ceil((countDialogueChars(line.text) / effectivePaceRate) * 2) / 2
-		), 0);
-		if (minimumDialogueSeconds > candidate.durationSeconds) {
-			return `beats[${beatIndex}] cannot carry its frozen spoken script: durationSeconds=${candidate.durationSeconds}, dialoguePaceRate=${effectivePaceRate}, minimumDialogueSeconds=${minimumDialogueSeconds}; lowering dialoguePaceRate increases minimumDialogueSeconds and is not a repair. Keep every line verbatim and in order, then increase durationSeconds or move complete ordered speechLedger lines across beat boundaries in the same Agent task; do not use pace as a blind fit knob`;
-		}
+		// Speech capacity observations belong to the agents-cli authoring chain.
 		totalPhysicalDuration += candidate.durationSeconds;
 		if (!Array.isArray(candidate.storyEvents) || candidate.storyEvents.length === 0) {
 			return `beats[${beatIndex}].storyEvents must be a non-empty array`;
@@ -1161,6 +1317,81 @@ function inspectBeatSheetArtifact(root: Record<string, unknown>): string | null 
 	}
 	const continuityDiagnostic = inspectWorkflowBeatObjectContinuity(root.beats.filter(isRecord)).diagnostics[0];
 	if (continuityDiagnostic) return continuityDiagnostic.message;
+	return null;
+}
+
+type ResolvedSchemaPathValue = Readonly<{
+	value: unknown;
+	path: readonly (string | number)[];
+}>;
+
+function parseSchemaIdentityPath(value: unknown): readonly string[] | null {
+	if (!Array.isArray(value) || value.length === 0 || value.length > 16) return null;
+	const path = value.map((segment) => typeof segment === "string" ? segment.trim() : "");
+	if (path.some((segment) => !segment || (segment !== "*" && segment.includes(".")))) return null;
+	return path;
+}
+
+function resolveSchemaIdentityPath(root: unknown, path: readonly string[]): ResolvedSchemaPathValue[] {
+	const resolved: ResolvedSchemaPathValue[] = [];
+	const visit = (value: unknown, offset: number, currentPath: readonly (string | number)[]): void => {
+		if (offset === path.length) {
+			resolved.push({ value, path: currentPath });
+			return;
+		}
+		const segment = path[offset];
+		if (segment === "*") {
+			if (!Array.isArray(value)) return;
+			for (const [index, entry] of value.entries()) visit(entry, offset + 1, [...currentPath, index]);
+			return;
+		}
+		if (!isRecord(value) || !Object.hasOwn(value, segment)) return;
+		visit(value[segment], offset + 1, [...currentPath, segment]);
+	};
+	visit(root, 0, []);
+	return resolved;
+}
+
+function renderSchemaDataPath(path: readonly (string | number)[]): string {
+	return path.reduce<string>((current, segment) => typeof segment === "number"
+		? `${current}[${String(segment)}]`
+		: current ? `${current}.${segment}` : segment, "");
+}
+
+/**
+ * Generic cross-reference contract for typed artifacts that create asset
+ * identities and also carry references. Schema metadata declares both paths;
+ * the host only rejects a reference to an identity produced by that same batch
+ * when the frozen project inventory proves it is not already materialized.
+ */
+function inspectBatchAssetReferenceConstraints(
+	root: Record<string, unknown>,
+	jsonSchema: Record<string, unknown> | undefined,
+	knownExistingAssetIds: readonly string[] = [],
+): string | null {
+	const rawRules = jsonSchema?.["x-batchAssetReferenceConstraints"];
+	if (rawRules === undefined) return null;
+	if (!Array.isArray(rawRules) || rawRules.length === 0 || rawRules.length > 32) {
+		return "jsonSchema x-batchAssetReferenceConstraints must be a non-empty array with at most 32 rules";
+	}
+	const existingAssetIds = new Set(knownExistingAssetIds);
+	for (const [ruleIndex, rawRule] of rawRules.entries()) {
+		if (!isRecord(rawRule)) return `jsonSchema x-batchAssetReferenceConstraints[${String(ruleIndex)}] must be an object`;
+		const declaredPath = parseSchemaIdentityPath(rawRule.declaredIdentityPath);
+		const referencedPath = parseSchemaIdentityPath(rawRule.referencedIdentityPath);
+		if (!declaredPath || !referencedPath) {
+			return `jsonSchema x-batchAssetReferenceConstraints[${String(ruleIndex)}] requires valid declaredIdentityPath and referencedIdentityPath`;
+		}
+		const declaredIds = new Set(resolveSchemaIdentityPath(root, declaredPath).flatMap(({ value }) =>
+			typeof value === "string" && value.trim() ? [value.trim()] : []));
+		if (declaredIds.size === 0) continue;
+		for (const reference of resolveSchemaIdentityPath(root, referencedPath)) {
+			if (typeof reference.value !== "string") continue;
+			const assetId = reference.value.trim();
+			if (!assetId || !declaredIds.has(assetId) || existingAssetIds.has(assetId)) continue;
+			return `${renderSchemaDataPath(reference.path)} references assetId ${JSON.stringify(assetId)} declared as an output of this same batch, but the frozen project inventory does not show it as an existing asset. Revise this exact binding using confirmed project asset facts and preserve unrelated valid bindings`;
+		}
+	}
 	return null;
 }
 
@@ -1273,6 +1504,7 @@ export function parseWorkflowAgentJsonArrayContract(value: unknown): WorkflowAge
 
 export function parseWorkflowAgentJsonObjectContract(value: unknown): WorkflowAgentJsonObjectContract | null {
 	if (!isRecord(value)) return null;
+	if (value.jsonSchema !== undefined && (!isRecord(value.jsonSchema) || value.jsonSchema.type !== "object")) return null;
 	if (Object.prototype.hasOwnProperty.call(value, "failurePolicy")
 		|| Object.prototype.hasOwnProperty.call(value, "collectionCorrectionFields")
 		|| Object.prototype.hasOwnProperty.call(value, "arrayItemMergeKeyFields")) return null;
@@ -1282,22 +1514,44 @@ export function parseWorkflowAgentJsonObjectContract(value: unknown): WorkflowAg
 	const requiredStringFields = parseFieldList(value.requiredStringFields);
 	const requiredNumberFields = parseFieldList(value.requiredNumberFields);
 	const requiredObjectFields = parseFieldList(value.requiredObjectFields);
+	const requiredNonEmptyStringPaths = parseFieldList(value.requiredNonEmptyStringPaths);
+	const requiredObjectPaths = parseFieldList(value.requiredObjectPaths);
+	const requiredArrayPaths = parseFieldList(value.requiredArrayPaths);
+	const optionalNonEmptyStringPaths = parseFieldList(value.optionalNonEmptyStringPaths);
 	const requiredArrayFields = parseFieldList(value.requiredArrayFields);
 	const allowedFields = parseFieldList(value.allowedFields);
 	if (
 		requiredStringFields === null
 		|| requiredNumberFields === null
 		|| requiredObjectFields === null
+		|| requiredNonEmptyStringPaths === null
+		|| requiredObjectPaths === null
+		|| requiredArrayPaths === null
+		|| optionalNonEmptyStringPaths === null
 		|| requiredArrayFields === null
 		|| !allowedFields
 	) return null;
+	let exactStringPaths: Record<string, string> | undefined;
+	if (value.exactStringPaths !== undefined) {
+		if (!isRecord(value.exactStringPaths)) return null;
+		const entries = Object.entries(value.exactStringPaths);
+		if (entries.length === 0 || entries.length > 64) return null;
+		const normalized: Record<string, string> = {};
+		for (const [rawPath, rawExpected] of entries) {
+			const path = rawPath.trim();
+			const expected = typeof rawExpected === "string" ? rawExpected.trim() : "";
+			if (!path || !expected) return null;
+			normalized[path] = expected;
+		}
+		exactStringPaths = normalized;
+	}
 	const requiredFields = [
 		...(requiredStringFields ?? []),
 		...(requiredNumberFields ?? []),
 		...(requiredObjectFields ?? []),
 		...(requiredArrayFields ?? []),
 	];
-	if (requiredFields.length === 0 || new Set(requiredFields).size !== requiredFields.length) return null;
+	if ((requiredFields.length === 0 && !value.jsonSchema) || new Set(requiredFields).size !== requiredFields.length) return null;
 	const allowed = new Set(allowedFields);
 	if (requiredFields.some((field) => !allowed.has(field))) return null;
 	let exactStringFields: Record<string, string> | undefined;
@@ -1314,6 +1568,17 @@ export function parseWorkflowAgentJsonObjectContract(value: unknown): WorkflowAg
 			normalized[field] = exactValue;
 		}
 		exactStringFields = normalized;
+	}
+	let knownExistingAssetIds: readonly string[] | undefined;
+	if (value.knownExistingAssetIds !== undefined) {
+		if (!Array.isArray(value.knownExistingAssetIds)
+			|| value.knownExistingAssetIds.length === 0
+			|| value.knownExistingAssetIds.length > 2048) return null;
+		const normalized = value.knownExistingAssetIds.map((assetId) =>
+			typeof assetId === "string" ? assetId.trim() : "",
+		);
+		if (normalized.some((assetId) => !assetId)) return null;
+		knownExistingAssetIds = [...new Set(normalized)];
 	}
 	let expectedArrayLengths: Record<string, number> | undefined;
 	if (value.expectedArrayLengths !== undefined) {
@@ -1349,7 +1614,33 @@ export function parseWorkflowAgentJsonObjectContract(value: unknown): WorkflowAg
 		}
 		return normalized;
 	};
+	const parseArrayItemStringFormats = (
+		rawValue: unknown,
+	): Readonly<Record<string, Readonly<Record<string, WorkflowAgentStringFormat>>>> | null | undefined => {
+		if (rawValue === undefined) return undefined;
+		if (!isRecord(rawValue)) return null;
+		const entries = Object.entries(rawValue);
+		if (entries.length === 0 || entries.length > 64) return null;
+		const arrayFields = new Set(requiredArrayFields ?? []);
+		const normalized: Record<string, Readonly<Record<string, WorkflowAgentStringFormat>>> = {};
+		for (const [rawArrayField, rawFormats] of entries) {
+			const arrayField = rawArrayField.trim();
+			if (!arrayField || !arrayFields.has(arrayField) || !allowed.has(arrayField) || !isRecord(rawFormats)) return null;
+			const formatEntries = Object.entries(rawFormats);
+			if (formatEntries.length === 0 || formatEntries.length > 64) return null;
+			const formats: Record<string, WorkflowAgentStringFormat> = {};
+			for (const [rawField, rawFormat] of formatEntries) {
+				const field = rawField.trim();
+				const format = WORKFLOW_AGENT_STRING_FORMATS.find((candidate) => candidate === rawFormat);
+				if (!field || !format) return null;
+				formats[field] = format;
+			}
+			normalized[arrayField] = formats;
+		}
+		return normalized;
+	};
 	const arrayItemRequiredStringFields = parseArrayItemRequiredFields(value.arrayItemRequiredStringFields);
+	const arrayItemStringFormats = parseArrayItemStringFormats(value.arrayItemStringFormats);
 	const arrayItemRequiredStringArrayFields = parseArrayItemRequiredFields(
 		value.arrayItemRequiredStringArrayFields,
 	);
@@ -1358,9 +1649,15 @@ export function parseWorkflowAgentJsonObjectContract(value: unknown): WorkflowAg
 	);
 	const arrayItemAllowedFields = parseArrayItemRequiredFields(value.arrayItemAllowedFields);
 	if (arrayItemRequiredStringFields === null
+		|| arrayItemStringFormats === null
 		|| arrayItemRequiredStringArrayFields === null
 		|| arrayItemRequiredNonEmptyStringArrayFields === null
 		|| arrayItemAllowedFields === null) return null;
+	for (const [arrayField, formats] of Object.entries(arrayItemStringFormats ?? {})) {
+		const requiredFieldsForArray = new Set(arrayItemRequiredStringFields?.[arrayField] ?? []);
+		const allowedFieldsForArray = new Set(arrayItemAllowedFields?.[arrayField] ?? []);
+		if (Object.keys(formats).some((field) => !requiredFieldsForArray.has(field) || !allowedFieldsForArray.has(field))) return null;
+	}
 	if (value.arrayItemExactNumberFields !== undefined) {
 		if (!isRecord(value.arrayItemExactNumberFields)) return null;
 		const entries = Object.entries(value.arrayItemExactNumberFields);
@@ -1501,15 +1798,39 @@ export function parseWorkflowAgentJsonObjectContract(value: unknown): WorkflowAg
 		if (declarationPaths.some((path) => allowed.has(path))) return null;
 		itemExactAssetIds = { declarationPaths, expectedAssetPlansFromPort };
 	}
+	let itemTimelineEventIntervals: Array<{ startSeconds: number; endSeconds: number }> | undefined;
+	if (value.itemTimelineEventIntervals !== undefined) {
+		if (!Array.isArray(value.itemTimelineEventIntervals)
+			|| value.itemTimelineEventIntervals.length === 0
+			|| value.itemTimelineEventIntervals.length > 256) return null;
+		const intervals: Array<{ startSeconds: number; endSeconds: number }> = [];
+		for (const rawInterval of value.itemTimelineEventIntervals) {
+			if (!isRecord(rawInterval)) return null;
+			const startSeconds = rawInterval.startSeconds;
+			const endSeconds = rawInterval.endSeconds;
+			if (typeof startSeconds !== "number" || !Number.isFinite(startSeconds) || startSeconds < 0
+				|| typeof endSeconds !== "number" || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) return null;
+			intervals.push({ startSeconds, endSeconds });
+		}
+		itemTimelineEventIntervals = intervals;
+	}
 	return {
 		...(contractName ? { contractName, contractVersion } : {}),
+		...(isRecord(value.jsonSchema) ? { jsonSchema: value.jsonSchema } : {}),
 		...(requiredStringFields ? { requiredStringFields } : {}),
 		...(exactStringFields ? { exactStringFields } : {}),
+		...(knownExistingAssetIds ? { knownExistingAssetIds } : {}),
 		...(requiredNumberFields ? { requiredNumberFields } : {}),
 		...(requiredObjectFields ? { requiredObjectFields } : {}),
+		...(requiredNonEmptyStringPaths ? { requiredNonEmptyStringPaths } : {}),
+		...(requiredObjectPaths ? { requiredObjectPaths } : {}),
+		...(requiredArrayPaths ? { requiredArrayPaths } : {}),
+		...(optionalNonEmptyStringPaths ? { optionalNonEmptyStringPaths } : {}),
+		...(exactStringPaths ? { exactStringPaths } : {}),
 		...(requiredArrayFields ? { requiredArrayFields } : {}),
 		...(expectedArrayLengths ? { expectedArrayLengths } : {}),
 		...(arrayItemRequiredStringFields ? { arrayItemRequiredStringFields } : {}),
+		...(arrayItemStringFormats ? { arrayItemStringFormats } : {}),
 		...(arrayItemRequiredStringArrayFields ? { arrayItemRequiredStringArrayFields } : {}),
 		...(arrayItemRequiredNonEmptyStringArrayFields ? { arrayItemRequiredNonEmptyStringArrayFields } : {}),
 		...(arrayItemAllowedFields ? { arrayItemAllowedFields } : {}),
@@ -1519,6 +1840,7 @@ export function parseWorkflowAgentJsonObjectContract(value: unknown): WorkflowAg
 		...(arrayItemExactStringArrayFields ? { arrayItemExactStringArrayFields } : {}),
 		...(itemRequiredNonEmptyArrayFields ? { itemRequiredNonEmptyArrayFields } : {}),
 		...(itemExactAssetIds ? { itemExactAssetIds } : {}),
+		...(itemTimelineEventIntervals ? { itemTimelineEventIntervals } : {}),
 		allowedFields,
 	};
 }
@@ -1574,6 +1896,11 @@ export function inspectDeclaredAssetIdsMatch(
 				if (!isRecord(entry)) continue;
 				const assetId = typeof entry.assetId === "string" ? entry.assetId.trim() : "";
 				if (assetId) declared.add(assetId);
+				if (Array.isArray(entry.assetIds)) {
+					for (const id of entry.assetIds) {
+						if (typeof id === "string" && id.trim()) declared.add(id.trim());
+					}
+				}
 			}
 		}
 		const missing = expected.filter((assetId) => !declared.has(assetId));
@@ -1668,7 +1995,22 @@ export function validateWorkflowAgentOutput(input: Readonly<{
 		let parsed = parsedValue;
 		const contract = input.jsonObjectContract;
 		if (!contract) return { ok: false, errorMessage: "Agent json_object output requires an explicit structural contract" };
-		let diagnostics: readonly WorkflowAgentOutputDiagnostic[] = [];
+		const referenceObservations: ReferenceFactObservation[] = [];
+		if (contract.jsonSchema) {
+			const issues = validateWorkflowToolArguments(contract.jsonSchema, parsed, referenceObservations);
+			if (issues.length) return { ok: false, errorMessage: issues.map(issue => issue.message).join(" | ") };
+			const registryError = inspectRegisteredAssetPlans(parsed);
+			if (registryError) return { ok: false, errorMessage: registryError };
+			const batchAssetReferenceError = inspectBatchAssetReferenceConstraints(
+				parsed,
+				contract.jsonSchema,
+				contract.knownExistingAssetIds,
+			);
+			if (batchAssetReferenceError) return { ok: false, errorMessage: batchAssetReferenceError };
+		}
+		let diagnostics: readonly WorkflowAgentOutputDiagnostic[] = referenceObservations.map(observation => ({
+			code: "model_authored_consistency", message: observation.message,
+		}));
 		if (
 			contract.contractName === BEAT_SHEET_ARTIFACT_CONTRACT_NAME
 			&& (
@@ -1725,15 +2067,29 @@ export function validateWorkflowAgentOutput(input: Readonly<{
 				errorMessage: `Agent json_object output array field ${mismatchedArrayLength} must contain exactly ${String(expected)} items`,
 			};
 		}
-		for (const [arrayField, requiredFields] of Object.entries(contract.arrayItemRequiredStringFields ?? {})) {
+	for (const [arrayField, requiredFields] of Object.entries(contract.arrayItemRequiredStringFields ?? {})) {
 			const items = Array.isArray(parsed[arrayField]) ? parsed[arrayField] as unknown[] : [];
 			for (let index = 0; index < items.length; index += 1) {
 				const item = items[index];
 				if (!isRecord(item)) return { ok: false, errorMessage: `Agent json_object output ${arrayField} item ${index + 1} must be an object` };
 				const missing = requiredFields.find((field) => typeof item[field] !== "string" || !(item[field] as string).trim());
 				if (missing) return { ok: false, errorMessage: `Agent json_object output ${arrayField} item ${index + 1} requires non-empty string field ${missing}` };
+		}
+	}
+	for (const [arrayField, formats] of Object.entries(contract.arrayItemStringFormats ?? {})) {
+		const items = Array.isArray(parsed[arrayField]) ? parsed[arrayField] as unknown[] : [];
+		for (let index = 0; index < items.length; index += 1) {
+			const item = items[index];
+			if (!isRecord(item)) return { ok: false, errorMessage: `Agent json_object output ${arrayField} item ${index + 1} must be an object` };
+			const mismatch = Object.entries(formats).find(([field, format]) => {
+				const value = (item as Record<string, unknown>)[field];
+				return typeof value !== "string" || inspectStringFormat(value.trim(), format) !== null;
+			});
+			if (mismatch) {
+				return { ok: false, errorMessage: `Agent json_object output ${arrayField} item ${index + 1} field ${mismatch[0]} must use kind://canonical-name` };
 			}
 		}
+	}
 		for (const [arrayField, requiredFields] of Object.entries(contract.arrayItemRequiredStringArrayFields ?? {})) {
 			const items = Array.isArray(parsed[arrayField]) ? parsed[arrayField] as unknown[] : [];
 			for (let index = 0; index < items.length; index += 1) {
@@ -1768,6 +2124,7 @@ export function validateWorkflowAgentOutput(input: Readonly<{
 				// deterministic projection adds the legacy downstream field after raw
 				// input has already been checked against the compact beat allow-list.
 				allowedItemFieldSet.add("assetObjectContracts");
+				allowedItemFieldSet.add("blockingPlan");
 			}
 			for (let index = 0; index < items.length; index += 1) {
 				const item = items[index];
@@ -1873,13 +2230,13 @@ export function validateWorkflowAgentOutput(input: Readonly<{
 			if (contract.contractVersion !== BEAT_SHEET_ARTIFACT_CONTRACT_VERSION) {
 				return { ok: false, errorMessage: `Agent json_object output uses unsupported ${contract.contractName} version ${contract.contractVersion ?? "missing"}` };
 			}
-			const executionBlocker = inspectBeatSheetExecutionBlocker(parsed);
+			const executionBlocker = inspectBeatSheetExecutionBlocker(parsed, contract.knownExistingAssetIds);
 			if (executionBlocker) {
 				return { ok: false, errorMessage: `Agent BeatSheet artifact cannot be executed: ${executionBlocker}` };
 			}
 			const artifactMismatch = inspectBeatSheetArtifact(parsed);
 			if (artifactMismatch) {
-				diagnostics = [{
+				diagnostics = [...diagnostics, {
 					code: "model_authored_consistency",
 					message: artifactMismatch,
 				}];

@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
 	preferenceUpsert: vi.fn(),
 	preferenceDeleteMany: vi.fn(),
 	attachmentDeleteMany: vi.fn(),
+	attachmentUpsert: vi.fn(),
 	systemSettingFindMany: vi.fn(),
 	skillFindMany: vi.fn(),
 	flowFindFirst: vi.fn(),
@@ -43,11 +44,13 @@ import {
 	generateWorkflowCapabilityDescription,
 	getBuiltInCapabilityAvailability,
 	getCapabilityBay,
+	inspectWorkflowCapability,
 	listEquippedWorkflowCapabilities,
 	obsoleteWorkflowReplacementPreferences,
 	resolveEquippedWorkflowExecutionTarget,
 	unequipWorkflowCapability,
 	updateBuiltInCapabilityState,
+	validateCapabilityRouteResolutions,
 } from "./capability-bay.service";
 
 describe("generateWorkflowCapabilityDescription", () => {
@@ -121,6 +124,7 @@ const report = {
 	targetCapabilityId: descriptor.capabilityId,
 	checkedAt: "2026-08-15T00:00:00.000Z",
 	descriptorSha256: "a".repeat(64),
+	semanticAnalysis: { status: "succeeded" } as const,
 	conflicts: [],
 	blocking: false,
 	requiresConfirmation: false,
@@ -157,6 +161,7 @@ const database = {
 		findFirst: mocks.attachmentFindFirst,
 		findMany: mocks.attachmentFindMany,
 		deleteMany: mocks.attachmentDeleteMany,
+		upsert: mocks.attachmentUpsert,
 	},
 	flows: { findFirst: mocks.flowFindFirst, findMany: mocks.flowFindMany },
 	flow_versions: {
@@ -421,6 +426,19 @@ describe("workflow equip scope", () => {
 						workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION - 1,
 					},
 				},
+				{
+					id: "video-stage-1",
+					data: {
+						kind: "workflowStage",
+						workflowKey: VIDEO_PRODUCTION_WORKFLOW_KEY,
+						workflowExecutionVariant: "full_video",
+						workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION - 1,
+						workflowAtomicSpec: {
+							operation: "video_submission",
+							executorRef: "tapcanvas.video.generate/v1",
+						},
+					},
+				},
 			],
 			edges: [],
 		});
@@ -510,7 +528,7 @@ describe("workflow equip scope", () => {
 
 		const rows = await listEquippedWorkflowCapabilities(context, "user-1");
 
-		expect(rows[0]?.preparation).toBeUndefined();
+		expect(rows[0]).not.toHaveProperty("preparation");
 	});
 
 	it("rejects a non-admin attempt to publish a workflow as all_users", async () => {
@@ -532,6 +550,15 @@ describe("workflow equip scope", () => {
 describe("workflow replacement lifecycle", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+	});
+
+	it("releases a previous replacement only when the new decision explicitly chooses coexistence", () => {
+		const preference = { capability_kind: "built_in", capability_id: "one_click_video", enabled: 0,
+			disabled_reason: "replaced", replaced_by_capability_id: "workflow:flow-1" };
+		expect(obsoleteWorkflowReplacementPreferences({ workflowCapabilityId: "workflow:flow-1",
+			replacementTargets: [], requiredSkills: [], coexistingTargets: ["builtin:one_click_video"],
+			preferences: [preference, { ...preference, replaced_by_capability_id: "workflow:another" }],
+		})).toEqual([{ capabilityKind: "built_in", capabilityId: "one_click_video" }]);
 	});
 
 	it("releases only self-disabled Skill dependencies and preserves confirmed built-in replacements across versions", () => {
@@ -610,6 +637,10 @@ describe("getCapabilityBay", () => {
 			name: "当前项目",
 			project_kind: "creative",
 			updated_at: "2026-08-15T00:00:00.000Z",
+			owner_id: "user-1",
+			team_id: null,
+			team_shared: false,
+			access: "team_edit",
 		}]);
 		mocks.attachmentFindMany.mockResolvedValue([]);
 		mocks.invocationFindMany.mockResolvedValue([]);
@@ -621,6 +652,7 @@ describe("getCapabilityBay", () => {
 
 	it("loads the current project alongside globally managed AI workflow projects", async () => {
 		const bayContext = {
+			get: (key: string) => key === "auth" ? {} : undefined,
 			env: {
 				DB: {
 					flows: { findMany: mocks.flowFindMany },
@@ -662,7 +694,48 @@ describe("getCapabilityBay", () => {
 		expect(result.invocations).toEqual([]);
 		expect(result.candidates[0]).toMatchObject({
 			projectName: "当前项目",
+			canEdit: true,
 			descriptor: { sourceVersionId: expect.stringMatching(/^capability-version-[a-f0-9]{64}$/) },
+		});
+		expect(mocks.invocationFindMany).not.toHaveBeenCalled();
+	});
+
+	it("projects workflow editability and loads invocations only when requested", async () => {
+		mocks.listProjectsAccessibleByUser.mockResolvedValue([{
+			id: "project-1",
+			name: "工作流项目",
+			project_kind: "ai_workflow",
+			updated_at: "2026-08-15T00:00:00.000Z",
+			owner_id: "user-1",
+			team_id: null,
+			team_shared: false,
+			access: "owner",
+		}]);
+
+		const bayContext = {
+			get: (key: string) => key === "auth" ? {} : undefined,
+			env: {
+				DB: {
+					flows: { findMany: mocks.flowFindMany },
+					flow_versions: { findMany: mocks.versionFindMany },
+					agent_capability_attachments: { findMany: mocks.attachmentFindMany },
+					agent_capability_preferences: { findMany: mocks.preferenceFindMany },
+					agent_builtin_capability_settings: { findMany: mocks.systemSettingFindMany },
+					agent_skills: { findMany: mocks.skillFindMany },
+					agent_capability_invocations: { findMany: mocks.invocationFindMany },
+				},
+			},
+		} as unknown as AppContext;
+
+		const result = await getCapabilityBay(bayContext, "user-1", undefined, { includeInvocations: true });
+
+		expect(result.candidates[0]).toMatchObject({ canEdit: true, nodeBreakdown: null });
+		expect(result.workflowProjects[0]).toMatchObject({ canEdit: true, canDelete: true });
+		expect(mocks.invocationFindMany).toHaveBeenCalledWith({
+			where: { user_id: "user-1" },
+			orderBy: { created_at: "desc" },
+			take: 100,
+			include: { workflow_executions: true },
 		});
 	});
 
@@ -1528,5 +1601,67 @@ describe("workflow fanout diff stale tolerance", () => {
 
 		await expect(resolveEquippedWorkflowExecutionTarget(context, "user-1", "attachment-1"))
 			.rejects.toMatchObject({ code: "capability_attachment_stale", status: 409 });
+	});
+});
+describe("capability coexistence action boundary", () => {
+  for (const capabilityId of ["builtin:paid_media_generation", "tapcanvas-video-prompt-writer"]) {
+    it(`preserves ${capabilityId} for coexist while rejecting replacement`, () => {
+      const input = {
+		descriptor: { ...descriptor, requiredSkills: ["tapcanvas-video-prompt-writer"], sideEffects: [...descriptor.sideEffects] },
+        report: { ...report, conflicts: [{
+          id: "overlap", severity: "warning" as const, category: "semantic_overlap" as const,
+          withCapabilityId: capabilityId, resolutionMode: "choose_primary" as const,
+          title: "Shared dependency", rationale: "The workflow consumes this capability", resolution: "Keep dependency",
+        }] },
+      };
+      expect(validateCapabilityRouteResolutions({ ...input, resolutions: [{
+        conflictId: "overlap", withCapabilityId: capabilityId, action: "coexist",
+      }] })).toEqual([]);
+      expect(() => validateCapabilityRouteResolutions({ ...input, resolutions: [{
+        conflictId: "overlap", withCapabilityId: capabilityId, action: "replace_existing",
+      }] })).toThrow();
+    });
+  }
+});
+
+
+describe("workflow version replacement transaction", () => {
+	it("replaces the attachment with the newly inspected version and preserves its primary route", async () => {
+		vi.clearAllMocks();
+		mocks.flowFindFirst.mockResolvedValue({ ...flowRow, data: capabilityWorkflowJson });
+		mocks.getProjectForUserAccess.mockResolvedValue({ id: "project-1", access: "owner" });
+		const previousRoute = { conflictId: "old-route", withCapabilityId: "builtin:one_click_video", action: "replace_existing" };
+		mocks.attachmentFindMany.mockResolvedValue([{ ...attachmentRow, route_decisions_json: JSON.stringify([previousRoute]) }]);
+		mocks.preferenceFindMany.mockResolvedValue([]);
+		mocks.skillFindMany.mockResolvedValue([]);
+		mocks.systemSettingFindMany.mockResolvedValue([]);
+		mocks.attachmentUpsert.mockImplementation(async (input: { update: Record<string, unknown> }) => ({
+			...attachmentRow, ...input.update, conflict_report_revision: 2,
+		}));
+		const c = { env: { DB: { ...database,
+			agent_skills: { findMany: mocks.skillFindMany },
+			agent_builtin_capability_settings: { findMany: mocks.systemSettingFindMany },
+		}, AGENTS_BRIDGE_BASE_URL: "http://bridge", JWT_SECRET: "test-secret" } } as unknown as AppContext;
+		mocks.transaction.mockImplementation(async (operation: (db: typeof c.env.DB) => Promise<unknown>) => operation(c.env.DB));
+		const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ conflicts: [] }), { status: 200 }));
+		try {
+			const inspection = await inspectWorkflowCapability(c, "user-1", "flow-1");
+			const result = await equipWorkflowCapability(c, "user-1", "flow-1", {
+				sourceVersionId: inspection.descriptor.sourceVersionId,
+				descriptorSha256: inspection.descriptorSha256,
+				inspectionToken: inspection.inspectionToken,
+				resolutions: inspection.report.conflicts.map((conflict) => ({ conflictId: conflict.id,
+					withCapabilityId: conflict.withCapabilityId,
+					action: conflict.resolutionMode === "choose_primary" ? "replace_existing" : "acknowledge" })),
+			});
+			expect(result.sourceVersionId).toBe(inspection.descriptor.sourceVersionId);
+			expect(result.sourceVersionId).not.toBe(attachmentRow.source_version_id);
+			expect(result.descriptorSha256).toBe(inspection.descriptorSha256);
+			expect(result.routeDecisions).toContainEqual(previousRoute);
+			expect(mocks.transaction).toHaveBeenCalledWith(expect.any(Function), { isolationLevel: "Serializable" });
+			expect(mocks.versionUpsert).toHaveBeenCalledWith(expect.objectContaining({ update: {} }));
+		} finally {
+			fetchMock.mockRestore();
+		}
 	});
 });

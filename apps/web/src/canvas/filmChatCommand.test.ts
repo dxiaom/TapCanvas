@@ -32,7 +32,8 @@ describe('film chat commands', () => {
     expect(chapter).toContain('创意改编')
     expect(chapter).toContain('executionScope=media_delivery')
     expect(chapter).toContain('executionVariant=full_video')
-		expect(chapter).toContain('不得用账号偏好')
+		expect(chapter).toContain('新执行受理时读取用户当前启用的生成偏好')
+    expect(chapter).toContain('单段时长不是整章总时长')
     expect(chapter).not.toContain('"aspect"')
     expect(chapter).not.toContain('"resolution"')
     expect(chapter).toContain('"targetDurationSeconds":90')
@@ -69,7 +70,7 @@ describe('film chat commands', () => {
 			'tapcanvas_equipped_workflow_run',
 		])
 		expect(policy.allowedTools).not.toContain('tapcanvas_analyze_video')
-		expect(policy.allowedTools).not.toContain('tapcanvas_director_set_character_motion')
+		expect(policy.allowedTools).not.toContain('tapcanvas_director_desk')
 		expect(policy.allowedTools).not.toContain('tapcanvas_project_context_get')
 		expect(policy.allowedTools).not.toContain('tapcanvas_execution_get')
 		expect(policy.allowedTools).not.toContain('tapcanvas_execution_node_runs_get')

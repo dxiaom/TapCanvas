@@ -1,3 +1,4 @@
+import { bindWorkflowUserIntentToTrigger } from "../execution/execution.workflow-user-intent";
 import { createRoute, z } from "@hono/zod-openapi";
 import {
   WORKFLOW_CONCURRENCY_MAX,
@@ -177,13 +178,16 @@ import {
   parseVideoGenerationContract,
   resolveStoryPlanGenerationContract,
 } from "./video-orchestrator.generation-contract";
-import { resolveModelMediaOptions } from "./video-orchestrator.model-duration";
 import { loadPublicChatEnabledModelCatalogSummary } from "../model-catalog/model-catalog.public-chat-summary";
 import { buildAgentImageExecutionCatalog } from "./agents-tool-bridge.model-execution-catalog";
 import { splitMasterStoryboardForAgent } from "./agents-tool-bridge.master-storyboard-split";
-import { captureDirectorScene, defineDirectorMotion, setDirectorCharacterMotion } from "./agents-tool-bridge.capture-director-scene";
-import { getTaskResultByTaskId, tryClaimTaskResult, upsertTaskResult } from "./task-result.repo";
-import { readResultJson, buildResultJson } from "./director-capture.shared";
+import {
+	DIRECTOR_DESK_RELAY_TOOL_NAME,
+	claimDirectorDeskCall,
+	listPendingDirectorDeskCalls,
+	relayDirectorDeskTool,
+	reportDirectorDeskCall,
+} from "./director-desk-relay";
 import {
 	WorkflowExecutionFamilySchema,
 	WorkflowExecutionEventSchema,
@@ -219,11 +223,7 @@ import {
 	WorkflowResumeError,
 } from "../execution/execution.resume-service";
 import { buildWorkflowProjectContextForRun } from "../execution/execution.project-context-runtime";
-import {
-  freezeWorkflowVideoDurationPlan,
-  WORKFLOW_VIDEO_DURATION_PLAN_TRIGGER_FIELD,
-  type FrozenWorkflowVideoDurationPlan,
-} from "../execution/execution.video-workflow-contract";
+import { freezeWorkflowVideoPlanAtAdmission } from "./workflow-video-plan-admission";
 import { requireStoryboardV12ArtifactPayload } from "../storyboard/storyboard-persistence-contract";
 import {
   type StoryboardPlanRecord,
@@ -344,10 +344,7 @@ export const AgentsToolExecuteRequestSchema = z.object({
     "tapcanvas_video_compare",
     "tapcanvas_fetch_video_from_url",
     "tapcanvas_shot_table_critic",
-    "tapcanvas_capture_director_scene",
-    "tapcanvas_render_director_clip",
-    "tapcanvas_director_define_motion",
-    "tapcanvas_director_set_character_motion",
+    DIRECTOR_DESK_RELAY_TOOL_NAME,
     "tapcanvas_master_storyboard_split",
     "tapcanvas_tool_catalog_get",
     "tapcanvas_tool_schema_get",
@@ -366,6 +363,8 @@ export const AgentsToolExecuteRequestSchema = z.object({
   chapterId: z.string().min(1).optional(),
   executionId: z.string().min(1).optional(),
   parentAgentExecution: ParentAgentExecutionSchema.optional(),
+  userIntentContract: z.record(z.string(), z.unknown()).optional(),
+  userIntentContractHash: z.string().min(1).optional(),
   publicTurnId: z.string().min(1).max(200).optional(),
   requestedWorkflowExecutionVariant: z.enum(["full_video", "first_video"]).optional(),
 });
@@ -931,120 +930,6 @@ async function requireEnabledImageModelCatalog(
 	return catalogResult.summary.imageModels;
 }
 
-async function freezeWorkflowVideoPlanAtAdmission(input: Readonly<{
-  c: AppContext;
-  triggerPayload: Record<string, unknown> | undefined;
-}>): Promise<Readonly<{
-  triggerPayload: Record<string, unknown> | undefined;
-  durationPlan: FrozenWorkflowVideoDurationPlan | null;
-}>> {
-  const targetDurationValue = input.triggerPayload?.targetDurationSeconds;
-  const modelKeyValue = input.triggerPayload?.videoModelKey;
-  if (targetDurationValue === undefined || modelKeyValue === undefined) {
-    return { triggerPayload: input.triggerPayload, durationPlan: null };
-  }
-  const targetDurationSeconds = Number(targetDurationValue);
-  const requestedClipCountValue = input.triggerPayload?.requestedClipCount;
-  const requestedClipCount = requestedClipCountValue === undefined
-    ? null
-    : Number(requestedClipCountValue);
-  const requestedClipDurationsValue = input.triggerPayload?.requestedClipDurationsSeconds;
-  const requestedClipDurationsSeconds = requestedClipDurationsValue === undefined
-    ? null
-    : Array.isArray(requestedClipDurationsValue)
-      ? requestedClipDurationsValue
-      : null;
-  const modelKey = readTrimmedString(modelKeyValue);
-  if (!Number.isInteger(targetDurationSeconds) || targetDurationSeconds <= 0) {
-    throw new AppError("targetDurationSeconds must be a positive integer", {
-      status: 400,
-      code: "workflow_video_target_duration_invalid",
-    });
-  }
-  if (!modelKey) {
-    throw new AppError("videoModelKey is required when targetDurationSeconds is provided", {
-      status: 400,
-      code: "workflow_video_model_key_required",
-    });
-  }
-  if (requestedClipCount !== null && (!Number.isInteger(requestedClipCount) || requestedClipCount <= 0)) {
-    throw new AppError("requestedClipCount must be a positive integer", {
-      status: 400,
-      code: "workflow_requested_clip_count_invalid",
-    });
-  }
-  if (
-    requestedClipDurationsValue !== undefined
-    && (
-      !requestedClipDurationsSeconds
-      || requestedClipDurationsSeconds.length === 0
-      || requestedClipDurationsSeconds.length > 64
-      || requestedClipDurationsSeconds.some((duration) => (
-        typeof duration !== "number" || !Number.isInteger(duration) || duration <= 0
-      ))
-    )
-  ) {
-    throw new AppError("requestedClipDurationsSeconds must contain 1..64 positive integers", {
-      status: 400,
-      code: "workflow_requested_clip_durations_invalid",
-    });
-  }
-  if (
-    requestedClipDurationsSeconds
-    && requestedClipCount === null
-  ) {
-    throw new AppError("requestedClipCount is required when requestedClipDurationsSeconds is provided", {
-      status: 400,
-      code: "workflow_requested_clip_count_required_for_durations",
-    });
-  }
-  if (
-    requestedClipDurationsSeconds
-    && requestedClipCount !== null
-    && requestedClipDurationsSeconds.length !== requestedClipCount
-  ) {
-    throw new AppError("requestedClipCount must match requestedClipDurationsSeconds.length", {
-      status: 400,
-      code: "workflow_requested_clip_count_duration_mismatch",
-    });
-  }
-  if (
-    requestedClipDurationsSeconds
-    && requestedClipDurationsSeconds.reduce((total, duration) => total + Number(duration), 0) !== targetDurationSeconds
-  ) {
-    throw new AppError("requestedClipDurationsSeconds must sum to targetDurationSeconds", {
-      status: 400,
-      code: "workflow_requested_clip_duration_total_mismatch",
-    });
-  }
-  const mediaOptions = await resolveModelMediaOptions({ c: input.c, modelKey });
-  assertWorkflowVideoMediaSelectionSupported({
-    modelKey,
-    resolution: readTrimmedString(input.triggerPayload?.videoResolution),
-    aspectRatio: readTrimmedString(input.triggerPayload?.videoAspectRatio),
-    resolutionOptions: mediaOptions.resolutionOptions,
-    aspectRatioOptions: mediaOptions.aspectRatioOptions,
-  });
-  const durationPlan = freezeWorkflowVideoDurationPlan({
-    targetDurationSeconds,
-    modelKey,
-    durationOptions: mediaOptions.durationOptions,
-    ...(requestedClipDurationsSeconds
-      ? { explicitDurations: requestedClipDurationsSeconds as number[] }
-      : {}),
-  });
-  return {
-    triggerPayload: {
-      ...(input.triggerPayload ?? {}),
-      targetDurationSeconds,
-      ...(requestedClipCount === null ? {} : { requestedClipCount }),
-      ...(requestedClipDurationsSeconds ? { requestedClipDurationsSeconds } : {}),
-      [WORKFLOW_VIDEO_DURATION_PLAN_TRIGGER_FIELD]: durationPlan,
-    },
-    durationPlan,
-  };
-}
-
 /**
  * 系统级共享工作流的媒体交付目标：调用者当前对话所在画布（canvasFlowId/
  * canvasProjectId）。缺省（未传、或与工作流自身 flow 相同）时不注入，媒体
@@ -1069,7 +954,7 @@ function resolveWorkflowDeliveryScope(input: Readonly<{
 }
 
 export function buildWorkflowExecutionReceipt(
-	execution: WorkflowExecutionDto,
+	execution: Pick<WorkflowExecutionDto, "id" | "executionFamilyId" | "status">,
 ): Readonly<{
 	protocolVersion: "tapcanvas.workflow-execution-receipt/v1";
 	runId: string;
@@ -1077,6 +962,8 @@ export function buildWorkflowExecutionReceipt(
 	executionFamilyId: string;
 	status: WorkflowExecutionDto["status"];
 	acceptedAsync: boolean;
+	completionBoundary?: "submission";
+	executionOwner?: "durable_executor";
 	inspection: Readonly<{
 		toolName: "tapcanvas_workflow_execution_inspect";
 		familyArgs: Readonly<{ executionId: string; view: "family" }>;
@@ -1090,6 +977,7 @@ export function buildWorkflowExecutionReceipt(
 		executionFamilyId: execution.executionFamilyId,
 		status: execution.status,
 		acceptedAsync: execution.status === "queued" || execution.status === "running",
+		...(execution.status === "queued" || execution.status === "running" ? { completionBoundary: "submission" as const, executionOwner: "durable_executor" as const } : {}),
 		inspection: {
 			toolName: "tapcanvas_workflow_execution_inspect",
 			familyArgs: { executionId: execution.id, view: "family" },
@@ -2167,8 +2055,15 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
       const admittedVideoPlan = await freezeWorkflowVideoPlanAtAdmission({
         c: c as unknown as AppContext,
         triggerPayload: parsedTriggerPayload,
+        workflowData: target.flow.data,
       });
-      let triggerPayload = admittedVideoPlan.triggerPayload;
+      let triggerPayload = bindWorkflowUserIntentToTrigger({
+        ownerId: requestUserId,
+        contract: body.userIntentContract,
+        expectedContractHash: body.userIntentContractHash,
+        triggerPayload: admittedVideoPlan.triggerPayload,
+        args: body.args,
+      });
       const callerProjectId = readTrimmedString(body.canvasProjectId);
       const callerChapterId = resolveChapterCanvasId({
         chapterId: body.chapterId,
@@ -2291,7 +2186,7 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
               }
             : {}),
 			trackingHint:
-				"这是持久 Workflow IR 执行。若回执尚未 terminal，使用 inspection 指定的 tapcanvas_workflow_execution_inspect 跟踪同一执行族；成功终态的 workflowOutputs 是 workflow.output/v1 标准交付边界，必须原样转交其中的用户输出。不要把 executionId 传给 tapcanvas_pipeline_run_get。",
+				"这是持久 Workflow IR 执行。submission + durable_executor 回执表示已交接，结束本轮提交，媒体仍待执行器完成，不创建第二个轮询 owner。用户后续查询时可用 inspection 读取同一执行族事实；成功终态 workflowOutputs 来自显式输出边界或冻结图声明的终端 delivery 端口，交付验收必须引用真实输出。不要把 executionId 传给 tapcanvas_pipeline_run_get。",
         };
         return c.json({ ok: true, content: JSON.stringify(response), data: response });
       } catch (error: unknown) {
@@ -2348,10 +2243,6 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
       body.toolName === "tapcanvas_workflow_execution_inspect" ||
 	  body.toolName === "tapcanvas_workflow_resume" ||
       body.toolName === "tapcanvas_workflow_run" ||
-      body.toolName === "tapcanvas_capture_director_scene" ||
-      body.toolName === "tapcanvas_render_director_clip" ||
-      body.toolName === "tapcanvas_director_define_motion" ||
-      body.toolName === "tapcanvas_director_set_character_motion" ||
       body.toolName === "tapcanvas_master_storyboard_split";
     // A flow-scoped tool must read and write one flow truth. In a chapter
     // session that truth is chapters.canvas_flow, including read-only vision
@@ -4358,8 +4249,8 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
         !execution ||
 		!workflowExecutionMatchesCanvasScope({
 			executionFlowId: execution.flow_id,
-			executionCanvasId: execution.canvas_id,
-			executionProjectId: execution.project_id,
+			executionCanvasId: execution.canvas_id ?? null,
+			executionProjectId: execution.project_id ?? null,
 			scopeFlowId: row.id,
 			scopeProjectId: projectId,
 			isChapterScope: Boolean(chapterCanvasId),
@@ -4457,6 +4348,8 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
 				})
 				: [];
 			const response = {
+				...buildWorkflowExecutionReceipt({ id: parsedFamily.latestExecutionId, executionFamilyId: parsedFamily.executionFamilyId, status: parsedFamily.latestExecutionStatus }),
+				terminal: parsedFamily.latestExecutionStatus === "success" || parsedFamily.latestExecutionStatus === "failed" || parsedFamily.latestExecutionStatus === "canceled",
 				view,
 				family: parsedFamily,
 				...(parsedFamily.latestExecutionStatus === "success" ? { workflowOutputs } : {}),
@@ -5116,15 +5009,13 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
       );
     }
 
-    if (body.toolName === "tapcanvas_capture_director_scene") {
-      const generated = await captureDirectorScene({
-        c: c as never,
-        requestUserId,
-        devBypass,
-        flowId,
-        row,
-        bodyArgs: body.args,
-        ...(chapterCanvasId ? { chapterId: chapterCanvasId } : {}),
+    if (body.toolName === DIRECTOR_DESK_RELAY_TOOL_NAME) {
+      const generated = await relayDirectorDeskTool({
+        db: c.env.DB,
+        userId: requestUserId,
+        args: body.args,
+        nodeId: readTrimmedString(body.canvasNodeId) || null,
+        nowIso: new Date().toISOString(),
       });
       return c.json(
         AgentsToolExecuteResponseSchema.parse({
@@ -5134,54 +5025,6 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
         }),
       );
     }
-
-    if (body.toolName === "tapcanvas_render_director_clip") {
-      // clip 模式复用 captureDirectorScene：合入 mode:'clip'，浏览器离屏渲灰模动画 mp4 样片，
-      // 后端据 report 的 videoUrl 建带 sourceVideoUrl 的 video 节点（seedance v2v 入口）。
-      const generated = await captureDirectorScene({
-        c: c as never,
-        requestUserId,
-        devBypass,
-        flowId,
-        row,
-        bodyArgs: { ...(body.args as Record<string, unknown>), mode: "clip" },
-        ...(chapterCanvasId ? { chapterId: chapterCanvasId } : {}),
-      });
-      return c.json(
-        AgentsToolExecuteResponseSchema.parse({
-          ok: true,
-          content: stringifyAgentVisibleToolResult(generated),
-          data: generated as unknown as Record<string, unknown>,
-        }),
-      );
-    }
-
-    if (body.toolName === "tapcanvas_director_define_motion") {
-      const generated = await defineDirectorMotion({
-        c: c as never,
-        requestUserId,
-        devBypass,
-        flowId,
-        row,
-        bodyArgs: body.args,
-        ...(chapterCanvasId ? { chapterId: chapterCanvasId } : {}),
-      });
-      return c.json(AgentsToolExecuteResponseSchema.parse({ ok: true, content: stringifyAgentVisibleToolResult(generated), data: generated as unknown as Record<string, unknown> }));
-    }
-
-    if (body.toolName === "tapcanvas_director_set_character_motion") {
-      const generated = await setDirectorCharacterMotion({
-        c: c as never,
-        requestUserId,
-        devBypass,
-        flowId,
-        row,
-        bodyArgs: body.args,
-        ...(chapterCanvasId ? { chapterId: chapterCanvasId } : {}),
-      });
-      return c.json(AgentsToolExecuteResponseSchema.parse({ ok: true, content: stringifyAgentVisibleToolResult(generated), data: generated as unknown as Record<string, unknown> }));
-    }
-
     if (body.toolName === "tapcanvas_video_generate_to_canvas") {
 	  const publicTurnId = readTrimmedString(body.publicTurnId);
       const generated = await generateVideoToCanvas({
@@ -5512,8 +5355,8 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
           const reqUserId = requireUserId(c);
           const nodeId = `agent-breakdown-${Date.now().toString(36)}`;
           const loglineHead = String(distilled.breakdown.logline || "参考片").slice(0, 20);
-          const nodeData: Record<string, unknown> = {
-            kind: "text",
+          const nodeData = {
+            kind: "text" as const,
             label: `拆片卡｜${loglineHead}`,
             prompt: renderDirectorBreakdownMarkdown(distilled.breakdown),
             directorBreakdown: distilled.breakdown as unknown as Record<string, unknown>,
@@ -5546,8 +5389,8 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
         try {
           const nodeId = `agent-breakdown-${readTrimmedString(distillArgs.nodeId) || "reference"}`;
           const loglineHead = String(distilled.breakdown.logline || "参考片").slice(0, 20);
-          const nodeData: Record<string, unknown> = {
-            kind: "text",
+          const nodeData = {
+            kind: "text" as const,
             label: `拆片卡｜${loglineHead}`,
             prompt: renderDirectorBreakdownMarkdown(distilled.breakdown),
             directorBreakdown: distilled.breakdown as unknown as Record<string, unknown>,
@@ -5572,7 +5415,7 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
                 createNodes: [
                   {
                     id: nodeId,
-                    type: "taskNode",
+                    type: "taskNode" as const,
                     position: { x: -420, y: 0 },
                     data: nodeData,
                   },
@@ -5716,8 +5559,8 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
         flowId: chapterResponse.flowId,
         updatedAt: chapterResponse.updatedAt,
         stats: chapterResponse.stats,
-        createdNodeSnapshots: chapterResponse.createdNodeSnapshots,
-        createdEdgeSnapshots: chapterResponse.createdEdgeSnapshots,
+        createdNodeSnapshots: chapterResponse.createdNodeSnapshots ?? [],
+        createdEdgeSnapshots: chapterResponse.createdEdgeSnapshots ?? [],
       });
       return c.json(
         AgentsToolExecuteResponseSchema.parse({
@@ -5828,8 +5671,8 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
       flowId: response.flowId,
       updatedAt: response.updatedAt,
       stats: response.stats,
-      createdNodeSnapshots: response.createdNodeSnapshots,
-      createdEdgeSnapshots: response.createdEdgeSnapshots,
+      createdNodeSnapshots: response.createdNodeSnapshots ?? [],
+      createdEdgeSnapshots: response.createdEdgeSnapshots ?? [],
     });
     return c.json(
       AgentsToolExecuteResponseSchema.parse({
@@ -5887,74 +5730,40 @@ export function registerPublicAgentsToolBridgeRoutes(publicApiRouter: OpenAPIHon
     );
   });
 
-  publicApiRouter.post("/director-capture/claim", async (c) => {
+  publicApiRouter.post("/director-desk/tool-claim", async (c) => {
     const userId = requireUserId(c);
-    const body = (await c.req.json().catch(() => ({}))) as { captureId?: string };
-    const captureId = String(body.captureId ?? "").trim();
-    if (!captureId) return c.json({ ok: false, code: "bad_request" }, 400);
-    const row = await getTaskResultByTaskId(c.env.DB, userId, captureId);
-    if (!row || row.vendor !== "browser-director-capture") return c.json({ ok: false, code: "not_found" }, 404);
-    if (row.status !== "queued") return c.json({ ok: false, code: "already_claimed" }, 409);
-    const prev = readResultJson(row.result);
-    const leaseToken = crypto.randomUUID();
-    const nowIso = new Date().toISOString();
-    const won = await tryClaimTaskResult(c.env.DB, {
-      userId,
-      taskId: captureId,
-      nowIso,
-      result: JSON.parse(buildResultJson({ ...prev, phase: "claimed", leaseToken, leaseOwner: userId })),
-    });
-    if (!won) return c.json({ ok: false, code: "already_claimed" }, 409);
-    return c.json({ ok: true, leaseToken, scene: prev.scene });
+    const body = (await c.req.json().catch(() => ({}))) as { callId?: string };
+    const callId = String(body.callId ?? "").trim();
+    if (callId) {
+      const claimed = await claimDirectorDeskCall(c.env.DB, { userId, callId, nowIso: new Date().toISOString() });
+      return c.json(claimed.ok
+        ? { ok: true, call: { callId, tool: claimed.tool, arguments: claimed.arguments }, leaseToken: claimed.leaseToken }
+        : { ok: false, code: "already_claimed" });
+    }
+    return c.json({ ok: true, pending: await listPendingDirectorDeskCalls(c.env.DB, userId) });
   });
 
-  publicApiRouter.post("/director-capture/report", async (c) => {
+  publicApiRouter.post("/director-desk/tool-report", async (c) => {
     const userId = requireUserId(c);
     const body = (await c.req.json().catch(() => ({}))) as {
-      captureId?: string;
+      callId?: string;
       leaseToken?: string;
-      status?: string;
-      imageUrl?: string;
-      videoUrl?: string;
-      assetId?: string;
+      ok?: boolean;
+      data?: unknown;
       error?: string;
     };
-    const captureId = String(body.captureId ?? "").trim();
+    const callId = String(body.callId ?? "").trim();
     const leaseToken = String(body.leaseToken ?? "").trim();
-    if (!captureId || !leaseToken) return c.json({ ok: false, code: "bad_request" }, 400);
-    const row = await getTaskResultByTaskId(c.env.DB, userId, captureId);
-    if (!row || row.vendor !== "browser-director-capture") return c.json({ ok: false, code: "not_found" }, 404);
-    const prev = readResultJson(row.result);
-    if (row.status !== "claimed" || prev.leaseToken !== leaseToken || prev.leaseOwner !== userId) {
-      return c.json({ ok: false, code: "lease_invalid" }, 409);
-    }
-    const hasImageUrl = !!String(body.imageUrl ?? "").trim();
-    const hasVideoUrl = !!String(body.videoUrl ?? "").trim();
-    const hasAssetId = !!String(body.assetId ?? "").trim();
-    // image 模式：imageUrl + assetId；clip 模式：videoUrl + assetId（assetId 仍需上报）
-    const ok = body.status === "succeeded" && (hasImageUrl || hasVideoUrl) && hasAssetId;
-    const nowIso = new Date().toISOString();
-    await upsertTaskResult(c.env.DB, {
+    if (!callId || !leaseToken) return c.json({ ok: false, code: "bad_request" }, 400);
+    const reported = await reportDirectorDeskCall(c.env.DB, {
       userId,
-      taskId: captureId,
-      vendor: "browser-director-capture",
-      kind: "image_edit",
-      status: ok ? "succeeded" : "failed",
-      completedAt: nowIso,
-      chapterId: row.chapter_id,
-      nodeId: row.node_id,
-      nowIso,
-      result: JSON.parse(buildResultJson({
-        ...prev,
-        phase: ok ? "succeeded" : "failed",
-        ...(ok
-          ? {
-              assets: [{ type: "image" as const, url: hasImageUrl ? String(body.imageUrl) : String(body.videoUrl), assetId: String(body.assetId) }],
-              ...(hasVideoUrl ? { videoUrl: String(body.videoUrl) } : {}),
-            }
-          : { error: String(body.error ?? "render_failed") }),
-      })),
+      callId,
+      leaseToken,
+      ok: body.ok === true,
+      data: body.data,
+      error: body.error,
+      nowIso: new Date().toISOString(),
     });
-    return c.json({ ok: true });
+    return c.json(reported.ok ? { ok: true } : { ok: false, code: reported.code ?? "report_failed" }, reported.ok ? 200 : 409);
   });
 }

@@ -1,3 +1,4 @@
+import { isRetryableChatTransportError, readRetryAfterMilliseconds } from './agentsChatRetry'
 import type { Edge, Node } from '@xyflow/react'
 import type { PublicFlowAnchorBinding } from '@tapcanvas/flow-anchor-bindings'
 import type {
@@ -27,7 +28,7 @@ import {
   type ProjectDirectorySnapshot,
   type SaveProjectDirectoryRequest,
 } from '@tapcanvas/project-directory-protocol'
-import type { User } from '../auth/store'
+import { hasAuthSession, type User } from '../auth/store'
 import { sanitizeFlowValueForPersistence } from '../canvas/utils/persistenceSanitizer'
 import { useUploadRuntimeStore } from '../domain/upload-runtime/store/uploadRuntimeStore'
 import type { StoryboardStructuredData } from '../storyboard/storyboardStructure'
@@ -105,7 +106,7 @@ function getActiveTeamId(): string | null {
   try { return localStorage.getItem('tapcanvas_active_team_id') } catch { return null }
 }
 
-function withAuth(init?: RequestInit, teamIdOverride?: string | null): RequestInit {
+export function withAuth(init?: RequestInit, teamIdOverride?: string | null): RequestInit {
   // When a caller explicitly targets a team (e.g. getMyTeam('personal')), align the
   // X-Team-Id header with that target. Otherwise the stale active-team header would win
   // over the ?teamId= query on the backend (header takes priority), making it impossible
@@ -202,13 +203,14 @@ export async function fetchAssetDownloadBlob(url: string): Promise<Blob> {
 }
 
 type ApiRequestError = Error & {
+  retryAfterMs?: number
   status?: number
   code?: string
   details?: unknown
   progress?: unknown
 }
 
-async function throwApiError(r: Response, fallbackMessage: string): Promise<never> {
+export async function throwApiError(r: Response, fallbackMessage: string): Promise<never> {
   let msg = fallbackMessage
   let body: unknown = null
   try {
@@ -224,6 +226,8 @@ async function throwApiError(r: Response, fallbackMessage: string): Promise<neve
   }
   const err: ApiRequestError = new Error(msg)
   err.status = r.status
+  const retryAfterMs = readRetryAfterMilliseconds(r.headers.get('Retry-After'))
+  if (retryAfterMs !== null) err.retryAfterMs = retryAfterMs
   if (body && typeof body === 'object') {
     err.code = 'code' in body && typeof body.code === 'string' ? body.code : undefined
     err.details = 'details' in body ? body.details : undefined
@@ -570,6 +574,8 @@ export type WorkflowExecutionDto = {
     nodeLabel: string
     status: WorkflowNodeRunDto['status']
     errorMessage: string | null
+    waitingReasonCode?: 'structured_output_repair_required' | 'provider_balance_required' | 'workflow_agent_no_progress_recovery_deferred' | 'external_dependency_unavailable' | null
+    waitingReasonLabel?: string | null
   } | null
 }
 
@@ -657,6 +663,12 @@ export type WorkflowNodeRunDto = {
   startedAt?: string | null
   finishedAt?: string | null
 }
+
+export type WorkflowMediaRetryRequestDto = Readonly<{
+  nodeId: string
+  itemId: string | null
+  taskId: string | null
+}>
 
 export type WorkflowExecutionContextDto = {
   executionId: string
@@ -927,6 +939,8 @@ export type AgentsChatGenerationProposal = {
 }
 
 export type AgentsChatRequestDto = {
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  serviceTier?: 'default' | 'priority'
   vendor?: string
   vendorCandidates?: string[]
   prompt: string
@@ -1116,6 +1130,7 @@ export type AgentExecutionProvenanceDto = {
     decisionBasisRole?: 'professional_method' | 'evidence_only'
   }>
   loadedKnowledgeSources?: Array<{
+    readReceipt?: { toolCallId: string; candidateSetId: string; tool: 'knowledge_read' | 'prompt_example_read'; readAt: string }
     cardId: string
     title: string
     description?: string
@@ -1125,6 +1140,7 @@ export type AgentExecutionProvenanceDto = {
     contentHash: string
     contentChars: number
   }>
+  retrievalDecisions?: Array<{ version: 1; blocking: false; toolNames: string[]; toolCallIds: string[]; rationale: string; status: 'tool_actions_requested' | 'no_body_read_requested'; at: string }>
   startedAt: string
 }
 
@@ -1261,6 +1277,8 @@ export type AgentsChatResponseDto = {
     }
     /** Legacy diagnostic only. Lifecycle authority is logicalTaskState. */
     requestTerminal?: AgentRequestTerminalV1
+    /** Physical run projection used to distinguish a suspended result from a logical terminal. */
+    runOutcome?: { status?: string }
     logicalTaskState: AgentLogicalTaskStateV1
     runtime?: AgentsRuntimeTraceDto
     executionProvenance?: AgentExecutionProvenanceDto
@@ -1400,6 +1418,8 @@ export type AgentsChatAgentRoleStreamPayload = {
 }
 
 export type AgentsChatSkillStreamPayload = {
+  sectionId?: string | null
+  resource?: string | null
   toolCallId: string
   phase: 'started' | 'completed'
   status?: 'succeeded' | 'failed' | 'denied' | 'blocked'
@@ -1797,6 +1817,31 @@ export class AgentsChatReplayResyncRequiredError extends Error {
 const AGENTS_CHAT_TRANSPORT_IDLE_MS = 45_000
 const AGENTS_CHAT_ADMISSION_MAX_ATTEMPTS = 5
 
+/**
+ * A consumer callback is outside the transport's recovery boundary. If UI
+ * state application throws, replaying the same cursor would only re-deliver
+ * events and can create an infinite reconnect loop. Keep the original error
+ * available for the caller while tagging it for the stream pump.
+ */
+class AgentsChatStreamHandlerError extends Error {
+  readonly cause: unknown
+
+  constructor(cause: unknown) {
+    super('agents_chat_stream_handler_error')
+    this.name = 'AgentsChatStreamHandlerError'
+    this.cause = cause
+  }
+}
+
+function invokeAgentsChatHandler(callback: (() => void) | undefined): void {
+  if (!callback) return
+  try {
+    callback()
+  } catch (error: unknown) {
+    throw new AgentsChatStreamHandlerError(error)
+  }
+}
+
 function readAcceptedPublicTurnId(error: unknown): string | null {
   if (!error || typeof error !== 'object') return null
   const apiError = error as ApiRequestError
@@ -1806,17 +1851,6 @@ function readAcceptedPublicTurnId(error: unknown): string | null {
     ? details.publicTurnId.trim()
     : ''
   return publicTurnId || null
-}
-
-function isRetryableAgentsChatAdmissionError(error: unknown): boolean {
-  if (error instanceof Error && error.message.startsWith('agents_chat_stream_')) return false
-  if (!error || typeof error !== 'object') return true
-  const statusValue = Number((error as ApiRequestError).status)
-  if (!Number.isFinite(statusValue) || statusValue <= 0) return true
-  return statusValue === 408
-    || statusValue === 425
-    || statusValue === 429
-    || statusValue >= 500
 }
 
 function waitForAgentsChatRetry(signal: AbortSignal, milliseconds: number): Promise<void> {
@@ -1832,6 +1866,14 @@ function waitForAgentsChatRetry(signal: AbortSignal, milliseconds: number): Prom
     }
     signal.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+function createAgentsChatAbortError(signal: AbortSignal): Error {
+  const reason = signal.reason
+  if (reason instanceof Error) return reason
+  const error = new Error('agents_chat_stream_aborted')
+  error.name = 'AbortError'
+  return error
 }
 
 export type PublicVisionRequestDto = {
@@ -1878,6 +1920,7 @@ export async function agentsChatStream(
   let publicTurnId = ''
   try {
     for (let attempt = 1; attempt <= AGENTS_CHAT_ADMISSION_MAX_ATTEMPTS; attempt += 1) {
+      if (controller.signal.aborted) throw createAgentsChatAbortError(controller.signal)
       try {
         const response = await apiFetch(resolveAgentsChatEndpoint(payload), withAuth({
           method: 'POST',
@@ -1906,12 +1949,17 @@ export async function agentsChatStream(
         if (
           controller.signal.aborted
           || !String(payload.clientPendingId || '').trim()
-          || !isRetryableAgentsChatAdmissionError(error)
+          || !isRetryableChatTransportError(error)
           || attempt >= AGENTS_CHAT_ADMISSION_MAX_ATTEMPTS
         ) {
           throw error
         }
-        const backoffMs = Math.min(2_000, 250 * (2 ** (attempt - 1)))
+        const retryAfterMs = error && typeof error === 'object'
+          ? Number((error as ApiRequestError).retryAfterMs)
+          : Number.NaN
+        const backoffMs = Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+          ? retryAfterMs
+          : Math.min(2_000, 250 * (2 ** (attempt - 1)))
         await waitForAgentsChatRetry(controller.signal, backoffMs)
       }
     }
@@ -1923,7 +1971,19 @@ export async function agentsChatStream(
     releaseExternalSignal()
     throw new Error('agents_chat_stream_admission_identity_missing')
   }
-  handlers.onOpen?.({ turnId: publicTurnId })
+  try {
+    handlers.onOpen?.({ turnId: publicTurnId })
+  } catch (error: unknown) {
+    // Admission succeeded, but the consumer rejected the ownership handoff.
+    // Release the external abort listener and stop the local controller rather
+    // than leaving a live listener attached to a rejected stream.
+    releaseExternalSignal()
+    controller.abort()
+    if (initialResponse?.body) {
+      void initialResponse.body.cancel('agents_chat_stream_on_open_failed').catch(() => undefined)
+    }
+    throw error
+  }
   let cursor: AgentsChatEventCursor = {
     publicTurnId,
     eventId: null,
@@ -1931,6 +1991,25 @@ export async function agentsChatStream(
   }
   let sawTerminalEvent = false
   let notifiedError = false
+
+  const isTerminalResult = (response: AgentsChatResponseDto): boolean => {
+    const logicalStatus = response.trace?.logicalTaskState?.status
+    if (logicalStatus) {
+      return logicalStatus === 'succeeded'
+        || logicalStatus === 'failed'
+        || logicalStatus === 'cancelled'
+        || logicalStatus === 'waiting_input'
+    }
+    const runStatus = response.trace?.runOutcome?.status
+    if (runStatus === 'suspended' || runStatus === 'active' || runStatus === 'waiting_external') return false
+    // Older/minimal result envelopes have no lifecycle projection. Preserve
+    // their existing behavior and treat the result itself as terminal.
+    return true
+  }
+
+  const isTerminalDoneReason = (reason: string): boolean => {
+    return reason !== 'physical_suspended'
+  }
 
   const dispatchEvent = (
     eventName: string,
@@ -1950,18 +2029,18 @@ export async function agentsChatStream(
     if (advanced.status === 'duplicate') return
     cursor = advanced.cursor
     if (
-      event.event === 'result' ||
-      event.event === 'done' ||
+      (event.event === 'result' && isTerminalResult(event.data.response)) ||
+      (event.event === 'done' && isTerminalDoneReason(event.data.reason)) ||
       (event.event === 'error' && event.data.terminal === true)
     ) {
       sawTerminalEvent = true
     }
-    handlers.onEvent({
+    invokeAgentsChatHandler(() => handlers.onEvent({
       ...event,
       eventId: cursor.eventId ?? undefined,
       sequence: cursor.sequence,
       replayed,
-    })
+    }))
   }
 
   const consumeResponse = async (response: Response, replayed: boolean): Promise<void> => {
@@ -1988,7 +2067,7 @@ export async function agentsChatStream(
         const { done, value } = await reader.read()
         if (done) break
         armTransportIdle()
-        handlers.onTransportActivity?.()
+        invokeAgentsChatHandler(handlers.onTransportActivity)
         const events = parser.push(decoder.decode(value, { stream: true }))
         for (const event of events) {
           const payloadText = String(event.data || '').trim()
@@ -2005,6 +2084,9 @@ export async function agentsChatStream(
       }
     } finally {
       if (transportIdleTimerId !== null) globalThis.clearTimeout(transportIdleTimerId)
+      if (sawTerminalEvent || controller.signal.aborted) {
+        void reader.cancel('agents_chat_stream_terminal_or_aborted').catch(() => undefined)
+      }
       reader.releaseLock()
     }
   }
@@ -2046,6 +2128,7 @@ export async function agentsChatStream(
     let response: Response | null = initialResponse
     let replayed = initialResponse === null
     let reconnectAttempt = 0
+    let emptyReplayAttempt = 0
     while (!controller.signal.aborted && !sawTerminalEvent) {
       if (!response) {
         try {
@@ -2057,21 +2140,41 @@ export async function agentsChatStream(
           const status = error && typeof error === 'object'
             ? Number((error as { status?: unknown }).status)
             : 0
-          if (Number.isFinite(status) && status >= 400 && status < 500) {
+          if (Number.isFinite(status) && status >= 400 && status < 500 && status !== 408 && status !== 425 && status !== 429) {
             notifyError(error)
             return
           }
           reconnectAttempt += 1
-          const backoffMs = Math.min(2_000, 200 * (2 ** Math.min(reconnectAttempt, 4)))
+          const retryAfterMs = error && typeof error === 'object'
+            ? Number((error as ApiRequestError).retryAfterMs)
+            : Number.NaN
+          const backoffMs = Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+            ? retryAfterMs
+            : Math.min(2_000, 200 * (2 ** Math.min(reconnectAttempt, 4)))
           await waitForAgentsChatRetry(controller.signal, backoffMs)
           continue
         }
       }
       try {
+        const sequenceBefore = cursor.sequence
         await consumeResponse(response, replayed)
         if (sawTerminalEvent || controller.signal.aborted) return
+        if (replayed && cursor.sequence === sequenceBefore) {
+          emptyReplayAttempt += 1
+          await waitForAgentsChatRetry(
+            controller.signal,
+            Math.min(2_000, 200 * (2 ** Math.min(emptyReplayAttempt, 4))),
+          )
+        } else {
+          emptyReplayAttempt = 0
+        }
       } catch (error: unknown) {
         if (controller.signal.aborted) return
+        if (error instanceof AgentsChatStreamHandlerError) {
+          notifyError(error.cause)
+          controller.abort()
+          return
+        }
         if (
           error instanceof AgentsChatReplayResyncRequiredError ||
           (error instanceof Error && error.message.startsWith('agents_chat_stream_'))
@@ -2750,7 +2853,7 @@ const AgentCapabilityAttachmentDtoSchema = z.object({
   routeDecisions: z.array(z.object({
     conflictId: z.string(),
     withCapabilityId: z.string().nullable(),
-    action: z.enum(['acknowledge', 'replace_existing']),
+    action: z.enum(['acknowledge', 'replace_existing', 'coexist']),
   }).strict()),
   routingReady: z.boolean(),
   scope: z.enum(['current_user', 'all_users']).default('current_user'),
@@ -2761,8 +2864,12 @@ const AgentCapabilityAttachmentDtoSchema = z.object({
 
 const CapabilityBayCandidateDtoSchema = z.object({
   descriptor: WorkflowCapabilityDescriptorDtoSchema,
+  nodeBreakdown: z.object({ mainNodeCount: z.number().int().positive(), inlineStepCount: z.number().int().positive() }).nullable(),
   descriptorSha256: z.string(),
   projectName: z.string().nullable(),
+  canEdit: z.boolean(),
+  updatedAt: z.string().min(1),
+  attachedAt: z.string().nullable(),
   attached: z.boolean(),
   attachedVersionId: z.string().nullable(),
   stale: z.boolean(),
@@ -2811,6 +2918,7 @@ const CapabilityBayDtoSchema = z.object({
     flowCount: z.number().int().nonnegative(),
     updatedAt: z.string(),
     canDelete: z.boolean(),
+    canEdit: z.boolean(),
   }).strict()),
   invocations: z.array(z.object({
     id: z.string(),
@@ -2883,10 +2991,11 @@ export async function generateWorkflowCapabilityDescription(input: {
   return WorkflowCapabilityDescriptionResponseDtoSchema.parse(await response.json())
 }
 
-export async function getCapabilityBay(projectId?: string): Promise<CapabilityBayDto> {
+export async function getCapabilityBay(projectId?: string, options: Readonly<{ includeInvocations?: boolean }> = {}): Promise<CapabilityBayDto> {
 	const normalizedProjectId = projectId?.trim() ?? ''
 	const query = new URLSearchParams()
 	if (normalizedProjectId) query.set('projectId', normalizedProjectId)
+	if (options.includeInvocations) query.set('includeInvocations', 'true')
 	const suffix = query.size > 0 ? `?${query.toString()}` : ''
 	let response: Response
 	try {
@@ -2901,6 +3010,56 @@ export async function getCapabilityBay(projectId?: string): Promise<CapabilityBa
 	}
   if (!response.ok) await throwApiError(response, `加载 Agent 配置失败: ${response.status}`)
   return CapabilityBayDtoSchema.parse(await response.json())
+}
+
+export type LaunchEquippedWorkflowRequestDto = Readonly<{
+  intent: 'run_selected_equipped_workflow'
+  attachmentId: string
+  executionVariant: 'full_video' | 'first_video' | null
+  projectId: string
+  chapterId?: string
+  canvasFlowId?: string
+  canvasNodeId?: string
+  idempotencyKey: string
+  agentModelKey: string
+  triggerPayload?: Readonly<{
+    source?: string
+    sourceGroupId?: string
+    onlyVideoNodes?: boolean
+    imageModelKey?: string
+    imageAspectRatio?: string
+    imageSize?: string
+    videoModelKey?: string
+    videoResolution?: string
+    videoAspectRatio?: string
+  }>
+}>
+
+const EquippedWorkflowLaunchResponseDtoSchema = z.object({
+  created: z.boolean(),
+  execution: z.object({
+    id: z.string().min(1),
+    status: z.enum(['queued', 'running', 'success', 'failed', 'canceled']),
+    createdAt: z.string().min(1),
+  }).passthrough(),
+  invocationRecord: z.discriminatedUnion('status', [
+    z.object({ status: z.literal('recorded') }).strict(),
+    z.object({ status: z.literal('failed'), diagnosticId: z.string().min(1) }).strict(),
+  ]),
+}).strict()
+
+export type EquippedWorkflowLaunchResponseDto = z.infer<typeof EquippedWorkflowLaunchResponseDtoSchema>
+
+export async function launchEquippedWorkflow(
+  input: LaunchEquippedWorkflowRequestDto,
+): Promise<EquippedWorkflowLaunchResponseDto> {
+  const response = await apiFetch(`${API_BASE}/agents/capability-bay/workflows/run`, withAuth({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  }))
+  if (!response.ok) await throwApiError(response, `启动已添加工作流失败: ${response.status}`)
+  return EquippedWorkflowLaunchResponseDtoSchema.parse(await response.json())
 }
 
 export async function createAiWorkflowProject(name: string): Promise<{
@@ -2967,7 +3126,7 @@ export async function equipWorkflowCapability(input: {
   resolutions: Array<{
     conflictId: string
     withCapabilityId: string | null
-    action: 'acknowledge' | 'replace_existing'
+    action: 'acknowledge' | 'replace_existing' | 'coexist'
   }>
   scope?: 'current_user' | 'all_users'
 }): Promise<AgentCapabilityAttachmentDto> {
@@ -5399,14 +5558,14 @@ export async function listShotFlows(projectId: string, shotId: string): Promise<
   return r.json()
 }
 
-export async function saveProjectFlow(payload: { id?: string; projectId: string; name: string; nodes: Node[]; edges: Edge[]; viewport?: { x: number; y: number; zoom: number } | null; sceneCreationProgress?: unknown; expectedRevision?: number }): Promise<FlowSaveReceipt> {
+export async function saveProjectFlow(payload: { id?: string; projectId: string; name: string; nodes: Node[]; edges: Edge[]; viewport?: { x: number; y: number; zoom: number } | null; sceneCreationProgress?: unknown; deletedNodeIds?: string[]; restoredNodeIds?: string[]; expectedRevision?: number }): Promise<FlowSaveReceipt> {
   const data = sanitizeFlowDataForPersistence({
     nodes: payload.nodes,
     edges: payload.edges,
     viewport: payload.viewport ?? null,
     ...(typeof payload.sceneCreationProgress === 'undefined' ? null : { sceneCreationProgress: payload.sceneCreationProgress }),
   })
-  const r = await apiFetch(`${API_BASE}/flows`, withAuth({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: payload.id, projectId: payload.projectId, name: payload.name, data, ownerType: 'project', ownerId: payload.projectId, expectedRevision: payload.expectedRevision, source: 'user' }) }))
+  const r = await apiFetch(`${API_BASE}/flows`, withAuth({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: payload.id, projectId: payload.projectId, name: payload.name, data, ownerType: 'project', ownerId: payload.projectId, expectedRevision: payload.expectedRevision, deletedNodeIds: payload.deletedNodeIds, restoredNodeIds: payload.restoredNodeIds, source: 'user' }) }))
   if (!r.ok) await throwApiError(r, `save flow failed: ${r.status}`)
   return r.json()
 }
@@ -5462,6 +5621,8 @@ export async function saveChapterFlow(payload: {
   edges: Edge[]
   viewport?: { x: number; y: number; zoom: number } | null
   sceneCreationProgress?: unknown
+  deletedNodeIds?: string[]
+  restoredNodeIds?: string[]
   expectedRevision?: number
 }): Promise<FlowSaveReceipt> {
   const data = sanitizeFlowDataForPersistence({
@@ -5484,6 +5645,8 @@ export async function saveShotFlow(payload: {
   edges: Edge[]
   viewport?: { x: number; y: number; zoom: number } | null
   sceneCreationProgress?: unknown
+  deletedNodeIds?: string[]
+  restoredNodeIds?: string[]
   expectedRevision?: number
 }): Promise<FlowSaveReceipt> {
   const data = sanitizeFlowDataForPersistence({
@@ -5504,6 +5667,7 @@ export async function runWorkflowExecution(payload: {
   replayFromExecutionId?: string
   startFromNodeId?: string
   concurrency?: number
+  triggerPayload?: Record<string, unknown>
 }): Promise<WorkflowExecutionDto> {
   const r = await apiFetch(`${API_BASE}/executions/run`, withAuth({
     method: 'POST',
@@ -5520,6 +5684,7 @@ export async function runWorkflowExecution(payload: {
         : {}),
       concurrency: payload.concurrency ?? 1,
       trigger: 'manual',
+      ...(payload.triggerPayload ? { triggerPayload: payload.triggerPayload } : {}),
     }),
   }))
   if (!r.ok) await throwApiError(r, `run execution failed: ${r.status}`)
@@ -5611,7 +5776,11 @@ export async function getWorkflowExecutionMetrics(flowId?: string): Promise<Work
 
 export async function resumeWorkflowExecution(
   executionId: string,
-  request: Readonly<{ providerBalanceRestored?: true }> = {},
+  request: Readonly<{
+    providerBalanceRestored?: true
+    nodeId?: string
+    mediaRetries?: readonly WorkflowMediaRetryRequestDto[]
+  }> = {},
 ): Promise<WorkflowExecutionDto> {
   const r = await apiFetch(`${API_BASE}/executions/${encodeURIComponent(executionId)}/resume`, withAuth({
     method: 'POST',
@@ -5620,6 +5789,53 @@ export async function resumeWorkflowExecution(
   }))
   if (!r.ok) await throwApiError(r, `resume workflow execution failed: ${r.status}`)
   return r.json()
+}
+
+export type WorkflowExecutionEventMessage = Readonly<{
+  id: string
+  event: string
+  data: unknown
+}>
+
+/** Subscribe to the resumable execution event stream. The caller owns the AbortController. */
+export async function getWorkflowEventHistory(executionId: string): Promise<Readonly<{
+  items: WorkflowExecutionEventDto[]
+  nextCursor: number | null
+}>> {
+  const response = await apiFetch(`${API_BASE}/executions/${encodeURIComponent(executionId)}/event-history`, withAuth())
+  if (!response.ok) await throwApiError(response, `get workflow event history failed: ${response.status}`)
+  return response.json()
+}
+
+export async function streamWorkflowExecutionEvents(
+  executionId: string,
+  options: Readonly<{ after?: number; signal: AbortSignal; onEvent: (event: WorkflowExecutionEventMessage) => void }>,
+): Promise<void> {
+  const after = typeof options.after === 'number' && Number.isFinite(options.after) ? Math.max(0, Math.floor(options.after)) : 0
+  const response = await apiFetch(`${API_BASE}/executions/${encodeURIComponent(executionId)}/events?after=${after}`, withAuth({ signal: options.signal, headers: { Accept: 'text/event-stream' } }))
+  if (!response.ok) await throwApiError(response, `stream workflow execution events failed: ${response.status}`)
+  if (!response.body) throw new Error('workflow_execution_event_stream_body_missing')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  const parser = createSseEventParser()
+  try {
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      for (const message of parser.push(decoder.decode(chunk.value, { stream: true }))) {
+        let data: unknown = message.data
+        try { data = JSON.parse(message.data) as unknown } catch { /* preserve plain-text event payload */ }
+        options.onEvent({ id: message.id, event: message.event, data })
+      }
+    }
+    for (const message of parser.finish()) {
+      let data: unknown = message.data
+      try { data = JSON.parse(message.data) as unknown } catch { /* preserve plain-text event payload */ }
+      options.onEvent({ id: message.id, event: message.event, data })
+    }
+  } finally {
+    reader.releaseLock()
+  }
 }
 
 export async function getWorkflowExecutionSnapshot(executionId: string): Promise<WorkflowExecutionSnapshotDto> {
@@ -6776,6 +6992,7 @@ export type NewApiGatewayReadinessDto = z.infer<typeof NewApiGatewayReadinessSch
 export async function getNewApiGatewayReadiness(): Promise<NewApiGatewayReadinessDto> {
   const r = await apiFetch(`${API_BASE}/new-api-models/readiness`, withAuth({
     method: 'GET',
+    cache: 'no-store',
   }))
   if (!r.ok) {
     await throwApiError(r, `get new-api readiness failed: ${r.status}`)
@@ -6822,6 +7039,15 @@ export async function deleteModelCreditCost(modelKey: string, specKey?: string):
 
 // 用户全局生成偏好（AI 对话入口设置：生图模型/视频模型/规格）
 export type UserGenerationPrefsDto = {
+  imageQuality?: string
+  imagePreferenceEnabled?: boolean
+  videoPreferenceEnabled?: boolean
+  imageAspect?: string
+  imageResolution?: string
+  imageCount?: number
+  videoDuration?: number
+  videoCount?: number
+  videoGenerateAudio?: boolean
   imageModel?: string
   imageSize?: string
   videoModel?: string
@@ -8051,7 +8277,7 @@ export type ProjectBookIndexDto = {
     sourceByteLength: number
     sourceSha256: string
     sourceTextSha256: string
-    sourceEncoding: 'utf-8' | 'package-xml'
+    sourceEncoding: 'utf-8' | 'gb18030' | 'utf-16le' | 'utf-16be' | 'package-xml'
     extractedDocumentCount: number
     storedPath?: string
   }
@@ -10134,6 +10360,8 @@ export async function runTaskByVendor(vendor: string, request: TaskRequestDto): 
 }
 
 export async function runPublicTask(apiKey: string, payload: PublicRunTaskRequestDto): Promise<PublicRunTaskResponseDto> {
+  // Canvas uses its current cookie identity even if a legacy API key is stored.
+  if (hasAuthSession()) return runPublicTaskWithAuth(payload)
   const sanitizedPayload = sanitizePublicTaskPayload(payload)
   const drawPayload = toPublicDrawPayload(sanitizedPayload)
   const run = (endpoint: '/public/tasks' | '/public/draw', bodyPayload: PublicRunTaskRequestDto | PublicDrawRequestDto) => apiFetch(`${API_BASE}${endpoint}`, withPublicApiKey(apiKey, {
@@ -11572,33 +11800,3 @@ export async function updateMyCommunityProfile(payload: {
 }
 
 // ---------------------------------------------------------------------------
-// Director-capture polling bridge (browser-side renderer → agents-cli)
-// ---------------------------------------------------------------------------
-
-export async function claimDirectorCapture(captureId: string): Promise<{ ok: boolean; leaseToken?: string; scene?: unknown; code?: string }> {
-  const r = await apiFetch(`${API_BASE}/public/director-capture/claim`, withAuth({
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ captureId }),
-  }))
-  // 409 = already_claimed (another tab won the race); return body, do not throw
-  if (!r.ok && r.status !== 409) await throwApiError(r, 'claim director capture failed')
-  return r.json()
-}
-
-export async function reportDirectorCapture(input: {
-  captureId: string
-  leaseToken: string
-  status: 'succeeded' | 'failed'
-  imageUrl?: string
-  videoUrl?: string
-  assetId?: string
-  error?: string
-}): Promise<void> {
-  const r = await apiFetch(`${API_BASE}/public/director-capture/report`, withAuth({
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(input),
-  }))
-  if (!r.ok) await throwApiError(r, 'report director capture failed')
-}

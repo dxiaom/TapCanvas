@@ -1,3 +1,16 @@
+import {
+	authorizeWorkflowMediaRetries,
+	findWorkflowMediaRetryDownstreamEffects,
+	resolveWorkflowMediaRetryFrontier,
+	workflowMediaRetryBatchIdentity,
+	type AuthorizedWorkflowMediaRetry,
+	type WorkflowMediaRetry,
+} from "./execution.media-retry";
+import { readWorkflowMediaAdoptions, validateWorkflowMediaAdoptionTargets, validateWorkflowMediaAdoptionDescendants, type WorkflowMediaAdoption } from "./execution.media-adoption";
+import { projectAssetSnapshot, isWorkflowProjectImageReady } from "./execution.project-context";
+import { createWorkflowAssetResolver } from "./execution.asset-resolver";
+import { prepareWorkflowPlanningRevision, reviseWorkflowAssetSnapshots, type WorkflowPlanningRevision } from "./execution.planning-revision";
+import { loadVisibleWorkflowProjectAssets } from "./execution.project-context-runtime";
 import type { AppContext, AppEnv } from "../../types";
 import { getFlowForOwner } from "../flow/flow.repo";
 import {
@@ -21,6 +34,7 @@ import {
 	parseWorkflowProjectContext,
 } from "./execution.project-context";
 import { scopeWorkflowFlowData } from "./execution.flow-scope";
+import { repairMissingWorkflowSourceBinding, loadWorkflowSourceBindingCandidate } from "./execution.source-binding-repair";
 import { cancelActiveWorkflowNodeJobs } from "./execution.queue";
 import { resolveCoreWorkflowExecutorSemantics } from "./execution.core-semantics";
 import { parseWorkflowNodeOutputV1 } from "./execution.node-runtime";
@@ -30,6 +44,8 @@ import {
 	getExecutionSnapshotForOwner,
 	listNodeRunsForExecutionOwner,
 	mapExecutionSnapshotRow,
+	mapExecutionRow,
+	requeueUnstartedExecution,
 	type NodeRunRow,
 } from "./execution.repo";
 import {
@@ -42,12 +58,9 @@ import {
 } from "./execution.snapshot-runtime";
 import {
 	startWorkflowExecution,
+	startDurableExecution,
 	WorkflowStartError,
 } from "./execution.start-service";
-import {
-	assertWorkflowExecutionRecoveryAllowed,
-	WorkflowExecutionRecoveryPolicyError,
-} from "./execution.recovery-policy";
 
 type WorkflowResumeStatus = 400 | 404 | 409 | 422 | 500 | 501 | 503;
 
@@ -60,11 +73,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isProviderBalanceSuspension(outputRefs: string | null): boolean {
 	const output = parseWorkflowNodeOutputV1(outputRefs);
 	if (!output) return false;
-	const terminal = isRecord(output.evidence.requestTerminal)
-		? output.evidence.requestTerminal
-		: null;
-	return terminal?.status === "suspended"
-		&& terminal.reason === "provider_balance_required";
+	const suspended = (evidence: Record<string, unknown>): boolean => {
+		const terminal = isRecord(evidence.requestTerminal) ? evidence.requestTerminal : null;
+		return terminal?.status === "suspended" && terminal.reason === "provider_balance_required";
+	};
+	return suspended(output.evidence) || output.itemRuns.some((item) => (
+		item.status === "waiting_external" && suspended(item.evidence)
+	));
 }
 
 function isResolvedOutputReuse(outputRefs: string | null): boolean {
@@ -238,11 +253,15 @@ export async function resumeWorkflowExecution(input: Readonly<{
 	env: AppEnv["Bindings"];
 	ownerId: string;
 	sourceExecutionId: string;
+	nodeId?: string;
 	trigger: "manual" | "agent";
 	providerBalanceRestored?: true;
 	cancellationRevoked?: true;
 	agentModelCutover?: WorkflowResumeAgentModelCutover;
 	definitionCutover?: Readonly<{ mode: "current_flow" }>;
+	planningRevision?: WorkflowPlanningRevision;
+	mediaAdoptions?: readonly WorkflowMediaAdoption[];
+	mediaRetries?: readonly WorkflowMediaRetry[];
 }>): Promise<Awaited<ReturnType<typeof startWorkflowExecution>>["execution"]> {
 	const sourceExecution = await getExecutionForOwner(
 		input.env.DB,
@@ -259,21 +278,43 @@ export async function resumeWorkflowExecution(input: Readonly<{
 	const providerBalanceRestored = input.providerBalanceRestored === true;
 	const cancellationRevoked = input.cancellationRevoked === true;
 	const definitionCutover = input.definitionCutover?.mode === "current_flow";
-	const recoveryModeCount = [Boolean(cutover), providerBalanceRestored, cancellationRevoked, definitionCutover].filter(Boolean).length;
+	const recoveryModeCount = [Boolean(input.nodeId), Boolean(cutover), providerBalanceRestored, cancellationRevoked, definitionCutover, Boolean(input.planningRevision), Boolean(input.mediaAdoptions), Boolean(input.mediaRetries)].filter(Boolean).length;
 	if (recoveryModeCount > 1) {
 		throw new WorkflowResumeError("Workflow recovery modes are mutually exclusive", {
 			status: 400,
 			code: "workflow_resume_recovery_mode_conflict",
 		});
 	}
+	let mediaRetryFrontierNodeId: string | undefined;
+	if (input.mediaRetries) {
+		try {
+			mediaRetryFrontierNodeId = resolveWorkflowMediaRetryFrontier(input.mediaRetries);
+		} catch (error: unknown) {
+			const code = error instanceof Error ? error.message : "workflow_media_retry_frontier_conflict";
+			throw new WorkflowResumeError("A media retry request must target items from one failed workflow node", {
+				status: 400,
+				code: code === "workflow_media_retry_frontier_missing"
+					? "workflow_media_retry_frontier_missing"
+					: "workflow_media_retry_frontier_conflict",
+			});
+		}
+	}
 	const providerBalanceRecovery = Boolean(cutover) || providerBalanceRestored;
+	const mediaRetryRecovery = Boolean(input.mediaRetries);
 	if (cancellationRevoked && sourceExecution.status !== "canceled") {
 		throw new WorkflowResumeError("Cancellation revocation requires the latest canceled workflow execution", {
 			status: 409,
 			code: "workflow_cancellation_revocation_source_not_canceled",
 		});
 	}
-	if (!providerBalanceRecovery && !cancellationRevoked && sourceExecution.status !== "failed") {
+	if (mediaRetryRecovery && sourceExecution.status !== "failed" && sourceExecution.status !== "success"
+		&& sourceExecution.status !== "canceled") {
+		throw new WorkflowResumeError("Exact media retry requires a terminal workflow execution", {
+			status: 409,
+			code: "workflow_media_retry_source_not_terminal",
+		});
+	}
+	if (!providerBalanceRecovery && !cancellationRevoked && !mediaRetryRecovery && sourceExecution.status !== "failed") {
 		throw new WorkflowResumeError("Only a failed workflow execution can be resumed", {
 			status: 409,
 			code: "workflow_resume_source_not_failed",
@@ -360,10 +401,18 @@ export async function resumeWorkflowExecution(input: Readonly<{
 	const cancellationRevocationCanRecoverLatestSource = cancellationRevoked
 		&& family.latestExecutionId === sourceExecution.id
 		&& family.activeExecutionCount === 0;
+	// A user may explicitly retry one durable failed media item from the latest
+	// canceled execution. This still creates an append-only media-retry child;
+	// it never reopens the canceled row or admits a node-level rerun.
+	const canceledSourceMediaRetryCanRecoverLatestSource = mediaRetryRecovery
+		&& sourceExecution.status === "canceled"
+		&& family.latestExecutionId === sourceExecution.id
+		&& family.activeExecutionCount === 0;
 	const bypassStandardFamilyGuard = providerRecoveryOwnsOnlyActiveExecution
 		|| providerRecoveryCanRecoverTerminalSource
 		|| providerRecoveryCanRecoverHistoricalSource
-		|| cancellationRevocationCanRecoverLatestSource;
+		|| cancellationRevocationCanRecoverLatestSource
+		|| canceledSourceMediaRetryCanRecoverLatestSource;
 	if (!bypassStandardFamilyGuard && !familyGuard.allowed && familyGuard.code === "workflow_resume_family_active") {
 		throw new WorkflowResumeError("The workflow execution family already has an active recovery", {
 			status: 409,
@@ -389,14 +438,41 @@ export async function resumeWorkflowExecution(input: Readonly<{
 			executionId: sourceExecution.id,
 		}),
 	]);
-	const recoveryNode = providerBalanceRecovery
+	// Dispatch can fail before the DAG creates its first node. There is no
+	// node frontier to replay: re-dispatch the exact frozen execution instead.
+	if (source && sourceExecution.started_at === null && nodeRuns.length === 0
+		&& !input.nodeId && !input.mediaRetries && !providerBalanceRecovery && !cancellationRevoked
+		&& !definitionCutover && !cutover) {
+		const requeued = await requeueUnstartedExecution(input.env.DB, {
+			executionId: sourceExecution.id, ownerId: input.ownerId,
+		});
+		if (!requeued) {
+			throw new WorkflowResumeError("Execution dispatch state changed or is not recoverable", {
+				status: 409, code: "workflow_resume_dispatch_conflict",
+			});
+		}
+		console.info("[workflow-dispatch] unstarted execution requeued", {
+			executionId: sourceExecution.id, previousError: sourceExecution.error_message,
+		});
+		await startDurableExecution(input.env, sourceExecution.id);
+		const refreshed = await getExecutionForOwner(input.env.DB, sourceExecution.id, input.ownerId);
+		if (!refreshed) throw new WorkflowResumeError("Execution disappeared after dispatch", {
+			status: 404, code: "workflow_resume_source_not_found",
+		});
+		return mapExecutionRow(refreshed);
+	}
+	const recoveryNode = input.mediaRetries
+		? nodeRuns.find((node) => node.node_id === mediaRetryFrontierNodeId)
+		: providerBalanceRecovery
 		? nodeRuns.find((node) => isProviderBalanceSuspension(node.output_refs))
 		: cancellationRevoked
 			? nodeRuns.find((node) => node.status === "canceled" && node.started_at !== null)
 				?? nodeRuns.find((node) => node.status === "canceled")
-			: nodeRuns.find((node) => node.status === "failed");
+			: nodeRuns.find((node) => node.status === "failed" && (input.nodeId === undefined || node.node_id === input.nodeId));
 	if (!source || !recoveryNode) {
-		throw new WorkflowResumeError(cancellationRevoked
+		throw new WorkflowResumeError(input.mediaRetries
+			? "The requested media retry frontier is not present in the source execution"
+			: cancellationRevoked
 			? "Canceled execution has no resumable node"
 			: providerBalanceRecovery
 			? cutover
@@ -404,7 +480,9 @@ export async function resumeWorkflowExecution(input: Readonly<{
 				: "Provider balance recovery requires a persisted provider-balance suspension"
 			: "Failed execution has no resumable node", {
 			status: 409,
-			code: cancellationRevoked
+			code: input.mediaRetries
+				? "workflow_media_retry_frontier_missing"
+				: cancellationRevoked
 				? "workflow_cancellation_revocation_node_missing"
 				: providerBalanceRecovery
 				? cutover
@@ -415,40 +493,8 @@ export async function resumeWorkflowExecution(input: Readonly<{
 	}
 	const frozen = mapExecutionSnapshotRow(source);
 	const rerun = prepareWorkflowExecutionSnapshotRerun(frozen.data);
-	try {
-		assertWorkflowExecutionRecoveryAllowed(rerun.data, rerun.triggerNodeId);
-	} catch (error: unknown) {
-		if (!(error instanceof WorkflowExecutionRecoveryPolicyError)) throw error;
-		throw new WorkflowResumeError(error.message, {
-			status: 409,
-			code: "workflow_resume_fresh_only",
-			details: { ...error.details, sourceExecutionId: sourceExecution.id },
-		});
-	}
-	const currentFlowForRecoveryPolicy = await getFlowForOwner(
-		input.env.DB,
-		frozen.flowId,
-		input.ownerId,
-	);
-	if (currentFlowForRecoveryPolicy) {
-		try {
-			assertWorkflowExecutionRecoveryAllowed(
-				currentFlowForRecoveryPolicy.data,
-				rerun.triggerNodeId,
-			);
-		} catch (error: unknown) {
-			if (!(error instanceof WorkflowExecutionRecoveryPolicyError)) throw error;
-			throw new WorkflowResumeError(error.message, {
-				status: 409,
-				code: "workflow_resume_fresh_only",
-				details: {
-					...error.details,
-					sourceExecutionId: sourceExecution.id,
-					policyAuthority: "current_flow",
-				},
-			});
-		}
-	}
+	// Recovery authority comes from family ownership, fenced Agent turns and
+	// per-node replay evidence below; authored flags cannot force paid work to restart.
 	let root = rerun.data;
 	let currentFlowUpdatedAt: string | null = null;
 	let recoveryFlowName = frozen.name;
@@ -499,11 +545,103 @@ export async function resumeWorkflowExecution(input: Readonly<{
 			);
 		}
 	}
-	const recoveryFrontier = resolveWorkflowRecoveryFrontier({
+	let recoveryFrontier = resolveWorkflowRecoveryFrontier({
 		failedNode: recoveryNode,
 		nodeRuns,
 		flowData: root,
 	});
+	let authorizedMediaRetries: AuthorizedWorkflowMediaRetry[] | undefined;
+	// Successful media stays in the replay checkpoint with its original receipt.
+	// Only explicit amendments become project-asset adoptions; generated outputs
+	// need not exist in the project's frozen input asset catalog.
+	const resumeRuns = nodeRuns.map((run) => ({ nodeId: run.node_id, status: run.status, outputRefs: run.output_refs }));
+	if (input.mediaRetries) {
+		const mediaRetryNodeId = mediaRetryFrontierNodeId;
+		if (!mediaRetryNodeId) {
+			throw new WorkflowResumeError("The requested media retry frontier is missing", {
+				status: 400, code: "workflow_media_retry_frontier_missing",
+			});
+		}
+		const retries = authorizeWorkflowMediaRetries({
+			sourceExecutionId: sourceExecution.id,
+			retries: input.mediaRetries,
+			outputs: resumeRuns,
+			workflowDefinition: root,
+		});
+		authorizedMediaRetries = retries;
+		const downstreamEffects = findWorkflowMediaRetryDownstreamEffects({
+			nodeId: mediaRetryNodeId,
+			workflowDefinition: root,
+			outputs: nodeRuns.map((run) => ({
+				nodeId: run.node_id,
+				status: run.status,
+				startedAt: run.started_at,
+				outputRefs: run.output_refs,
+			})),
+		});
+		const externalDescendantNodeIds = downstreamEffects.filter((nodeId) => {
+			const run = nodeRuns.find((candidate) => candidate.node_id === nodeId);
+			if (!run) return true;
+			const output = parseWorkflowNodeOutputV1(run.output_refs);
+			const executorRef = (run.node_type || output?.executorRef || "").trim();
+			return !isUnmaterializedAgentAttempt(run, executorRef, output);
+		});
+		if (externalDescendantNodeIds.length > 0) {
+			throw new WorkflowResumeError("Media retry would invalidate a started downstream external action", {
+				status: 409,
+				code: "workflow_media_retry_downstream_effect_exists",
+				details: { nodeIds: externalDescendantNodeIds },
+			});
+		}
+		validateWorkflowMediaAdoptionDescendants({ root, adoptions: [{ nodeId: mediaRetryNodeId }], runs: resumeRuns });
+		root = { ...root, workflowMediaRetries: retries, workflowMediaRetrySourceExecutionId: sourceExecution.id };
+		recoveryFrontier = { ...recoveryFrontier, invalidatedNodeIds: [...new Set([
+			...recoveryFrontier.invalidatedNodeIds, mediaRetryNodeId,
+		])] };
+	}
+	const explicitAdoptions = input.mediaAdoptions ?? [];
+	const mergedAdoptions = new Map(readWorkflowMediaAdoptions(root).map((item) => [JSON.stringify([item.nodeId, item.itemId]), item]));
+	for (const item of explicitAdoptions) {
+		mergedAdoptions.set(JSON.stringify([item.nodeId, item.itemId]), item);
+	}
+	if (mergedAdoptions.size > 0) {
+		const adoptions = [...mergedAdoptions.values()];
+		let applicable = true;
+		let adoptionOwnerNodeIds: string[] = [];
+		try {
+			adoptionOwnerNodeIds = validateWorkflowMediaAdoptionTargets({
+				adoptions, outputs: resumeRuns, workflowDefinition: root,
+			});
+			validateWorkflowMediaAdoptionDescendants({ root, adoptions, runs: resumeRuns });
+		} catch (error: unknown) {
+			// A caller-requested amendment is a contract: it fails the resume instead of
+			// silently re-generating what the caller asked to reuse.
+			if (explicitAdoptions.length > 0) throw error;
+			applicable = false;
+			console.warn(JSON.stringify({
+				message: "workflow_media_adoption_reuse_skipped",
+				executionId: sourceExecution.id,
+				retainedAdoptions: mergedAdoptions.size,
+				reason: error instanceof Error ? error.message : String(error),
+			}));
+		}
+		if (applicable) {
+			root = { ...root, workflowMediaAdoptions: adoptions,
+				workflowMediaAdoptionSourceExecutionId: sourceExecution.id };
+			recoveryFrontier = { ...recoveryFrontier, invalidatedNodeIds: [...new Set([
+				...recoveryFrontier.invalidatedNodeIds, ...adoptionOwnerNodeIds,
+			])] };
+		}
+	}
+
+	if (input.planningRevision) {
+		const revision = prepareWorkflowPlanningRevision({ root, revision: input.planningRevision, nodeRuns });
+		root = { ...revision.root, workflowPlanningRevision: {
+			...input.planningRevision, sourceExecutionId: sourceExecution.id,
+			authorizedBy: input.ownerId, requestedAt: new Date().toISOString(),
+		} };
+		recoveryFrontier = { ...recoveryFrontier, invalidatedNodeIds: revision.invalidatedNodeIds };
+	}
 	root = {
 		...root,
 		workflowRecoveryFrontier: {
@@ -511,7 +649,7 @@ export async function resumeWorkflowExecution(input: Readonly<{
 			sourceExecutionId: sourceExecution.id,
 			failedNodeId: recoveryNode.node_id,
 			invalidatedNodeIds: recoveryFrontier.invalidatedNodeIds,
-			mode: recoveryFrontier.mode,
+			mode: input.planningRevision ? "authorized_planning_revision" : recoveryFrontier.mode,
 			rejectedBindingCount: recoveryFrontier.rejectedBindingCount,
 			unresolvedBindingCount: recoveryFrontier.unresolvedBindingCount,
 		},
@@ -621,8 +759,44 @@ export async function resumeWorkflowExecution(input: Readonly<{
 		// fields introduced later. Re-reading the mutable canvas here would mix
 		// outputs from the failed physical run back into its input, invalidate
 		// checkpoints and potentially repeat already paid side effects.
-		const projectContext = parseWorkflowProjectContext(root.workflowProjectContext);
-		const callerCanvasSnapshot = parseWorkflowCallerCanvasSnapshot(root.workflowCallerCanvasSnapshot);
+		let projectContext = parseWorkflowProjectContext(root.workflowProjectContext);
+		let callerCanvasSnapshot = parseWorkflowCallerCanvasSnapshot(root.workflowCallerCanvasSnapshot);
+		if (input.mediaAdoptions) {
+			if (!projectContext) throw new Error("media_adoption_project_context_missing");
+			const currentAssets = await loadVisibleWorkflowProjectAssets(input.context, input.ownerId, projectContext.projectId);
+			const ids = new Set(input.mediaAdoptions.map((item) => item.assetId));
+			const adopted = currentAssets.filter((asset) => ids.has(asset.id) && asset.projectId === projectContext!.projectId).map(projectAssetSnapshot);
+			if (adopted.length !== ids.size || adopted.some((asset) => !isWorkflowProjectImageReady(asset))) throw new Error("media_adoption_asset_not_ready");
+			projectContext = { ...projectContext,
+				projectAssetIds: [...new Set([...projectContext.projectAssetIds, ...ids])],
+				assetSnapshot: [...projectContext.assetSnapshot.filter((asset) => !ids.has(asset.assetId)), ...adopted],
+			};
+			const resolver = createWorkflowAssetResolver({ context: projectContext, loadVisibleAssets: async () => currentAssets });
+			for (const id of ids) await resolver.resolveAssetResource(id, "image");
+			root = { ...root, workflowProjectContext: projectContext };
+		}
+
+		if (input.planningRevision && input.planningRevision.refreshAssetIds.length > 0) {
+			if (!projectContext) throw new Error("planning_revision_project_context_missing");
+			const currentAssets = await loadVisibleWorkflowProjectAssets(input.context, input.ownerId, projectContext.projectId);
+			projectContext = { ...reviseWorkflowAssetSnapshots(projectContext, input.planningRevision.refreshAssetIds, currentAssets),
+				capturedAt: new Date().toISOString() };
+			root = { ...root, workflowProjectContext: projectContext };
+		}
+
+		if (projectContext && callerCanvasSnapshot) {
+			const frozenContext = projectContext;
+			const binding = await repairMissingWorkflowSourceBinding({ projectContext, callerCanvasSnapshot,
+				loadSource: () => loadWorkflowSourceBindingCandidate(input.context, input.ownerId, frozenContext) });
+			if (binding.repaired) {
+				projectContext = binding.projectContext;
+				callerCanvasSnapshot = binding.callerCanvasSnapshot;
+				console.info("[workflow-source-binding] missing canonical input bound during recovery", {
+					sourceExecutionId: sourceExecution.id, canvasId: projectContext.canvasId,
+					sourceNodeId: projectContext.sourceNodeId,
+				});
+			}
+		}
 		const triggerNode = Array.isArray(root.nodes)
 			? root.nodes.find((node) => node && typeof node === "object" && !Array.isArray(node)
 				&& (node as Record<string, unknown>).id === rerun.triggerNodeId)
@@ -648,7 +822,7 @@ export async function resumeWorkflowExecution(input: Readonly<{
 			...(rerun.stopAfterNodeId ? { stopAfterNodeId: rerun.stopAfterNodeId } : {}),
 				replay: {
 					sourceExecutionId: sourceExecution.id,
-					startFromNodeId: recoveryNode.node_id,
+					startFromNodeId: input.planningRevision?.nodeId ?? recoveryNode.node_id,
 					invalidatedNodeIds: recoveryFrontier.invalidatedNodeIds,
 					scope: "recovery_snapshot",
 				},
@@ -661,6 +835,8 @@ export async function resumeWorkflowExecution(input: Readonly<{
 				idempotencyKey: `workflow-cancellation-revoked:${sourceExecution.id}`,
 			} : definitionCutover && currentFlowUpdatedAt ? {
 				idempotencyKey: `workflow-definition-cutover:${sourceExecution.id}:${currentFlowUpdatedAt}`,
+			} : input.mediaRetries ? {
+				idempotencyKey: `workflow-media-retry:${workflowMediaRetryBatchIdentity(authorizedMediaRetries ?? [])}`,
 			} : {
 				// Recovery admission can be requested concurrently by the queue and
 				// reconciler. One source checkpoint owns exactly one standard recovery
@@ -672,7 +848,17 @@ export async function resumeWorkflowExecution(input: Readonly<{
 			...(projectContext ? { projectContext } : {}),
 			...(callerCanvasSnapshot ? { callerCanvasSnapshot } : {}),
 			recoveryOfExecutionId: sourceExecution.id,
-			recoveryAdmission: cancellationRevoked ? "cancellation_revocation" : "failed_source",
+			// Balance recovery (and model cutover) fenced its own source above, so the
+			// source is `canceled` by the time this child is admitted. Declaring the
+			// admission mode keeps that fence from being read back as "the source
+			// changed under us" and rejecting the recovery that just performed it.
+			recoveryAdmission: cancellationRevoked
+				? "cancellation_revocation"
+				: providerBalanceRecovery
+					? "provider_balance_recovery"
+					: input.mediaRetries
+						? "media_retry"
+					: "failed_source",
 		});
 		return result.execution;
 	} catch (error: unknown) {

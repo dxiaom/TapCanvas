@@ -1,3 +1,6 @@
+import { projectWorkflowReplayInvocation, WorkflowReplayInvocationError, type WorkflowReplayInvocation } from "./execution.replay-invocation";
+import { workflowReplayAttempt, type WorkflowReplayAttemptV1 } from "./execution.replay-attempt";
+import { compressJsonResponse } from "../../platform/node/json-response-compression";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { AppContext, AppEnv } from "../../types";
@@ -20,13 +23,15 @@ import {
 	mapNodeRunRow,
 	updateNodeRun,
 } from "./execution.repo";
-import { RunFlowExecutionRequestSchema, WorkflowExecutionFamilySchema, WorkflowExecutionHistoryPageSchema, WorkflowExecutionResumeRequestSchema, WorkflowHumanApprovalResponseSchema, WorkflowNodeAttemptPageSchema } from "./execution.schemas";
+import { WorkflowSnapshotRerunRequestSchema, RunFlowExecutionRequestSchema, WorkflowExecutionFamilySchema, WorkflowExecutionHistoryPageSchema, WorkflowExecutionResumeRequestSchema, WorkflowHumanApprovalResponseSchema, WorkflowNodeAttemptPageSchema } from "./execution.schemas";
 import { getPrismaClient } from "../../platform/node/prisma";
 import { parseWorkflowNodeOutputV1 } from "./execution.node-runtime";
+import { workflowExternalPollAt } from "./execution.external-check";
 import { isAdminRequest } from "../team/team.service";
 import { parseWorkflowTriggerSpec } from "@tapcanvas/workflow-kernel-protocol";
 import {
 	startWorkflowExecution,
+	findExistingWorkflowConsumerReplay,
 	WorkflowStartError,
 } from "./execution.start-service";
 import { previewWorkflowSchedule } from "./execution.schedule-runtime";
@@ -35,12 +40,16 @@ import { cancelWorkflowExecutionForOwner } from "./execution.cancel-service";
 import { deliverWorkflowEvent, deliverWorkflowWebhook } from "./execution.trigger-runtime";
 import { projectWorkflowGraphForViewer } from "@tapcanvas/workflow-kernel-protocol";
 import { prepareWorkflowExecutionSnapshotRerun } from "./execution.snapshot-runtime";
-import { buildWorkflowProjectContextForRun } from "./execution.project-context-runtime";
+import { loadExplicitWorkflowProjectAssets, buildWorkflowProjectContextForRun } from "./execution.project-context-runtime";
+import { createRuntimeWorkflowAssetResolver } from "./execution.project-context-runtime";
+import { enrichWorkflowMediaUnderstanding } from "./execution.media-understanding";
+import { parseWorkflowProjectContext } from "./execution.project-context";
 import {
 	getWorkflowExecutionFamilyPageForOwner,
 	listWorkflowNodeAttemptsPageForExecutionOwner,
 } from "./execution.family-store";
 import { resumeWorkflowExecution, WorkflowResumeError } from "./execution.resume-service";
+import { workflowAgentPreferencesRouter } from "./execution.agent-preferences.routes";
 
 export const executionRouter = new Hono<AppEnv>();
 export const workflowTriggerRouter = new Hono<AppEnv>();
@@ -93,6 +102,7 @@ workflowTriggerRouter.post("/webhooks/:webhookId", async (c) => {
 });
 
 executionRouter.use("*", authMiddleware);
+executionRouter.route("/", workflowAgentPreferencesRouter);
 
 executionRouter.get("/", async (c) => {
 	const userId = c.get("userId");
@@ -184,16 +194,43 @@ executionRouter.post("/run", async (c) => {
 	const flow = await getFlowForOwner(c.env.DB, flowId, userId);
 	if (!flow) return c.json({ error: "Flow not found" }, 404);
 	try {
-		const runContext = flow.project_id
+		let replayInvocation: WorkflowReplayInvocation | undefined;
+		let replayAttempt: WorkflowReplayAttemptV1 | undefined;
+		if (parsed.data.replayFromExecutionId && parsed.data.startFromNodeId && parsed.data.stopAfterNodeId) {
+			const row = await getExecutionSnapshotForOwner(c.env.DB, { ownerId: userId, executionId: parsed.data.replayFromExecutionId });
+			if (!row) throw new WorkflowReplayInvocationError("workflow_replay_source_not_found", 404);
+			const source = mapExecutionSnapshotRow(row);
+			if (source.flowId !== flow.id) throw new WorkflowReplayInvocationError("workflow_replay_source_flow_mismatch");
+			if (!source.data || typeof source.data !== "object" || Array.isArray(source.data)) throw new WorkflowReplayInvocationError("workflow_replay_graph_invalid", 400);
+			const sourceData = source.data as Record<string, unknown>;
+			if (!parsed.data.idempotencyKey) throw new WorkflowReplayInvocationError("workflow_replay_idempotency_key_missing", 400);
+			replayAttempt = workflowReplayAttempt({ idempotencyKey: parsed.data.idempotencyKey, flowId: flow.id, ownerId: userId,
+				sourceExecutionId: source.executionId, sourceFlowVersionId: source.flowVersionId, sourceSnapshot: source.data, liveFlowData: flow.data,
+				triggerNodeId: parsed.data.triggerNodeId, startFromNodeId: parsed.data.startFromNodeId, stopAfterNodeId: parsed.data.stopAfterNodeId,
+				refreshAssetIds: parsed.data.refreshAssetIds, trigger: parsed.data.trigger ?? "manual", concurrency: parsed.data.concurrency });
+			const accepted = await findExistingWorkflowConsumerReplay(c.env, { flowId: flow.id, ownerId: userId, attempt: replayAttempt });
+			if (accepted) return c.json(accepted);
+			const sourceContext = parseWorkflowProjectContext(sourceData.workflowProjectContext);
+			const refreshIds = parsed.data.refreshAssetIds ?? [];
+			if (refreshIds.length && !sourceContext) throw new WorkflowReplayInvocationError("workflow_replay_asset_context_missing");
+			const visibleAssets = refreshIds.length && sourceContext
+				? await loadExplicitWorkflowProjectAssets(c as unknown as AppContext, userId, sourceContext.projectId, refreshIds) : [];
+			replayInvocation = projectWorkflowReplayInvocation({ liveFlowData: flow.data, sourceSnapshot: source.data,
+				sourceExecutionId: source.executionId, sourceFlowVersionId: source.flowVersionId,
+				triggerNodeId: parsed.data.triggerNodeId, startFromNodeId: parsed.data.startFromNodeId,
+				stopAfterNodeId: parsed.data.stopAfterNodeId, refreshAssetIds: refreshIds, visibleAssets, capturedAt: new Date().toISOString() });
+		}
+		const runContext = !replayInvocation && flow.project_id
 			? await buildWorkflowProjectContextForRun({
 				c: c as unknown as AppContext,
 				ownerId: userId,
 				projectId: flow.project_id,
 				canvasId: flow.id,
+				...(parsed.data.triggerPayload ? { triggerPayload: parsed.data.triggerPayload } : {}),
 			})
 			: undefined;
 		const result = await startWorkflowExecution(c.env, {
-			flow,
+			flow: replayInvocation ? { ...flow, data: JSON.stringify(replayInvocation.flowData) } : flow,
 			ownerId: userId,
 			triggerNodeId: parsed.data.triggerNodeId,
 			...(parsed.data.stopAfterNodeId ? { stopAfterNodeId: parsed.data.stopAfterNodeId } : {}),
@@ -202,11 +239,21 @@ executionRouter.post("/run", async (c) => {
 					replay: {
 						sourceExecutionId: parsed.data.replayFromExecutionId,
 						startFromNodeId: parsed.data.startFromNodeId,
+						requireSuccessfulAncestors: true,
 					},
 				}
 				: {}),
 			trigger: parsed.data.trigger ?? "manual",
 			concurrency: parsed.data.concurrency,
+			...(parsed.data.idempotencyKey ? { idempotencyKey: parsed.data.idempotencyKey } : {}),
+			...(replayAttempt ? { replayAttempt } : {}),
+			...(parsed.data.triggerPayload ? { triggerPayload: parsed.data.triggerPayload } : {}),
+			...(replayInvocation ? {
+				replayInvocationFacts: replayInvocation.frozenInvocationFacts,
+				...(replayInvocation.projectContext ? { projectContext: replayInvocation.projectContext } : {}),
+				...(replayInvocation.callerCanvasSnapshot ? { callerCanvasSnapshot: replayInvocation.callerCanvasSnapshot } : {}),
+				...(replayInvocation.triggerPayload === undefined ? {} : { triggerPayload: replayInvocation.triggerPayload }),
+			} : {}),
 			...(runContext ? {
 				projectContext: runContext.projectContext,
 				callerCanvasSnapshot: runContext.callerCanvasSnapshot,
@@ -214,6 +261,7 @@ executionRouter.post("/run", async (c) => {
 		});
 		return c.json(result.execution);
 	} catch (error: unknown) {
+		if (error instanceof WorkflowReplayInvocationError) return c.json({ error: error.message, code: error.message }, error.status);
 		if (error instanceof WorkflowStartError) {
 			return c.json(
 				{
@@ -283,7 +331,7 @@ executionRouter.get("/node-history", async (c) => {
 	return c.json(rows.map(mapNodeRunHistoryRow));
 });
 
-executionRouter.get("/:id/snapshot", async (c) => {
+executionRouter.get("/:id/snapshot", compressJsonResponse, async (c) => {
 	const userId = c.get("userId");
 	if (!userId) return c.json({ error: "Unauthorized" }, 401);
 	const row = await getExecutionSnapshotForOwner(c.env.DB, {
@@ -310,12 +358,18 @@ executionRouter.get("/:id/snapshot", async (c) => {
 	}
 });
 
-executionRouter.get("/:id/context", async (c) => {
+executionRouter.get("/:id/context", compressJsonResponse, async (c) => {
 	const userId = c.get("userId");
 	if (!userId) return c.json({ error: "Unauthorized" }, 401);
 	const row = await getExecutionForOwner(c.env.DB, c.req.param("id"), userId);
 	if (!row) return c.json({ error: "Execution not found" }, 404);
 	const execution = mapExecutionRow(row);
+	const appContext = c as unknown as AppContext;
+	const frozenContext = parseWorkflowProjectContext(execution.projectContext);
+	const observedContext = frozenContext ? await enrichWorkflowMediaUnderstanding({
+		c: appContext, ownerId: userId, context: frozenContext, assetIds: frozenContext.projectAssetIds,
+		resolver: createRuntimeWorkflowAssetResolver({ c: appContext, ownerId: userId, context: frozenContext }),
+	}) : null;
 	return c.json({
 		executionId: execution.id,
 		projectId: execution.projectId ?? null,
@@ -323,10 +377,15 @@ executionRouter.get("/:id/context", async (c) => {
 		projectContext: execution.projectContext ?? null,
 		assetSnapshot: execution.assetSnapshot ?? [],
 		usesProjectAssets: execution.usesProjectAssets === true,
+		mediaUnderstanding: {
+			frozen: frozenContext?.mediaUnderstanding !== undefined,
+			evidence: observedContext?.mediaUnderstanding ?? [],
+			diagnostics: observedContext?.mediaUnderstandingDiagnostics ?? [],
+		},
 	});
 });
 
-executionRouter.get("/:id/attempts", async (c) => {
+executionRouter.get("/:id/attempts", compressJsonResponse, async (c) => {
 	const userId = c.get("userId");
 	if (!userId) return c.json({ error: "Unauthorized" }, 401);
 	const executionId = c.req.param("id").trim();
@@ -385,7 +444,17 @@ executionRouter.post("/:id/resume", async (c) => {
 			details: parsed.error.flatten(),
 		}, 400);
 	}
+	/*
+	 * 恢复执行是"所有者对自己的执行"的动作：resumeWorkflowExecution 全程按 ownerId 取源执行、
+	 * 校验冻结快照与家族归属，越权者取不到任何资源。此前这里一律要求 admin，而 UI 的"重试"
+	 * 对普通用户同样展示，个人账号点下去必然 403，把"从失败节点继续"变成不可用路径。
+	 * 管理员仍可恢复任意执行；所有者可恢复自己的执行；非所有者仍需显式外部原因标志。
+	 */
+	const ownedExecution = isAdminRequest(c)
+		? null
+		: await getExecutionForOwner(c.env.DB, c.req.param("id").trim(), userId);
 	if (!isAdminRequest(c)
+		&& ownedExecution === null
 		&& parsed.data.providerBalanceRestored !== true
 		&& parsed.data.cancellationRevoked !== true) {
 		return c.json({ error: "Administrator workflow access required", code: "admin_required" }, 403);
@@ -396,6 +465,7 @@ executionRouter.post("/:id/resume", async (c) => {
 			env: c.env,
 			ownerId: userId,
 			sourceExecutionId: c.req.param("id").trim(),
+			...(parsed.data.nodeId ? { nodeId: parsed.data.nodeId } : {}),
 			trigger: "manual",
 			...(parsed.data.providerBalanceRestored ? { providerBalanceRestored: true as const } : {}),
 			...(parsed.data.cancellationRevoked ? { cancellationRevoked: true as const } : {}),
@@ -406,6 +476,9 @@ executionRouter.post("/:id/resume", async (c) => {
 				},
 			} : {}),
 			...(parsed.data.definitionCutover ? { definitionCutover: parsed.data.definitionCutover } : {}),
+			...(parsed.data.planningRevision ? { planningRevision: parsed.data.planningRevision } : {}),
+			...(parsed.data.mediaAdoptions ? { mediaAdoptions: parsed.data.mediaAdoptions } : {}),
+			...(parsed.data.mediaRetries ? { mediaRetries: parsed.data.mediaRetries } : {}),
 		}));
 	} catch (error: unknown) {
 		if (error instanceof WorkflowResumeError) {
@@ -428,6 +501,15 @@ executionRouter.post("/:id/rerun", async (c) => {
 	if (!isAdminRequest(c)) {
 		return c.json({ error: "Administrator workflow access required", code: "admin_required" }, 403);
 	}
+	let rerunBody: unknown;
+	try {
+		const raw = await c.req.text();
+		rerunBody = raw.trim() ? JSON.parse(raw) : {};
+	} catch {
+		return c.json({ error: "Invalid rerun request JSON" }, 400);
+	}
+	const parsed = WorkflowSnapshotRerunRequestSchema.safeParse(rerunBody);
+	if (!parsed.success) return c.json({ error: "Invalid rerun request body", issues: parsed.error.issues }, 400);
 	const source = await getExecutionSnapshotForOwner(c.env.DB, {
 		ownerId: userId,
 		executionId: c.req.param("id"),
@@ -435,7 +517,7 @@ executionRouter.post("/:id/rerun", async (c) => {
 	if (!source) return c.json({ error: "Execution not found" }, 404);
 	try {
 		const frozen = mapExecutionSnapshotRow(source);
-		const rerun = prepareWorkflowExecutionSnapshotRerun(frozen.data);
+		const rerun = prepareWorkflowExecutionSnapshotRerun(frozen.data, parsed.data);
 		const result = await startWorkflowExecution(c.env, {
 			flow: {
 				id: frozen.flowId,
@@ -448,7 +530,13 @@ executionRouter.post("/:id/rerun", async (c) => {
 			},
 			ownerId: userId,
 			triggerNodeId: rerun.triggerNodeId,
+			...(rerun.projectContext ? { projectContext: rerun.projectContext } : {}),
 			...(rerun.stopAfterNodeId ? { stopAfterNodeId: rerun.stopAfterNodeId } : {}),
+			...(parsed.data.startFromNodeId ? { replay: {
+				sourceExecutionId: c.req.param("id"), startFromNodeId: parsed.data.startFromNodeId,
+				...(parsed.data.authorRepair ? { authorRepair: parsed.data.authorRepair } : {}),
+				...(parsed.data.consumerReplay ? { consumerReplay: parsed.data.consumerReplay } : {}),
+			} } : {}),
 			trigger: "manual",
 		});
 		return c.json(result.execution);
@@ -530,6 +618,9 @@ executionRouter.post("/:id/human-response", async (c) => {
 	const respondedAt = new Date().toISOString();
 	const nextOutputRefs = {
 		...outputRefs,
+		// Persist the wakeup together with its signal evidence, before publishing.
+		// A crash or lost queue delivery can then be recovered by the common scanner.
+		externalCheck: workflowExternalPollAt(respondedAt),
 		evidence: {
 			...outputRefs.evidence,
 			humanResponse: parsed.data.response,
@@ -552,7 +643,7 @@ executionRouter.post("/:id/human-response", async (c) => {
 	return c.json({ accepted: true, executionId, nodeId: parsed.data.nodeId, response: parsed.data.response, respondedAt });
 });
 
-executionRouter.get("/:id/node-runs", async (c) => {
+executionRouter.get("/:id/node-runs", compressJsonResponse, async (c) => {
 	const userId = c.get("userId");
 	if (!userId) return c.json({ error: "Unauthorized" }, 401);
 	const id = c.req.param("id");
@@ -561,6 +652,23 @@ executionRouter.get("/:id/node-runs", async (c) => {
 		executionId: id,
 	});
 	return c.json(rows.map(mapNodeRunRow));
+});
+
+// Bounded persisted event history also works for completed executions.
+executionRouter.get("/:id/event-history", async (c) => {
+	const userId = c.get("userId");
+	if (!userId) return c.json({ error: "Unauthorized" }, 401);
+	const executionId = c.req.param("id");
+	const owner = await getExecutionForOwner(c.env.DB, executionId, userId);
+	if (!owner) return c.json({ error: "Execution not found" }, 404);
+	const after = Number(c.req.query("after") ?? 0);
+	const limit = Number(c.req.query("limit") ?? 200);
+	if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200) {
+		return c.json({ error: "Invalid event cursor or limit", code: "workflow_event_page_invalid" }, 400);
+	}
+	const rows = await listExecutionEvents(c.env.DB, { executionId, afterSeq: after, limit });
+	const items = rows.slice(0, limit).map(mapExecutionEventRow);
+	return c.json({ items, nextCursor: rows.length === limit ? items[items.length - 1]!.seq : null });
 });
 
 // SSE stream for execution logs (DB-backed; resumable via `?after=<seq>`)
@@ -576,14 +684,31 @@ executionRouter.get("/:id/events", async (c) => {
 
 	return streamSSE(c, async (stream) => {
 		const HEARTBEAT_MS = 15_000;
+		const INITIAL_POLL_MS = 800;
+		const MAX_POLL_MS = 5_000;
 		let closed = false;
 		const abortSignal = c.req.raw.signal as AbortSignal;
 		abortSignal.addEventListener("abort", () => {
 			closed = true;
 		});
 
-		const sleep = (ms: number) =>
-			new Promise<void>((resolve) => setTimeout(resolve, ms));
+		const sleep = (ms: number) => new Promise<boolean>((resolve) => {
+			if (abortSignal.aborted) {
+				resolve(false);
+				return;
+			}
+			let settled = false;
+			const finish = (result: boolean): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				abortSignal.removeEventListener("abort", onAbort);
+				resolve(result);
+			};
+			const onAbort = (): void => finish(false);
+			const timer = setTimeout(() => finish(true), ms);
+			abortSignal.addEventListener("abort", onAbort, { once: true });
+		});
 
 		try {
 			await stream.writeSSE({
@@ -596,6 +721,7 @@ executionRouter.get("/:id/events", async (c) => {
 			});
 
 			let lastPingAt = Date.now();
+			let pollIntervalMs = INITIAL_POLL_MS;
 			while (!closed) {
 				const rows = await listExecutionEvents(c.env.DB, {
 					executionId,
@@ -603,10 +729,15 @@ executionRouter.get("/:id/events", async (c) => {
 					limit: 50,
 				});
 				if (rows.length) {
+					pollIntervalMs = INITIAL_POLL_MS;
 					for (const r of rows) {
 						const dto = mapExecutionEventRow(r);
 						cursor = Math.max(cursor, dto.seq);
 						await stream.writeSSE({
+							// The client persists this cursor and sends it back as `after` on
+							// reconnect. Without the SSE id, every reconnect restarts at zero
+							// and replays the entire execution event log indefinitely.
+							id: String(dto.seq),
 							event: dto.eventType,
 							data: JSON.stringify(dto),
 						});
@@ -621,7 +752,8 @@ executionRouter.get("/:id/events", async (c) => {
 					});
 					lastPingAt = Date.now();
 				}
-				await sleep(800);
+				if (!(await sleep(pollIntervalMs))) return;
+				pollIntervalMs = Math.min(MAX_POLL_MS, pollIntervalMs * 2);
 			}
 		} finally {
 			closed = true;

@@ -1,3 +1,6 @@
+import { VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION } from "@tapcanvas/video-orchestrator-protocol";
+import { MEDIA_ASSET_PURPOSES } from "../../../../../packages/schemas/media-asset-purpose/index.mjs";
+
 /**
  * AI tool contracts + canvas node capability specs.
  *
@@ -43,7 +46,7 @@ export type ToolExecutionSemantics = {
 export const characterIdentityBoardSpecToolSchema = {
 	type: "object",
 	description:
-		"characterAssetRole='identity_anchor' 时使用的纯结构角色身份板合同：正面脸、3/4 脸、正面全身、背面全身四个信息区。协议只验证跨视图一致性、参考职责隔离、中性参考背景、无文字/品牌等可执行结构；体型、媒介、镜头与生活痕迹必须由 agents-cli 的 tapcanvas-character-card 根据角色事实和项目画风决定，禁止协议层默认九头身、真人写实或固定焦段。",
+		"characterAssetRole='identity_anchor' 时使用的纯结构角色身份板合同（identity-board/v3）：正面脸、侧面脸、正面全身、背面全身四个信息区。协议只验证跨视图一致性、参考职责隔离、中性参考背景、仅模板角标文字（FACE FRONT / FACE SIDE / BODY FRONT / BACK）且无姓名/品牌等可执行结构；体型、媒介、镜头与生活痕迹必须由 agents-cli 的 tapcanvas-character-card 根据角色事实和项目画风决定，禁止协议层默认九头身、真人写实或固定焦段。",
 	properties: {
 		layout: { type: "string", enum: ["identity_board_four_view"] },
 		faceViews: {
@@ -51,8 +54,8 @@ export const characterIdentityBoardSpecToolSchema = {
 			minItems: 2,
 			maxItems: 2,
 			uniqueItems: true,
-			items: { type: "string", enum: ["front", "three_quarter"] },
-			description: "Exactly front then three_quarter face views.",
+			items: { type: "string", enum: ["front", "profile"] },
+			description: "Exactly front then profile (side) face views, matching the FACE FRONT / FACE SIDE panels.",
 		},
 		fullBodyViews: {
 			type: "array",
@@ -65,7 +68,7 @@ export const characterIdentityBoardSpecToolSchema = {
 		crossViewConsistency: { type: "boolean", enum: [true] },
 		referenceRoleIsolation: { type: "boolean", enum: [true] },
 		neutralReferenceBackground: { type: "boolean", enum: [true] },
-		readableTextVisible: { type: "boolean", enum: [false] },
+		readableTextVisible: { type: "boolean", enum: [true] },
 		brandingVisible: { type: "boolean", enum: [false] },
 		neutralBaseState: { type: "boolean", enum: [true] },
 		canonicalNameVisible: { type: "boolean", enum: [false] },
@@ -119,7 +122,7 @@ export const propIdentityBoardSpecToolSchema = {
 			type: "string",
 			enum: ["source_dimensions", "relative_scale_reference", "source_unspecified"],
 		},
-		readableTextVisible: { type: "boolean", enum: [false] },
+		readableTextVisible: { type: "boolean", enum: [true] },
 		brandingVisible: { type: "boolean", enum: [false] },
 		neutralBaseState: { type: "boolean", enum: [true] },
 	},
@@ -230,6 +233,12 @@ export type CanvasCapabilityManifest = {
 	remoteTools: CanvasCapabilityToolSchema[];
 	nodeSpecs: Record<string, CanvasCapabilityNodeSpec>;
 	protocols: {
+		workflow: {
+			canvasDefinitionVersion: number;
+			mediaAssetPurposes: readonly string[];
+			prerequisiteAssetUrlFields: readonly string[];
+			deliveryContract: readonly string[];
+		};
 		flowPatch: {
 			supportedMutationOperations: readonly string[];
 			supportedCreateNodeTypes: readonly string[];
@@ -242,7 +251,7 @@ export type CanvasCapabilityManifest = {
 				videoLikeTargets: readonly string[];
 				videoLikeSources: readonly string[];
 			};
-			storyboard: {
+			storyboard?: {
 				editorCellFactField: string;
 				editorCellPromptField: string;
 				runtimeTelemetryFields: readonly string[];
@@ -472,7 +481,7 @@ export const canvasToolSchemas = [
 	{
 		name: "add_director_console",
 		description:
-			"在当前章节画布上种一个导演台节点（directorConsole）。导演台是一个真 3D 摄影棚：在空 3D 空间里摆放骨骼人体素体（角色，支持 56 种姿势预设：坐/跪/打斗/交流/情绪等，及逐关节微调）与机位，调机位位置/注视目标/FOV，从机位 POV 截图作为 AI 出图的空间/构图参考，截图可「发送到画布」生成参考图节点。场景搭建为节点内全屏 3D 编辑器中的交互操作，本工具仅负责创建空导演台节点；如需程序化摆场景+姿势+直接出参考图，用 tapcanvas_capture_director_scene。必须使用稳定 ID 以确保重试幂等；若同 id 节点已存在则直接返回，不重复创建。",
+			"在当前章节画布上种一个导演台入口节点（directorConsole）。导演台是独立的三维预演工作台：场景、角色、道具、机位、走位、分镜板与视频导出均由画布节点打开的导演台应用管理，本工具只负责创建入口节点，不复制或推断导演台内部场景数据。必须使用稳定 ID 以确保重试幂等；若同 id 节点已存在则直接返回，不重复创建。",
 		parameters: {
 			type: "object",
 			additionalProperties: false,
@@ -713,7 +722,7 @@ export const canvasNodeSpecs = {
 			characterProfileVersion:
 				"string (optional; 当前角色资产包结构版本；新角色卡统一为 character-card/v3)",
 			identityBoardSpec:
-				"object (characterAssetRole='identity_anchor' 时使用的 identity-board/v3 结构合同：正面脸、3/4 脸、正面全身、背面全身，锁定跨视图一致性、参考图职责隔离、中性参考背景、无文字与无品牌。体型、媒介、镜头与生活痕迹由 tapcanvas-character-card 从角色事实和项目画风编译；协议层不提供九头身、真人写实、固定焦段或随机瑕疵默认。)",
+				"object (characterAssetRole='identity_anchor' 时使用的 identity-board/v3 结构合同：正面脸、侧面脸、正面全身、背面全身，锁定跨视图一致性、参考图职责隔离、中性参考背景、仅模板角标文字且无姓名与品牌。体型、媒介、镜头与生活痕迹由 tapcanvas-character-card 从角色事实和项目画风编译；协议层不提供九头身、真人写实、固定焦段或随机瑕疵默认。)",
 			identityAnchors:
 				"string[] (optional; 3-6 个画面可验证、跨镜必须稳定的身份事实，例如骨相、发型剪影、体型、核心配饰、基准服装结构或身份道具。禁止抽象评价。)",
 			prohibitedDrift:
@@ -922,16 +931,13 @@ export const canvasNodeSpecs = {
 	directorConsole: {
 		label: "导演台",
 		purpose:
-			"真 3D 摄影棚 blocking 节点。节点内全屏 3D 编辑器：摆放骨骼人体素体（角色，含位置/旋转/缩放/颜色/姿势）与机位（位置/注视目标可锁定角色/FOV），双视角（导演视角总览 / 机位视角 POV）切换，按画幅比例从机位 POV 截图，截图可发送到画布生成参考图节点。素体支持 56 种姿势预设（posePresetId，分基础/坐跪/行动/武戏/交流/情绪六类）与逐关节 pose 微调，应按剧情为每个角色设定姿势——缺省 T-pose 无表演信息。适用于镜头 pre-viz、构图与空间关系编排、为 AI 出图提供精确机位/构图参考。",
+			"独立三维预演工作台入口。节点只保存导演台宿主状态；打开后由同源 iframe 加载 `apps/director-desk`，导演台在自己的 IndexedDB 工程中管理场景、角色、道具、机位、动作、分镜板与视频导出。",
 		fields: {
-			scene: "DirectorScene { characters: CharacterObj[], cameras: CameraObj[], aspect, activeCameraId? }",
-			"scene.characters[]": "CharacterObj { id, name, modelId, position[3], rotation[3], scale[3], uniformScale, colorHex, posePresetId?, pose?, hidden?, locked? }",
-			"scene.characters[].posePresetId": "静态定格姿势预设 id（56 种，完整枚举见 tapcanvas_capture_director_scene 工具 schema），如 sit/kneel/punch/hug/dejected——不会动。",
-			"scene.characters[].motionClip": "动画动作预设 id（会动，开箱即用，要角色「做动作」优先用它、别手搓关键帧）：待机 idle-breathe/look-around/impatient；交流 wave-loop/nod/shake-head/bow-once/clap-loop/salute-once/cheer-loop/point-forward；武戏 punch-combo/kick-once/block-recoil/sword-draw/taichi-flow；情绪 stagger-hit/clutch-fall/flinch-loop/dejected-sink。纯位移走 motion.locomotion，与 motionClip 取舍其一。",
-			"scene.characters[].pose": "Record<joint, [x,y,z]弧度>（进阶逐关节覆盖，joint=spine|neck|shoulderL|elbowL|shoulderR|elbowR|hipL|kneeL|hipR|kneeR；与 posePresetId 同给时 pose 优先）",
-			"scene.cameras[]": "CameraObj { id, name, position[3], lookAtMode('manual'|characterId), lookAt[3], fovDeg, screenshots: CameraShot[] }",
-			activeViewpoint: "'director' | 'camera'",
-			selectedObjectId: "string (optional; 当前选中对象 id)",
+			kind: "directorConsole",
+			label: "string",
+			status: "idle | running | success | error",
+			"host bridge": "window.directorDesktop（iframe 宿主桥接）",
+			"project storage": "导演台 IndexedDB 工程",
 		},
 	},
 } as const satisfies Record<string, unknown>;
@@ -950,7 +956,7 @@ export function buildCanvasCapabilityManifest(input?: {
 			)
 		: canvasNodeSpecs;
 	return {
-		version: "2026-04-03",
+		version: "2026-10-07",
 		summary:
 			"TapCanvas canvas capability manifest. Use this as the source of truth for real canvas interfaces, node kinds, flow patch constraints, and bridge-exposed remote tools. Do not invent node kinds, handles, or write paths outside this manifest.",
 		localCanvasTools: canvasToolSchemas.map((tool) => ({
@@ -966,6 +972,18 @@ export function buildCanvasCapabilityManifest(input?: {
 		})),
 		nodeSpecs: nodeSpecs as Record<string, CanvasCapabilityNodeSpec>,
 		protocols: {
+			workflow: {
+				canvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
+				mediaAssetPurposes: MEDIA_ASSET_PURPOSES,
+				prerequisiteAssetUrlFields: ["imageUrl", "imageResults[].url", "videoUrl", "videoResults[].url", "storyboardEditorCells[].imageUrl", "firstFrameUrl", "lastFrameUrl"],
+				deliveryContract: [
+					"Workflow ports carry frozen source segments, chapter asset identities, per-clip production packets and persisted execution evidence. A connection or placeholder does not prove an upstream asset exists.",
+					"The v135 executable canvas template is shared by Web and Hono. Each authored chapter sequence and clip timeline is bound to its frozen source coordinates and exact asset identities before media submission.",
+					"Media execution requires a real prerequisite asset URL. A manual retry creates an independent attempt linked to its exact failed provider receipt; an accepted or uncertain receipt is reconciled without duplicate billing.",
+					"onlyVideoNodes=true delivers saved video nodes, prompts, exact references and real URLs for required upstream images; it does not submit video generation or concatenation.",
+					"Accepted executions are not completed media. Preserve every produced asset, node result and attempt receipt even after later failures or terminal delivery; report missing delivery evidence explicitly.",
+				],
+			},
 			flowPatch: {
 				supportedMutationOperations: [
 					"deleteNodeIds",

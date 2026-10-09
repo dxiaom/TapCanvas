@@ -46,14 +46,27 @@ export type ChatSendCommand = {
   generationProposal?: GenerationProposalContext
   /** 去重/触发用，单调递增 */
   nonce: number
+  /** 页面正在创建项目 Flow 时暂存的用户需求，不应被消费为临时会话。 */
+  queuedUntilFlow?: boolean
+  /** 暂存队列中对应的本地气泡，用于 Flow 就绪时去重。 */
+  queuedMessageId?: string
+  /** 暂存需求的项目/章节作用域，防止导航后投递到另一个项目。 */
+  queuedProjectId?: string
+  queuedChapterId?: string
 }
 
 type ChatCommandState = {
   pending: ChatSendCommand | null
+  pendingQueue: ChatSendCommand[]
+  deferredUntilFlow: ChatSendCommand[]
   /** 主对话回合是否在飞（AiChatDialog 回写）：选项卡等组件据此提示"点选后排队发送"。 */
   busy: boolean
   /** 派发一条发送命令（画布侧调用）。回合在飞时不会丢：AiChatDialog 侧排队、回合结束补发。 */
   dispatchSend: (cmd: Omit<ChatSendCommand, 'nonce'>) => void
+  enqueueUntilFlow: (cmd: Omit<ChatSendCommand, 'nonce' | 'queuedUntilFlow'>) => ChatSendCommand
+  peekDeferredUntilFlow: (scope: { projectId: string; chapterId: string }) => ChatSendCommand | null
+  consumeDeferredUntilFlow: (scope?: { projectId: string; chapterId: string }) => ChatSendCommand | null
+  ackDeferredUntilFlow: (queuedMessageId: string) => void
   /** 取出并清空当前命令（AiChatDialog 消费） */
   consume: () => ChatSendCommand | null
   setBusy: (busy: boolean) => void
@@ -61,16 +74,108 @@ type ChatCommandState = {
 
 let seq = 0
 
+const DEFERRED_CHAT_COMMANDS_STORAGE_KEY = 'tapcanvas.aiChat.deferredUntilFlow.v1'
+
+function readDeferredCommands(): ChatSendCommand[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.sessionStorage.getItem(DEFERRED_CHAT_COMMANDS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is ChatSendCommand => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return false
+      const record = item as Record<string, unknown>
+      return typeof record.text === 'string' && record.text.trim().length > 0
+        && typeof record.nonce === 'number'
+    })
+  } catch {
+    return []
+  }
+}
+
+function persistDeferredCommands(commands: ChatSendCommand[]): void {
+  if (typeof window === 'undefined') return
+  try {
+    if (commands.length === 0) {
+      window.sessionStorage.removeItem(DEFERRED_CHAT_COMMANDS_STORAGE_KEY)
+    } else {
+      window.sessionStorage.setItem(DEFERRED_CHAT_COMMANDS_STORAGE_KEY, JSON.stringify(commands))
+    }
+  } catch {
+    // Session storage is an optional restart aid; the in-memory queue remains authoritative.
+  }
+}
+
 export const useChatCommandStore = create<ChatCommandState>((set, get) => ({
   pending: null,
+  pendingQueue: [],
+  deferredUntilFlow: readDeferredCommands(),
   busy: false,
   dispatchSend: (cmd) => {
     seq += 1
-    set({ pending: { attachCanvasContext: true, ...cmd, nonce: seq } })
+    const next = { attachCanvasContext: true, ...cmd, nonce: seq }
+    const current = get()
+    if (current.pending) {
+      set({ pendingQueue: [...current.pendingQueue, next] })
+    } else {
+      set({ pending: next })
+    }
+  },
+  enqueueUntilFlow: (cmd) => {
+    seq += 1
+    const next = {
+      attachCanvasContext: true,
+      ...cmd,
+      queuedUntilFlow: true,
+      nonce: seq,
+    }
+    set((state) => {
+      const deferredUntilFlow = [...state.deferredUntilFlow, next]
+      persistDeferredCommands(deferredUntilFlow)
+      return { deferredUntilFlow }
+    })
+    return next
+  },
+  peekDeferredUntilFlow: (scope) => {
+    return get().deferredUntilFlow.find((command) => (
+      command.queuedProjectId === scope.projectId
+      && (command.queuedChapterId || '') === scope.chapterId
+    )) ?? null
+  },
+  consumeDeferredUntilFlow: (scope) => {
+    const deferred = get().deferredUntilFlow
+    const index = scope
+      ? deferred.findIndex((command) => (
+          command.queuedProjectId === scope.projectId
+          && (command.queuedChapterId || '') === scope.chapterId
+        ))
+      : 0
+    const next = index >= 0 ? deferred[index] ?? null : null
+    if (next) {
+      const deferredUntilFlow = deferred.filter((_, itemIndex) => itemIndex !== index)
+      persistDeferredCommands(deferredUntilFlow)
+      set({ deferredUntilFlow })
+    }
+    return next
+  },
+  ackDeferredUntilFlow: (queuedMessageId) => {
+    const id = queuedMessageId.trim()
+    if (!id) return
+    const deferredUntilFlow = get().deferredUntilFlow.filter((command) => command.queuedMessageId !== id)
+    if (deferredUntilFlow.length === get().deferredUntilFlow.length) return
+    persistDeferredCommands(deferredUntilFlow)
+    set({ deferredUntilFlow })
   },
   consume: () => {
-    const p = get().pending
-    if (p) set({ pending: null })
+    const state = get()
+    const p = state.pending
+    if (p) {
+      set({
+        pending: state.pendingQueue[0] ?? null,
+        pendingQueue: state.pendingQueue.slice(1),
+      })
+    }
     return p
   },
   setBusy: (busy) => {

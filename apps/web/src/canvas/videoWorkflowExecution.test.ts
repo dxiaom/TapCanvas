@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Node } from '@xyflow/react'
+import { parseWorkflowPipelineRunSpec } from '@tapcanvas/workflow-kernel-protocol'
 import { useRFStore } from './store'
 import {
   VIDEO_ATOMIC_WORKFLOW_EDGES,
   VIDEO_ATOMIC_WORKFLOW_NODES,
+  VIDEO_PROMPT_ONLY_WORKFLOW_EDGES,
   createVideoWorkflowCanvasTemplate,
 } from './videoWorkflowCanvasTemplate'
 import { compileVideoWorkflow, runVideoWorkflow } from './videoWorkflowExecution'
@@ -31,16 +33,46 @@ const sourceGroup: Node = {
   },
 }
 
+type ConfigurableWorkflowNode = Readonly<{ id: string; type?: string; kind?: string; data: unknown }>
+
+function configureNodeTree(node: ConfigurableWorkflowNode): Readonly<ConfigurableWorkflowNode & { data: Record<string, unknown> }> {
+  const data = node.data && typeof node.data === 'object' && !Array.isArray(node.data)
+    ? { ...node.data as Record<string, unknown> }
+    : {}
+  const atomicSpec = data.workflowAtomicSpec && typeof data.workflowAtomicSpec === 'object' && !Array.isArray(data.workflowAtomicSpec)
+    ? data.workflowAtomicSpec as Record<string, unknown>
+    : {}
+  const operation = typeof atomicSpec.operation === 'string' ? atomicSpec.operation : ''
+  if (atomicSpec.executorRef === 'agents.logical-task/v2') data.workflowAgentModelKey = 'text-model-request-key'
+  if (operation === 'estimate') {
+    data.workflowVideoModelKey = 'video-model-request-key'
+    data.workflowVideoResolution = '1080p'
+    data.workflowVideoAspectRatio = '16:9'
+  }
+  if (operation === 'image_generate') {
+    data.workflowImageModelKey = 'gpt-image-2'
+    data.workflowImageAspectRatio = '16:9'
+    data.workflowImageSize = '2K'
+  }
+  if (data.workflowPipeline !== undefined) {
+    const pipeline = parseWorkflowPipelineRunSpec(data.workflowPipeline)
+    data.workflowPipeline = {
+      ...pipeline,
+      steps: pipeline.steps.map((step) => ({
+        ...step,
+        node: configureNodeTree(step.node),
+      })),
+    }
+  }
+  return { ...node, data }
+}
+
 function configureAgentModels(nodeIds: readonly string[]): void {
   for (const nodeId of nodeIds) {
     const node = useRFStore.getState().nodes.find((candidate) => candidate.id === nodeId)
-    const spec = node?.data.workflowAtomicSpec
-    if (
-      spec &&
-      typeof spec === 'object' &&
-      !Array.isArray(spec) &&
-      (spec as Record<string, unknown>).executorRef === 'agents.logical-task/v2'
-    ) useRFStore.getState().updateNodeData(nodeId, { workflowAgentModelKey: 'text-model-request-key' })
+    if (!node) continue
+    const configured = configureNodeTree(node)
+    useRFStore.getState().updateNodeData(nodeId, configured.data)
   }
   const deliveryContractNodeId = nodeIds.find((id) => id.endsWith(':delivery-contract'))
   if (deliveryContractNodeId) {
@@ -49,20 +81,40 @@ function configureAgentModels(nodeIds: readonly string[]): void {
       workflowTargetDurationSeconds: 72,
     })
   }
-  for (const estimateNodeId of nodeIds.filter((id) => id.endsWith('cost-estimate'))) {
-    useRFStore.getState().updateNodeData(estimateNodeId, {
-      workflowVideoModelKey: 'video-model-request-key',
-      workflowVideoResolution: '1080p',
-      workflowVideoAspectRatio: '16:9',
+}
+
+function updateInlineStep(
+  workflowInstanceId: string,
+  stepId: string,
+  update: (data: Record<string, unknown>) => Record<string, unknown>,
+): void {
+  const pipelineNodes = useRFStore.getState().nodes.filter((node) => (
+    node.data.workflowInstanceId === workflowInstanceId && node.data.workflowPipeline !== undefined
+  ))
+  for (const pipelineNode of pipelineNodes) {
+    const pipeline = parseWorkflowPipelineRunSpec(pipelineNode.data.workflowPipeline)
+    let matched = false
+    const steps = pipeline.steps.map((step) => {
+      if (step.stepId !== stepId) return step
+      matched = true
+      return { ...step, node: { ...step.node, data: update({ ...step.node.data }) } }
     })
-  }
-  for (const assetImageNodeId of nodeIds.filter((id) => id.endsWith('asset-image-generate'))) {
-    useRFStore.getState().updateNodeData(assetImageNodeId, {
-      workflowImageModelKey: 'gpt-image-2',
-      workflowImageAspectRatio: '16:9',
-      workflowImageSize: '2K',
+    if (!matched) continue
+    useRFStore.getState().updateNodeData(pipelineNode.id, {
+      workflowPipeline: { ...pipeline, steps },
     })
+    return
   }
+  throw new Error(`template did not create inline step ${stepId}`)
+}
+
+function inlineStepData(workflowInstanceId: string, pipelineNodeId: string, stepId: string): Record<string, unknown> {
+  const node = useRFStore.getState().nodes.find((candidate) => candidate.id === `${workflowInstanceId}:${pipelineNodeId}`)
+  if (!node || !node.data.workflowPipeline) throw new Error(`template did not create ${pipelineNodeId}`)
+  const pipeline = parseWorkflowPipelineRunSpec(node.data.workflowPipeline)
+  const step = pipeline.steps.find((candidate) => candidate.stepId === stepId)
+  if (!step) throw new Error(`template did not create inline step ${stepId}`)
+  return step.node.data
 }
 
 describe('one-click film atomic workflow execution', () => {
@@ -114,28 +166,35 @@ describe('one-click film atomic workflow execution', () => {
       videoModel: 'seedance-2',
     })
     expect(compiled.nodes).toHaveLength(VIDEO_ATOMIC_WORKFLOW_NODES.length)
-    expect(compiled.nodes.find((node) => node.workflowNodeId === 'beat-sheet-format')).toMatchObject({
-      operation: 'max_clip',
-      maxClipCount: 24,
-      executorRef: 'video.beat-sheet.take/v1',
+    expect(compiled.nodes.find((node) => node.workflowNodeId === 'clip-production-pipeline')).toMatchObject({
+      category: 'subworkflow',
+      operation: 'inline_pipeline',
+      executorRef: 'workflow.pipeline.run/v1',
     })
     expect(compiled.edges).toHaveLength(VIDEO_ATOMIC_WORKFLOW_EDGES.length)
     expect(compiled.edges).toContainEqual(expect.objectContaining({
-      sourcePort: 'asset-bindings',
-      targetPort: 'asset-bindings',
+      sourcePort: 'media-items',
+      targetPort: 'media-items',
     }))
     expect(compiled.edges).toContainEqual(expect.objectContaining({
       sourcePort: 'estimate',
-      targetPort: 'estimate',
+      targetPort: 'estimates',
     }))
     expect(compiled.edges).toContainEqual(expect.objectContaining({
-      source: expect.stringContaining(':production-handoff'),
-      target: expect.stringContaining(':video-submit'),
+      source: expect.stringContaining(':clip-media-pipeline'),
+      target: expect.stringContaining(':clip-production-aggregate'),
     }))
-    expect(compiled.edges.some((edge) => (
-      edge.source.includes(':asset-image-generate')
-      && edge.target.includes(':production-handoff')
-    ))).toBe(true)
+    expect(compiled.nodes.some((node) => node.workflowNodeId === 'cost-estimate')).toBe(false)
+    expect(inlineStepData(result.workflowInstanceId, 'clip-media-pipeline', 'cost-estimate')).toMatchObject({
+      workflowAtomicSpec: { operation: 'estimate' },
+      workflowVideoModelKey: 'video-model-request-key',
+      workflowVideoResolution: '1080p',
+      workflowVideoAspectRatio: '16:9',
+    })
+    expect(inlineStepData(result.workflowInstanceId, 'clip-production-pipeline', 'clip-production-agent')).toMatchObject({
+      workflowAtomicSpec: { category: 'agent', executorRef: 'agents.logical-task/v2' },
+      workflowAgentModelKey: 'text-model-request-key',
+    })
   })
 
 	it('compiles an unbound project-context source without asking SmallT for a group id', () => {
@@ -154,16 +213,14 @@ describe('one-click film atomic workflow execution', () => {
       return workflowNodeId ? [[workflowNodeId, node] as const] : []
     }))
 
-    expect(nodeByWorkflowId.get('beat-sheet-agent')?.data.workflowAtomicSpec).toMatchObject({
-      category: 'agent',
-      executorRef: 'agents.logical-task/v2',
-    })
-    expect(nodeByWorkflowId.get('beat-sheet-agent')?.data.workflowAgentDefinitionId).toBe('writer')
-		expect(nodeByWorkflowId.get('asset-coverage')?.data.workflowAtomicSpec).toMatchObject({
-			category: 'control',
-			executorRef: 'video.asset-plans.project/v1',
+		expect(nodeByWorkflowId.get('chapter-sequence-agent')?.data.workflowAtomicSpec).toMatchObject({
+			category: 'agent',
+			executorRef: 'agents.logical-task/v2',
 		})
-    expect(nodeByWorkflowId.get('clip-writer-agent')?.data.workflowAgentDefinitionId).toBe('video-prompt-writer')
+		expect(nodeByWorkflowId.get('chapter-sequence-agent')?.data.workflowAgentDefinitionId).toBe('writer')
+		expect(inlineStepData(result.workflowInstanceId, 'clip-production-pipeline', 'clip-production-agent'))
+			.toMatchObject({ workflowAgentDefinitionId: 'video-prompt-writer' })
+		expect(nodeByWorkflowId.get('clip-writer-agent')).toBeUndefined()
 		expect(nodeByWorkflowId.get('voice-plan-agent')).toBeUndefined()
     expect([...nodeByWorkflowId.values()].some((node) => node.data.workflowAgentDefinitionId === 'orchestrator')).toBe(false)
   })
@@ -174,13 +231,13 @@ describe('one-click film atomic workflow execution', () => {
     configureAgentModels(result.nodeIds)
     useRFStore.setState((state) => ({
       edges: state.edges.filter((edge) => !(
-        edge.source.endsWith(':beat-sheet-format') && edge.target.endsWith(':clip-fan-out')
+        edge.source.endsWith(':chapter-sequence-project')
+        && edge.target.endsWith(':clip-production-pipeline')
+        && edge.targetHandle?.endsWith('clip-sequences')
       )),
     }))
 
-    expect(() => compileVideoWorkflow(`${result.workflowInstanceId}:manual-trigger`)).toThrow(
-      '节点“逐 Clip 展开”缺少输入端口 beat-sheet 的连线',
-    )
+    expect(() => compileVideoWorkflow(`${result.workflowInstanceId}:manual-trigger`)).toThrow(/clip-sequences.*连线/)
   })
 
   it('rejects a connection that feeds the wrong artifact port', () => {
@@ -189,26 +246,23 @@ describe('one-click film atomic workflow execution', () => {
     configureAgentModels(result.nodeIds)
     useRFStore.setState((state) => ({
       edges: state.edges.map((edge) => {
-        if (!edge.target.endsWith(':clip-fan-out')) return edge
-        if (edge.source.endsWith(':beat-sheet-format')) {
-          return { ...edge, targetHandle: 'in-workflow:asset-items' }
-        }
+        if (!edge.target.endsWith(':clip-production-pipeline')) return edge
+        if (edge.targetHandle?.endsWith('clip-sequences')) return { ...edge, targetHandle: 'in-workflow:undeclared-port' }
         return edge
       }),
     }))
 
     expect(() => compileVideoWorkflow(`${result.workflowInstanceId}:manual-trigger`)).toThrow(
-      '节点“逐 Clip 展开”不存在输入端口 asset-items',
+      '不存在输入端口 undeclared-port',
     )
   })
 
   it('rejects a partially configured paid media request instead of silently filling parameters', () => {
-    useRFStore.setState({ nodes: [sourceGroup], edges: [], nextGroupId: 1 })
     const result = createVideoWorkflowCanvasTemplate()
-    const estimateNodeId = result.nodeIds.find((id) => id.endsWith(':cost-estimate'))
-    if (!estimateNodeId) throw new Error('test template did not create cost-estimate')
-    useRFStore.getState().updateNodeData(estimateNodeId, {
-      workflowVideoModelKey: 'video-model-request-key',
+    configureAgentModels(result.nodeIds)
+    updateInlineStep(result.workflowInstanceId, 'cost-estimate', (data) => {
+      delete data.workflowVideoResolution
+      return { ...data, workflowVideoModelKey: 'video-model-request-key' }
     })
 
     expect(() => compileVideoWorkflow(`${result.workflowInstanceId}:manual-trigger`)).toThrow(
@@ -216,16 +270,17 @@ describe('one-click film atomic workflow execution', () => {
     )
   })
 
-  it('rejects an invalid Clip ceiling before any workflow execution is requested', () => {
+  it('requires an explicit configuration for inline image generation before dispatch', () => {
     const result = createVideoWorkflowCanvasTemplate()
     configureAgentModels(result.nodeIds)
-    useRFStore.getState().updateNodeData(`${result.workflowInstanceId}:beat-sheet-format`, {
-      workflowBeatSheetTakeCount: 0,
+    updateInlineStep(result.workflowInstanceId, 'clip-asset-image-generate', (data) => {
+      delete data.workflowImageModelKey
+      delete data.workflowImageAspectRatio
+      delete data.workflowImageSize
+      return data
     })
 
-    expect(() => compileVideoWorkflow(`${result.workflowInstanceId}:manual-trigger`)).toThrow(
-      'Clip 上限节点 beat-sheet-format 必须配置 1–1000 的正整数',
-    )
+    expect(() => runVideoWorkflow(`${result.workflowInstanceId}:manual-trigger`)).toThrow(/clip-asset-image-generate.*模型与规格配置/)
     expect(workflowExecutionMocks.requestWorkflowExecution).not.toHaveBeenCalled()
   })
 
@@ -274,11 +329,16 @@ describe('one-click film atomic workflow execution', () => {
     const compiled = compileVideoWorkflow(`${result.workflowInstanceId}:manual-trigger`)
 
     expect(compiled.executionScope).toBe('media_delivery')
-    expect(compiled.nodes.some((node) => node.workflowNodeId === 'asset-image-generate')).toBe(true)
-    expect(compiled.nodes.some((node) => node.workflowNodeId === 'video-submit')).toBe(true)
+    expect(compiled.nodes.some((node) => node.workflowNodeId === 'clip-media-pipeline')).toBe(true)
+    expect(inlineStepData(result.workflowInstanceId, 'clip-media-pipeline', 'clip-asset-image-generate')).toMatchObject({
+      workflowAtomicSpec: { operation: 'image_generate' },
+    })
+    expect(inlineStepData(result.workflowInstanceId, 'clip-media-pipeline', 'video-submit')).toMatchObject({
+      workflowAtomicSpec: { operation: 'video_submission' },
+    })
   })
 
-  it('builds a prompt-only canvas whose ordinary run action cannot include media nodes', () => {
+  it('builds a prompt-only canvas with design images but no video submission', () => {
     useRFStore.setState({ nodes: [sourceGroup], edges: [], nextGroupId: 1 })
     const result = createVideoWorkflowCanvasTemplate({ executionScope: 'prompt_only' })
     configureAgentModels(result.nodeIds)
@@ -289,13 +349,22 @@ describe('one-click film atomic workflow execution', () => {
     expect(compiled.nodes.map((node) => node.workflowNodeId)).toEqual([
       'canvas-source',
       'delivery-contract',
+      'chapter-assets-agent',
+      'source-units-agent',
+      'background-fan-out',
       'beat-sheet-agent',
+      'background-image-generate',
+      'clip-design-fan-out',
+      'clip-design-agent',
+      'beat-sheet-assemble',
       'beat-sheet-format',
+      'blocking-diagrams',
       'clip-fan-out',
       'clip-writer-agent',
       'prompt-package',
     ])
-    expect(compiled.edges).toHaveLength(10)
+    expect(compiled.nodes.find((node) => node.workflowNodeId === 'delivery-contract')?.inputPorts).toEqual(['canvas-facts'])
+    expect(compiled.edges).toHaveLength(VIDEO_PROMPT_ONLY_WORKFLOW_EDGES.length)
     expect(compiled.nodes.some((node) => node.workflowNodeId === 'asset-coverage')).toBe(false)
     expect(compiled.nodes.some((node) => node.workflowNodeId === 'video-submit')).toBe(false)
     expect(compiled.nodes.find((node) => node.workflowNodeId === 'clip-fan-out')?.inputPorts).toEqual(['delivery-contract', 'beat-sheet'])
@@ -309,15 +378,15 @@ describe('one-click film atomic workflow execution', () => {
   })
 
   it('fails before creating an execution when an Agent node has no explicit model', () => {
-    useRFStore.setState({ nodes: [sourceGroup], edges: [], nextGroupId: 1 })
     const result = createVideoWorkflowCanvasTemplate()
     configureAgentModels(result.nodeIds)
-		const agentNodeId = result.nodeIds.find((id) => id.endsWith(':clip-writer-agent'))
-		if (!agentNodeId) throw new Error('test template did not create clip-writer-agent')
-    useRFStore.getState().updateNodeData(agentNodeId, { workflowAgentModelKey: undefined })
+    updateInlineStep(result.workflowInstanceId, 'clip-production-agent', (data) => {
+      delete data.workflowAgentModelKey
+      return data
+    })
 
     expect(() => runVideoWorkflow(`${result.workflowInstanceId}:manual-trigger`)).toThrow(
-			'Agent 节点“clip-writer-agent”还没有从实时目录选择文本模型',
+			'Agent 节点“clip-production-agent”还没有从实时目录选择文本模型',
     )
   })
 })

@@ -1,3 +1,5 @@
+import { cancelCanceledWorkflowAgentContinuations } from "../task/async-agent-continuation";
+import { refreshEquippedWorkflowExecutionFamilyProjection } from "../task/equipped-workflow-execution-projection";
 import type { AppContext } from "../../types";
 import {
 	cancelWorkflowAgentTurns,
@@ -12,17 +14,11 @@ import {
 	mapExecutionRow,
 } from "./execution.repo";
 
-type WorkflowCancellationActor =
-	| Readonly<{
-		reasonCode: "user_requested";
-		actorType: "owner_admin" | "owner_eval" | "owning_chat_turn";
-		actorId: string;
-	}>
-	| Readonly<{
-		reasonCode: "video_production_start_deadline_exceeded";
-		actorType: "deadline_enforcer";
-		actorId: string;
-	}>;
+type WorkflowCancellationActor = Readonly<{
+	reasonCode: "user_requested";
+	actorType: "owner_admin" | "owner_eval" | "owning_chat_turn";
+	actorId: string;
+}>;
 
 export type WorkflowExecutionCancellationResult = Readonly<{
 	execution: ReturnType<typeof mapExecutionRow>;
@@ -93,12 +89,32 @@ async function cancelExactWorkflowExecutionForOwner(
 		context: input.context,
 		userId: input.userId,
 		targets: agentTurnTargets,
-		...(input.actor.reasonCode === "video_production_start_deadline_exceeded"
-			? { interruptReasonCode: "video_production_start_deadline_exceeded" as const }
-			: {}),
 	});
 	const refreshed = await getExecutionForOwner(input.context.env.DB, input.executionId, input.userId);
 	if (!refreshed) throw new Error("Execution not found after cancellation");
+	if (refreshed.status === "canceled") {
+		await cancelCanceledWorkflowAgentContinuations({
+			c: input.context,
+			userId: input.userId,
+			executionId: input.executionId,
+		});
+		// No node settles after a cancel, so the queue's refresh never runs; without
+		// this the canvas status surface keeps showing the canceled run as running.
+		try {
+			await refreshEquippedWorkflowExecutionFamilyProjection({
+				c: input.context,
+				ownerId: input.userId,
+				executionId: input.executionId,
+			});
+		} catch (error: unknown) {
+			console.error(JSON.stringify({
+				message: "workflow_execution_family_projection_refresh_failed",
+				executionId: input.executionId,
+				phase: "cancel",
+				error: error instanceof Error ? error.message : String(error),
+			}));
+		}
+	}
 	return {
 		execution: mapExecutionRow(refreshed),
 		receipt,
@@ -179,6 +195,17 @@ export async function listActiveWorkflowExecutionIdsForChatTurn(input: Readonly<
 			&& acceptedAgentExecutionIds.has(row.agent_execution_id.trim());
 		return exactTurnMatch || legacyExecutionMatch ? [row.workflow_execution_id] : [];
 	});
+}
+
+/** A queued or running workflow is a durable owner of its public chat turn. */
+export async function hasActiveWorkflowExecutionForChatTurn(input: Readonly<{
+	context: AppContext;
+	userId: string;
+	sessionKey: string;
+	publicTurnId: string;
+	agentExecutionIds: readonly string[];
+}>): Promise<boolean> {
+	return (await listActiveWorkflowExecutionIdsForChatTurn(input)).length > 0;
 }
 
 export async function cancelWorkflowExecutionsOwnedByChatTurn(input: Readonly<{

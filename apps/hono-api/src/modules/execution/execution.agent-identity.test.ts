@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	workflowAgentPublicTurnId,
 	workflowAgentSessionKey,
+	workflowAgentTurnOrdinal,
 } from "./execution.agent-identity";
 
 describe("workflow Agent public turn identity", () => {
@@ -19,6 +20,19 @@ describe("workflow Agent public turn identity", () => {
 			nodeId: "agent-1",
 			physicalRetryOrdinal: null,
 		})).toBe("workflow:execution-1:agent-1");
+	});
+
+	it("proves the physical retry generation from the canonical public id", () => {
+		const identity = { executionId: "execution-1", nodeId: "agent-1" };
+		expect(workflowAgentTurnOrdinal({
+			...identity,
+			observedTurnId: workflowAgentPublicTurnId({ ...identity, physicalRetryOrdinal: null }),
+		})).toBe(0);
+		expect(workflowAgentTurnOrdinal({
+			...identity,
+			observedTurnId: workflowAgentPublicTurnId({ ...identity, physicalRetryOrdinal: 2 }),
+		})).toBe(2);
+		expect(workflowAgentTurnOrdinal({ ...identity, observedTurnId: "workflow:other:agent:physical-retry:2" })).toBeNull();
 	});
 
 	it("keeps long collection item identities distinct after physical retries", () => {
@@ -48,12 +62,12 @@ describe("workflow Agent public turn identity", () => {
 });
 
 describe("workflow Agent durable session identity", () => {
-	it("uses only the physical transport retry as a new durable session", () => {
+	it("preserves the durable session across physical transport retries", () => {
 		expect(workflowAgentSessionKey({
 			executionId: "execution-1",
 			nodeId: "agent-1",
 			physicalRetryOrdinal: 2,
-		})).toBe("workflow:execution-1:agent-1:physical-retry:2");
+		})).toBe("workflow:execution-1:agent-1");
 	});
 
 	it("bounds long collection retry sessions without collapsing item identity", () => {
@@ -72,8 +86,8 @@ describe("workflow Agent durable session identity", () => {
 		expect(clip07).toHaveLength(240);
 		expect(clip08).toHaveLength(240);
 		expect(clip07).not.toBe(clip08);
-		expect(clip07).toMatch(/:[a-f0-9]{32}:physical-retry:3$/u);
-		expect(clip08).toMatch(/:[a-f0-9]{32}:physical-retry:3$/u);
+		expect(clip07).toMatch(/:[a-f0-9]{32}$/u);
+		expect(clip08).toMatch(/:[a-f0-9]{32}$/u);
 		expect(workflowAgentSessionKey({
 			executionId: `execution-${"b".repeat(64)}`,
 			nodeId: `${sharedNodePrefix}clip-07`,

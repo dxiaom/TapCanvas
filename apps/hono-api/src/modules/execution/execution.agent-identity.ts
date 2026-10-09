@@ -46,29 +46,67 @@ export function workflowAgentPublicTurnId(input: Readonly<{
 /**
  * Produces the bounded durable-session identity used by agents-cli.
  *
- * Collection item node ids can already approach the shared 240-character
- * observability boundary before a physical-recovery suffix is appended. Keep
- * the complete recovery identity visible, and bind the omitted
- * portion of an overlong base through the same deterministic digest strategy
- * used by public turn ids. This is an identity projection, not a fallback:
- * invalid or colliding workflow facts are never silently discarded.
+ * A physical retry changes its public turn id, never its durable session:
+ * otherwise the node loses its persisted candidate and repair checkpoint.
+ * Long collection identities remain distinct through the complete base digest.
  */
 export function workflowAgentSessionKey(input: Readonly<{
 	executionId: string;
 	nodeId: string;
 }> & WorkflowAgentTurnRetryIdentity): string {
 	const base = `workflow:${input.executionId}:${input.nodeId}`;
-	const suffix = retrySuffix(input);
-	const complete = `${base}${suffix}`;
-	if (complete.length <= WORKFLOW_AGENT_SESSION_KEY_MAX_LENGTH) return complete;
+	if (base.length <= WORKFLOW_AGENT_SESSION_KEY_MAX_LENGTH) return base;
 
 	const digest = sha256Hex(base).slice(0, WORKFLOW_AGENT_TURN_ID_DIGEST_LENGTH);
 	const digestMarker = `:${digest}`;
 	const prefixLength = WORKFLOW_AGENT_SESSION_KEY_MAX_LENGTH
-		- digestMarker.length
-		- suffix.length;
-	if (prefixLength <= 0) {
-		throw new Error("Workflow Agent physical-recovery suffix exceeds the durable session identity boundary");
-	}
-	return `${base.slice(0, prefixLength)}${digestMarker}${suffix}`;
+		- digestMarker.length;
+	return `${base.slice(0, prefixLength)}${digestMarker}`;
+}
+
+/** Match an earlier physical generation by the same exact identity derivation. */
+export function previousWorkflowAgentTurnOrdinal(input: Readonly<{
+  executionId: string;
+  nodeId: string;
+  currentOrdinal: number;
+  observedTurnId: string;
+}>): number | null {
+  for (let ordinal = 0; ordinal < input.currentOrdinal; ordinal += 1) {
+    if (workflowAgentPublicTurnId({ ...input, physicalRetryOrdinal: ordinal || null }) === input.observedTurnId) return ordinal;
+  }
+  return null;
+}
+
+/**
+ * Resolve the physical retry generation encoded in a public turn id.
+ *
+ * This is deliberately derived by round-tripping the canonical identity
+ * builder rather than accepting a loose suffix. A status response can expose
+ * the latest owner of a durable session while an older reconciler is still
+ * polling its predecessor; callers need a structural proof that the observed
+ * id belongs to this exact workflow node before treating it as a newer owner.
+ */
+export function workflowAgentTurnOrdinal(input: Readonly<{
+  executionId: string;
+  nodeId: string;
+  observedTurnId: string;
+}>): number | null {
+  const base = workflowAgentPublicTurnId({
+    executionId: input.executionId,
+    nodeId: input.nodeId,
+    physicalRetryOrdinal: null,
+  });
+  if (input.observedTurnId === base) return 0;
+  const marker = ":physical-retry:";
+  const markerIndex = input.observedTurnId.lastIndexOf(marker);
+  if (markerIndex < 0) return null;
+  const suffix = input.observedTurnId.slice(markerIndex + marker.length);
+  if (!/^\d+$/.test(suffix)) return null;
+  const ordinal = Number(suffix);
+  if (!Number.isSafeInteger(ordinal) || ordinal < 1) return null;
+  return workflowAgentPublicTurnId({
+    executionId: input.executionId,
+    nodeId: input.nodeId,
+    physicalRetryOrdinal: ordinal,
+  }) === input.observedTurnId ? ordinal : null;
 }

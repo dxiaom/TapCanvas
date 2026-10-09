@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../../middleware/error";
 
 import {
+	buildAutoSessionKey,
+	resolvePublicChatInterruptReasonCode,
 	buildBroadcastChatMessages,
 	buildStablePublicChatTurnId,
 	buildAsyncContinuationDeliveryReportLock,
@@ -143,12 +145,21 @@ describe("terminal continuation settlement public projection", () => {
 				turnId: "turn-1",
 				internalTurnId: "turn-1",
 				state: "suspended",
+				logicalTaskState: {
+					version: 1, logicalTaskId: "turn-1", status: "active",
+					reasonCode: "root_physical_execution_budget_exhausted",
+					physicalRunStatus: "interrupted", deliveryStatus: "pending",
+					taskNodeId: "root", taskRevision: 0,
+					updatedAt: "2026-08-20T00:00:01.000Z", continuationTicket: null,
+				},
 				phase: "suspended",
 				startedAt: "2026-08-20T00:00:00.000Z",
 				updatedAt: "2026-08-20T00:00:01.000Z",
 				lastConfirmedAt: "2026-08-20T00:00:01.000Z",
 				requestText: "生成视频",
 				terminalAuthority: "user_delivery",
+				userIntentContract: null,
+				terminalDelivery: null,
 				reasonCode: "root_physical_execution_budget_exhausted",
 				suspension: {
 					reasonCode: "root_physical_execution_budget_exhausted",
@@ -1692,6 +1703,13 @@ describe("async continuation delivery lock", () => {
 });
 
 describe("public agents chat model propagation", () => {
+	it("preserves the frozen artifact identity for request-scoped Skill resources", () => {
+		expect(buildTaskRequest({ prompt: "author", modelKey: "chosen-model", outputArtifactType: "tapcanvas.chapter-sequence/v4" }).extras?.outputArtifactType)
+			.toBe("tapcanvas.chapter-sequence/v4");
+	});
+	it("forwards explicit reasoning effort into the bridge request", () => {
+		expect(buildTaskRequest({ prompt: "test", modelKey: "gpt-5.6-terra", reasoningEffort: "high" }).extras?.reasoningEffort).toBe("high");
+	});
 	it("fails explicitly instead of falling back to the agents-cli configured model", () => {
 		expect(() => buildTaskRequest({ prompt: "不要替我选择模型" })).toThrowError(
 			"小T 主对话缺少当前选择的语言模型",
@@ -1872,4 +1890,17 @@ describe("public agents chat required Skill propagation", () => {
 			allowedTools: ["read_file", "read_file_range", "tapcanvas_shot_table_critic"],
 		});
 	});
+});
+
+
+describe("chat scope and interrupt boundaries", () => {
+ it("requires a flow for project chat but preserves chapter isolation", () => {
+  expect(buildAutoSessionKey("p", "f")).toBe("project:p:flow:f:lane:general:skill:default");
+  expect(buildAutoSessionKey("p", undefined, "ch")).toBe("project:p:chapter:ch:lane:general:skill:default");
+  expect(() => buildAutoSessionKey("p")).toThrow("Flow");
+ });
+ it("distinguishes physical interruption from logical cancellation", () => {
+  expect(resolvePublicChatInterruptReasonCode("physical_only")).toBe("provider_stream_interrupted");
+  expect(resolvePublicChatInterruptReasonCode("logical_task")).toBe("chat_turn_user_interrupt");
+ });
 });

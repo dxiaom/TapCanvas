@@ -45,6 +45,8 @@ import { nodeDurableInstanceCount } from "./platform/node/node-durable";
 import { resilientDraftMemorySize } from "./modules/task/video-orchestrator.resilient-draft-store";
 import { countAllCanvasSseConns } from "./modules/chapter/canvas-sse.manager";
 import { yjsRoomCount } from "./modules/realtime/yjs-realtime";
+import { syncBuiltInOneClickWorkflow } from "./modules/agents/system-one-click-workflow";
+import { syncBuiltInVideoProductionWorkflow } from "./modules/agents/system-video-production-workflow";
 
 async function bootstrap() {
 	loadLocalEnvFiles();
@@ -61,6 +63,8 @@ async function bootstrap() {
 	const env = await createNodeWorkerEnv();
 	const bootstrapAdminId = await ensureBootstrapAdmin(env.DB);
 	await syncBuiltInGreetingWorkflow(env.DB, bootstrapAdminId);
+	await syncBuiltInOneClickWorkflow(env.DB, bootstrapAdminId);
+	await syncBuiltInVideoProductionWorkflow(env.DB, bootstrapAdminId);
 	const assetHosting = assertObjectStorageStartupReady(env);
 	// Credentials are intentionally excluded from this startup diagnostic.
 	console.log("[api] asset hosting startup", assetHosting);

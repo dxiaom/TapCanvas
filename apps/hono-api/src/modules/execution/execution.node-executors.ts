@@ -1,12 +1,59 @@
+import type { AuthorReviewPolicy } from "../../../../../packages/schemas/author-review-policy/index.mjs";
+import { projectOptionalClipStagingDiagrams } from "./execution.clip-staging-optional";
+import type { HarnessAcceptedAuthorSourceV1 } from "../../../../../packages/schemas/author-source-representation/index.mjs";
+import { distinctPerformanceModes } from "../../../../../packages/schemas/performance-routing/index.mjs";
+import { projectWorkflowAuthorSource, type WorkflowAuthorSourceForwardStep } from "./execution.author-source";
+import { projectAtomicAuthorSelfCheckMetadata, type AtomicAuthorSelfCheckReceiptV1, type AtomicAuthorSelfCheckProjectionIssueV1 } from "../../../../../packages/schemas/atomic-author-selfcheck/index.cjs";
+import { createHash } from "node:crypto";
+import type { AgentRequestContextMetrics } from "../task/agent-request-context-metrics";
+import type { WorkflowVideoPreparationReceipt } from "./execution.video-node-preparation";
+import { parseClipProductionReferenceBindings, type ClipProductionReferenceBinding } from "./execution.clip-production-reference-prompt";
+import { preparedNodeDelivery, verifyDeliveryFacts } from "./execution.delivery-facts";
+import type { WorkflowPersistedInputSource } from "./execution.retrieval-input-projection";
+import { normalizeKnowledgeCandidateLimit } from "@tapcanvas/workflow-kernel-protocol";
+import { bindSourceUnitLedgerSchema } from "../../../../../packages/schemas/source-unit-ledger/index.mjs";
+import { sourceUnitLedgerFacts, parseSourceUnitLedger, canonicalizeSourceUnitLedger, bindSourceAllocationSchema } from "./execution.source-unit-ledger";
+import { IMAGE_REFERENCE_ROLES, validateAssetRecord } from "../../../../../packages/schemas/workflow-asset-registry/index.mjs";
+import { bindRegisteredAssetReferenceSchema } from "./execution.asset-reference-schema";
+import { materializedAssetUses, prepareChapterAssetCollection, bindMaterializedAssetConsumers } from "./execution.chapter-asset-preparation";
+import { bindClipDesignSchema } from "../../../../../packages/schemas/video-authoring-stages/schema.mjs";
+import { CHAPTER_ASSET_OUTLINE_ARTIFACT_TYPE, CHAPTER_ASSET_PART_ARTIFACT_TYPE, chapterAssetOutlineSchema, seedsFromOutline } from "../../../../../packages/schemas/video-authoring-stages/chapter-asset-fanout.mjs";
+import { bindChapterAssetPartAuthoringContract, collectChapterAssetParts, projectChapterAssetSeeds } from "./execution.chapter-asset-fanout";
+import { validateClipDesignReferences, assembleDesignedBeatSheet, buildClipDesignInputs, parseChapterBeatPlan, parseChapterAssetPlan, parseClipDesign } from "./execution.video-authoring-stages";
+import { mediaDeliveryCoverage, MediaDeliveryCoverageSchema, verifyMediaDeliveryCoverage } from "./execution.media-delivery-coverage";
+import { workflowActionFailure } from "./execution.action-failure";
+import { blockingBackgroundPlanCollection, blockingBackgroundCollection } from "./execution.blocking-backgrounds";
+import { readMediaDeliveryPolicy, type MediaDeliveryPolicy } from "./execution.media-delivery-policy";
+import { projectSceneReferenceMetadata } from "../../../../../packages/schemas/scene-reference-contract/index.mjs";
+import { ExternalDependencyError } from "../../platform/external-dependency-error";
+import { readWithImmediateDependencyRepair, waitForReadOnlyDependency } from "./execution.dependency-wait";
+import { executeWithImmediateOutputRepair } from "./execution.immediate-output-repair";
+import { projectWorkflowAssetReference } from "./execution.asset-reference-projection";
+import { workflowMediaRetryForItem, type AuthorizedWorkflowMediaRetry } from "./execution.media-retry";
+import { workflowMediaAdoptionAssetId } from "./execution.media-adoption";
+import { workflowProjectImageCandidateInstruction } from "./execution.project-image-candidates";
+import type { WorkflowProjectAssetMatchRequest, WorkflowProjectAssetMatchResult } from "./execution.project-asset-match";
+import { frozenReadyProjectImages, resolveWorkflowProjectImageReferences, type WorkflowReusableAssetReference, type WorkflowReusableAssetRoleFacts } from "./execution.project-image-references";
+import { readWorkflowAgentOutputRepair, retainWorkflowAgentRepairArtifacts } from "./execution.agent-output-repair";
+import { readWorkflowAcceptedAuthorRecovery } from "./execution.accepted-author-recovery";
+import { readWorkflowAgentInitialRecovery, type WorkflowAgentInitialRecoveryV1 } from "./execution.agent-initial-recovery";
+import { normalizeAuthorRevisionEvidence, type AuthorRevisionEvidenceV1 } from "../../../../../packages/schemas/author-revision-evidence/index.cjs";
+import type {
+	StructuredOutputReviewProjectionIssueV1,
+	StructuredOutputReviewV1,
+} from "../task/structured-output-review";
+import { workflowAgentSessionKey } from "./execution.agent-identity";
+import { readWorkflowUserIntent, WORKFLOW_USER_INTENT_FIELD } from "./execution.workflow-user-intent";
+import { workflowAgentMediaEvidenceTools } from "./execution.agent-evidence-tools";
 import {
 	createWorkflowCollection,
 	isWorkflowCollection,
 	WORKFLOW_AGENT_MAX_OUTPUT_TOKENS_MAX,
 	WORKFLOW_AGENT_MAX_OUTPUT_TOKENS_MIN,
-	parseWorkflowKnowledgeCandidateSetV1,
+	parseWorkflowKnowledgeCandidateSetV2,
 	hasWorkflowPluginExecutorRefPrefix,
 	type WorkflowInputBindingProvenanceV1,
-	type WorkflowKnowledgeCandidateSetV1,
+	type WorkflowKnowledgeCandidateSetV2,
 	type WorkflowKnowledgeCardV1,
 } from "@tapcanvas/workflow-kernel-protocol";
 import type { WorkflowItemLineageV1 } from "@tapcanvas/workflow-kernel-protocol";
@@ -15,8 +62,13 @@ import type {
 	WorkflowNodeOutputV1,
 	WorkflowNodeSnapshot,
 } from "./execution.node-runtime";
+import type { WorkflowAgentActivitySnapshot } from "./execution.agent-progress";
+import { resolveWorkflowNodeExecutionMode } from "./execution.node-runtime";
 import { executeWorkflowNodeByMode } from "./execution.collection-runtime";
+import { runWorkflowPipelineNode } from "./execution.pipeline-runner";
 import {
+	BEAT_SHEET_ARTIFACT_CONTRACT_NAME,
+	BEAT_SHEET_ARTIFACT_CONTRACT_VERSION,
 	parseWorkflowAgentOutputEncoding,
 	parseWorkflowAgentJsonArrayContract,
 	parseWorkflowAgentJsonObjectContract,
@@ -27,16 +79,29 @@ import {
 	applyWorkflowAgentArrayItemExactStringArrayFields,
 	resolvePlannedAssetIdsFromPort,
 	validateWorkflowAgentOutput,
+	WORKFLOW_STRUCTURED_OUTPUT_REPAIRABLE_POLICY,
 	WORKFLOW_STRUCTURED_OUTPUT_SUBMISSION_POLICY,
 	type WorkflowAgentJsonArrayContract,
 	type WorkflowAgentJsonObjectContract,
 	type WorkflowAgentOutputEncoding,
 } from "./execution.agent-output-contract";
 import {
+	validateBeatSheetSourceCoverage,
+	diagnoseBeatSheetSpeechCapacity,
+} from "./execution.beat-sheet-source-coverage";
+import { blockingPlanFields, backgroundPlanSchema, compositionSchema } from "../../../../../packages/schemas/blocking-plan-contract/schema.mjs";
+import { clipObjectStateFields } from "../../../../../packages/schemas/clip-reference-selection/index.mjs";
+import { sceneReferenceCardSchema } from "../../../../../packages/schemas/scene-reference-contract/index.mjs";
+import {
 	resolveWorkflowNodeExecutorRef,
 	workflowNodeExecutionFailure,
 	workflowNodeWaiting,
 } from "./execution.node-runtime";
+import type { WorkflowMediaProbeEvidence } from "./execution.media-probe";
+import {
+	isMediaWorkerEnabled,
+	probeMediaViaMediaWorker,
+} from "../../platform/media-worker/client";
 import {
 	workflowExternalPollAfter,
 	workflowExternalPollAt,
@@ -61,6 +126,7 @@ import {
 	parseWorkflowVideoDeliveryDurationPlan,
 	projectVideoAssetPlansFromBeatSheet,
 	compileWorkflowClipWriterFrozenEnvelope,
+	enrichVideoClipContextWithMaterializedAssets,
 	resolveVideoAssetRoleAllowlist,
 	validateWorkflowClipWriterForContext,
 	validateWorkflowAssetPlanProjectReuse,
@@ -74,39 +140,101 @@ import {
 	type WorkflowVoicePlan,
 } from "./execution.video-workflow-contract";
 import type { WorkflowSubworkflowRunRequest, WorkflowSubworkflowRunResult } from "./execution.subworkflow-runner";
+import type {
+	WorkflowBlockingDiagramRequest,
+	WorkflowBlockingDiagramResult,
+} from "./execution.blocking-diagram-runner";
+import type { WorkflowClipStagingDiagramRequest } from "./execution.clip-staging-diagram";
 import type { WorkflowPluginRuntimeRegistry } from "./execution.plugin-runtime";
 import type { AgentExecutionProvenance } from "../task/agent-execution-provenance";
+import { isAgentsChatRuntimeContractViolation } from "../task/task.agents-chat-runtime";
 import {
 	isWorkflowProjectImageReady,
 	parseWorkflowProjectContext,
 	type WorkflowProjectContext,
 } from "./execution.project-context";
-import { resolveWorkflowAgentModelKey } from "./execution.agent-model-inheritance";
+import { parseWorkflowInitiatingAgentExecution, resolveWorkflowAgentModelKey, resolveWorkflowAgentReasoningEffort } from "./execution.agent-model-inheritance";
 import type { WorkflowResolvedAsset } from "./execution.asset-resolver";
 import {
 	createWorkflowInputContractRejection,
 	WorkflowInputContractError,
 } from "./execution.input-contract";
+import {
+	characterIdentityBoardSpec,
+} from "./execution.character-identity-contract";
 import type { WorkflowFilmProjectionRequest } from "./execution.video-delivery-projection";
 import {
 	parseWorkflowAcceptedTurnSource,
 	WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD,
+	parseWorkflowActionableDeliverySource,
+	WORKFLOW_ACTIONABLE_DELIVERY_SOURCE_FIELD,
 } from "./execution.workflow-source-authority";
 import {
 	validateAcceptedLaunchBeatPrefix,
 } from "./execution.beat-sheet-prefix";
 import {
 	createWorkflowAgentRateLimitBackpressureEvidence,
+	createWorkflowAgentSessionTurnInflightEvidence,
 	isWorkflowAgentRateLimitError,
 	isWorkflowAgentRateLimitFailureCode,
+	isWorkflowAgentSessionTurnInflightError,
 	parseWorkflowAgentPhysicalFailureEvidence,
 } from "./execution.agent-backpressure";
 import { sha256Hex } from "../asset/book-content-hash";
+import { freezeWorkflowAuthoritativeSource, resolveWorkflowAuthoritativeSourceLineage } from "./execution.source-lineage";
+import {
+	bindOpeningClipAuthoringContract,
+	bindOpeningClipPrefixToSourceLedger,
+	mergeOpeningClipPrefix,
+	OPENING_CLIP_ARTIFACT_TYPE,
+	OPENING_CLIP_PROMPT_PROTOCOL,
+	projectOpeningClip,
+	spliceOpeningClipPlanPrefix,
+	verifyOpeningClipPromptSubmission,
+} from "./execution.opening-clip";
+import {
+	bindOpeningFramePlanAuthoringContract,
+	OPENING_FRAME_PLAN_ARTIFACT_TYPE,
+	openingFrameUrlFromImageOutput,
+	projectOpeningFramePlan,
+	projectOpeningFramePromptPackage,
+} from "./execution.opening-frame";
+import { bindChapterScriptAuthoringContract, compileChapterScript, projectChapterSequence } from "./execution.chapter-sequence";
+import {
+	BOUND_CHAPTER_SEQUENCE_ARTIFACT_TYPE,
+	CHAPTER_SEQUENCE_ARTIFACT_TYPE,
+	CHAPTER_SEQUENCE_CLIPS_ARTIFACT_TYPE,
+} from "../../../../../packages/schemas/chapter-sequence/index.mjs";
+import {
+	bindClipProductionPacketAuthoringContract,
+	bindFrozenClipSourceRanges,
+	materializeClipProductionDraft,
+	clipProductionAssetMetadata,
+	projectChapterAssetPreviewItems,
+	projectClipProductionAssetItems,
+	projectClipProductionPackets,
+	resolveClipProductionInputModesFromDeliveryContract,
+	verifyClipProductionPacketSourceBinding,
+	type ClipProductionAssetPlanItem,
+} from "./execution.clip-production";
+import { workflowImageEffectIdentity } from "./execution.image-runner";
+import { projectClipProductionPromptPackage } from "./execution.clip-production-project";
+import { aggregateClipProduction } from "./execution.clip-production-aggregate";
+import { projectClipProductionMediaItem, projectClipProductionNodePlan } from "./execution.clip-production-nodes";
+import type { WorkflowClipReuseHydrationRequest } from "./execution.clip-production-node-runner";
+import type { WorkflowClipNodeMaterializationRequest } from "./execution.clip-production-node-runner";
+import {
+	CLIP_PRODUCTION_ASSET_INTENTS_ARTIFACT_TYPE,
+	CLIP_PRODUCTION_PACKET_COLLECTION_ARTIFACT_TYPE,
+	CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION,
+	type ClipProductionSpeechEvent,
+} from "../../../../../packages/schemas/clip-production-packet/index.mjs";
 import { bindWorkflowNodeExecutionResultPorts } from "./execution.output-port-binding";
 import {
 	parseVideoGenerationContract,
 	type VideoGenerationContract,
 } from "../task/video-orchestrator.generation-contract";
+import { applyReasoningCeiling, resolveAuthorReasoningCeiling, resolveWorkflowAgentDefaultReasoningEffort } from "./execution.reasoning-ceiling";
 import {
 	parseWorkflowExecutionControl,
 	type WorkflowProductionStartDeadlineV2,
@@ -141,14 +269,43 @@ export type WorkflowPromptExampleCandidateSearchObservation = Readonly<{
 	toolCallId?: string;
 }>;
 
-const WORKFLOW_AGENT_KNOWLEDGE_TOOLS = [
+export type WorkflowKnowledgeCandidateSearchObservation = Readonly<{
+	version: 1;
+	status:
+		| "not_attempted"
+		| "candidate_found"
+		| "no_match"
+		| "retrieval_failed"
+		| "invalid_evidence"
+		| "tool_unavailable";
+	attempted: boolean;
+	candidateCount: number;
+	blocking: false;
+	rationale: string;
+	domains: readonly string[];
+	candidateSetId?: string;
+	toolCallId?: string;
+}>;
+
+const WORKFLOW_AGENT_BASE_TOOLS = [
 	"skill_search",
+	"skill_candidates_page",
+	"retrieval_rank",
 	"Skill",
+] as const;
+
+const WORKFLOW_AGENT_EXECUTION_TOOLS = ["tapcanvas_execution_node_runs_get"] as const;
+
+const WORKFLOW_AGENT_OPTIONAL_RETRIEVAL_TOOLS = [
 	"knowledge_search",
+	"knowledge_candidates_page",
 	"knowledge_read",
 ] as const;
 
+const WORKFLOW_AGENT_PROMPT_EXAMPLE_TOOLS = ["prompt_example_search", "prompt_example_read"] as const;
+
 export type WorkflowAgentRunRequest = Readonly<{
+	initialRecovery?: WorkflowAgentInitialRecoveryV1;
 	executionId: string;
 	executionFamilyId: string;
 	nodeId: string;
@@ -164,10 +321,21 @@ export type WorkflowAgentRunRequest = Readonly<{
 	deliveryRequirement: string;
 	modelKey: string;
 	maxOutputTokens: number;
+	structuredOutputTokenBudget?: number;
+	failurePolicy?: "single_submission" | "repair_with_correction";
+	executionPolicy?: "single_inference" | "multi_inference";
+	/** Independent model review policy; does not restrict author tools or structural repairs. */
+	reviewPolicy?: AuthorReviewPolicy;
+	projectContextPromptMode?: "identity_only";
+	promptMode?: "compact_structured";
 	reasoningEffort?: WorkflowAgentReasoningEffort;
+	serviceTier?: "default" | "priority";
 	inputs: WorkflowInputPorts;
+	persistedInputSource?: WorkflowPersistedInputSource;
 	requiredSkills: readonly string[];
 	mountedKnowledgeCardIds: readonly string[];
+	/** Performance modes of the frozen window a Clip author writes; the agent preloads the methods routed to them. */
+	performanceModes?: readonly string[];
 	disabledSkills: readonly string[];
 	disabledKnowledgeCardIds: readonly string[];
 	allowedTools: readonly string[];
@@ -178,10 +346,20 @@ export type WorkflowAgentRunRequest = Readonly<{
 		model?: string;
 	}>;
 	forcedAgentRole: string | null;
+	disableRoleSkillBundle?: boolean;
 	resumeOnly: boolean;
+	/** Zero-based item position for collection fan-out prompt projection. */
+	runtimeItemIndex?: number;
 	previousEvidence: Record<string, unknown> | null;
+	/** Server-resolved successful delivery artifact from this immutable execution snapshot. */
+	authorRepair?: AuthorRevisionEvidenceV1;
 	productionStartDeadline?: WorkflowProductionStartDeadlineV2;
+	logicalTaskBudgetRootId?: string;
 	abortSignal?: AbortSignal;
+	/** Receives sanitized Agent bridge activity without changing task control flow. */
+	onAgentActivity?: (activity: WorkflowAgentActivitySnapshot) => void | Promise<void>;
+	agentActivityContext?: Readonly<Pick<WorkflowAgentActivitySnapshot,
+		"displayName" | "runtimeNodeId" | "itemId" | "itemIndex">>;
 	/**
 	 * 系统级共享工作流的交付目标（调用者项目/画布）。有值时 flowId/projectId
 	 * 已指向调用者项目，本字段仅作为注入给 agent 的可见事实（提示其工具画布
@@ -189,9 +367,14 @@ export type WorkflowAgentRunRequest = Readonly<{
 	 */
 	deliveryScope?: Readonly<{ flowId: string; projectId: string | null; chapterId?: string }> | null;
 	projectContext?: WorkflowProjectContext | null;
+	/** Parent goal for authorship, not this node's terminal output contract. */
+	userIntentContract?: Record<string, unknown>;
 }>;
 
 export type WorkflowAgentRunResult = Readonly<{
+	acceptedAuthorSource?: HarnessAcceptedAuthorSourceV1;
+	acceptedAuthorSourceIssue?: string;
+	authorSourceTransportSteps?: readonly WorkflowAuthorSourceForwardStep[];
 	taskId: string;
 	text: string;
 	assets: readonly Readonly<{
@@ -203,9 +386,26 @@ export type WorkflowAgentRunResult = Readonly<{
 	deliveryEvidence: unknown;
 	deliveryVerification: unknown;
 	requestTerminal: unknown;
+	/** Structured-output failure evidence emitted by agents-cli when a typed
+	 * candidate was seen but could not be accepted. Kept separate from `text`
+	 * because typed failures intentionally do not masquerade as user output. */
+	structuredOutputFailure?: unknown;
 	executionProvenance?: AgentExecutionProvenance;
 	executionProvenanceHistory?: AgentExecutionProvenance[];
 	promptExampleCandidateSearch?: WorkflowPromptExampleCandidateSearchObservation;
+	knowledgeCandidateSearch?: WorkflowKnowledgeCandidateSearchObservation;
+	/** Trusted candidate-set receipts retained for snapshot inspection. */
+	retrievalCandidateSets?: readonly Record<string, unknown>[];
+	/** Exact model-facing request snapshots retained for upstream-context inspection. */
+	upstreamRequestContexts?: readonly Record<string, unknown>[];
+	upstreamRequestContextMetrics?: AgentRequestContextMetrics;
+	upstreamRequestContextMetricsIssue?: "invalid_request_context_metrics";
+	/** Author observations, not a task verdict or permission to discard assets. */
+	structuredOutputReview?: StructuredOutputReviewV1;
+	/** Malformed receipt diagnostics are retained without changing node completion. */
+	structuredOutputReviewProjectionIssue?: StructuredOutputReviewProjectionIssueV1;
+	atomicAuthorSelfCheck?: AtomicAuthorSelfCheckReceiptV1;
+	atomicAuthorSelfCheckProjectionIssue?: AtomicAuthorSelfCheckProjectionIssueV1;
 }>;
 
 export type WorkflowNodeExecutorDependencies = Readonly<{
@@ -216,6 +416,16 @@ export type WorkflowNodeExecutorDependencies = Readonly<{
 		durationMs: number;
 	}>>;
 	runImage?: (request: WorkflowImageRunRequest) => Promise<WorkflowImageRunResult>;
+	materializeBlockingDiagrams?: (request: WorkflowBlockingDiagramRequest) => Promise<WorkflowBlockingDiagramResult>;
+	prepareVideo?: (request: WorkflowVideoRunRequest) => Promise<WorkflowVideoPreparationReceipt>;
+	/** Draws each Clip's frozen staging onto the canvas as a top-down diagram. */
+	materializeClipStagingDiagrams?: (request: WorkflowClipStagingDiagramRequest) => Promise<Readonly<{
+		nodeIds: readonly string[]; createdNodeIds: readonly string[];
+	}>>;
+	materializeClipProductionNodes?: (request: WorkflowClipNodeMaterializationRequest) => Promise<Readonly<{
+		imageNodeIds: readonly string[]; videoNodeIds: readonly string[]; edgeIds: readonly string[];
+	}>>;
+	hydrateClipReusedImageNode?: (request: WorkflowClipReuseHydrationRequest) => Promise<Readonly<{ nodeId: string }>>;
 	runVideo: (request: WorkflowVideoRunRequest) => Promise<WorkflowVideoRunResult>;
 	prepareVideoProductionAssets?: (request: Readonly<{
 		executionId: string;
@@ -258,6 +468,10 @@ export type WorkflowNodeExecutorDependencies = Readonly<{
 		modelKey: string;
 	}>) => Promise<Readonly<{
 		durationOptions: readonly number[];
+		maxReferenceImages?: number | null;
+		supportsTextToVideo?: boolean | null;
+		supportsReferenceImages?: boolean | null;
+		supportsFirstLastFrame?: boolean | null;
 		resolutionOptions: readonly string[];
 		aspectRatioOptions: readonly string[];
 	}>>;
@@ -280,11 +494,15 @@ export type WorkflowNodeExecutorDependencies = Readonly<{
 		groupId: string;
 		chapterId?: string | null;
 	}>) => Promise<WorkflowCanvasGroupFacts>;
-	readCanvasProjectContextFromFlow?: (request: Readonly<{
+	readCanvasProjectContextFromSnapshot?: (request: Readonly<{
+		flowVersionData: unknown;
 		flowId: string;
 		ownerId: string;
 		projectContext: WorkflowProjectContext;
 		chapterId?: string | null;
+		allowNoTextSource?: boolean;
+		acceptedTurnSource?: import("./execution.workflow-source-authority").WorkflowAcceptedTurnSource | null;
+		actionableDeliverySource?: import("./execution.workflow-source-authority").WorkflowActionableDeliverySource | null;
 	}>) => Promise<WorkflowCanvasProjectContextFacts>;
 	searchKnowledge?: (request: Readonly<{
 		ownerId: string;
@@ -294,9 +512,10 @@ export type WorkflowNodeExecutorDependencies = Readonly<{
 		domain: string | null;
 		strictFilters: boolean;
 		limit: number;
-	}>) => Promise<WorkflowKnowledgeCandidateSetV1>;
+	}>) => Promise<WorkflowKnowledgeCandidateSetV2>;
 	readKnowledge?: (request: Readonly<{
-		candidateSet: WorkflowKnowledgeCandidateSetV1;
+		ownerId: string;
+		candidateSet: WorkflowKnowledgeCandidateSetV2;
 		cardId: string;
 	}>) => Promise<WorkflowKnowledgeCardV1>;
 	invokeTool?: (request: Readonly<{
@@ -321,7 +540,10 @@ export type WorkflowNodeExecutorDependencies = Readonly<{
 		assetId: string;
 		preferredKind: "image" | "video" | "audio";
 		projectContext: WorkflowProjectContext;
+		matchedAssetVersionId?: string;
+		matchedAssetContentFingerprint?: string;
 	}>) => Promise<WorkflowResolvedAsset>;
+	matchProjectAsset?: (request: WorkflowProjectAssetMatchRequest) => Promise<WorkflowProjectAssetMatchResult>;
 }>;
 
 export type WorkflowImageReferenceAssetBinding = Readonly<{
@@ -331,6 +553,10 @@ export type WorkflowImageReferenceAssetBinding = Readonly<{
 }>;
 
 export type WorkflowImageRunRequest = Readonly<{
+	mediaDeliveryPolicy?: MediaDeliveryPolicy | null;
+	assetIdentity?: Readonly<{ assetId: string; generationSpecVersion: string }>;
+	authorizedRetry?: AuthorizedWorkflowMediaRetry;
+	executionMode: "once" | "each";
 	executionId: string;
 	executionFamilyId: string;
 	ownerId: string;
@@ -344,7 +570,11 @@ export type WorkflowImageRunRequest = Readonly<{
 	modelKey: string;
 	aspectRatio: string;
 	imageSize: string;
+	imageQuality?: string;
 	referenceAssetBindings: readonly WorkflowImageReferenceAssetBinding[];
+	styleReferenceImages?: readonly string[];
+	stylePrompt?: string | null;
+	styleFingerprint?: string | null;
 	assetMetadata?: Readonly<Record<string, unknown>> | null;
 	previousEvidence: Record<string, unknown> | null;
 	resumeOnly: boolean;
@@ -352,10 +582,13 @@ export type WorkflowImageRunRequest = Readonly<{
 
 export type WorkflowImageRunResult =
 	| Readonly<{ status: "success"; nodeId: string; taskId: string | null; imageUrl: string; assetId: string | null; reused: boolean }>
-	| Readonly<{ status: "waiting_external"; nodeId: string; taskId: string; reused: boolean }>
+	| Readonly<{ status: "waiting_external"; nodeId: string; taskId: string | null; observationFailure?: { observedAt: string; message: string }; reused: boolean }>
 	| Readonly<{ status: "failed"; nodeId: string; taskId: string | null; errorMessage: string }>;
 
 export type WorkflowVideoRunRequest = Readonly<{
+	mediaDeliveryPolicy?: MediaDeliveryPolicy | null;
+	authorizedRetry?: AuthorizedWorkflowMediaRetry;
+	executionMode: "once" | "each";
 	executionId: string;
 	executionFamilyId: string;
 	ownerId: string;
@@ -365,13 +598,26 @@ export type WorkflowVideoRunRequest = Readonly<{
 	runtimeNodeId: string;
 	itemIndex: number;
 	prompt: string;
+	promptSourceProtocol?: "tapcanvas.clip-production-packets/v2";
+	workflowSourcePrompt?: string;
+	workflowSpeechEvents?: readonly ClipProductionSpeechEvent[];
+	workflowReferenceHeader?: string;
+	workflowReferenceBindings?: readonly ClipProductionReferenceBinding[];
+	sourceSnapshot?: Readonly<Record<string, unknown>>;
+	clipId?: string;
+	videoInputMode?: "image_to_video" | "reference_to_video" | "text_to_video";
+	firstFrameUrl?: string;
 	structuredClip: Readonly<Record<string, unknown>> | null;
 	modelKey: string;
 	durationSeconds: number;
 	resolution: string;
+	size?: string;
 	aspectRatio: string;
 	referenceImageNodeIds: readonly string[];
 	referenceAssetIds: readonly string[];
+	styleReferenceImages?: readonly string[];
+	stylePrompt?: string | null;
+	styleFingerprint?: string | null;
 	estimateIdentity: string | null;
 	generationContract?: VideoGenerationContract | null;
 	previousEvidence: Record<string, unknown> | null;
@@ -379,12 +625,23 @@ export type WorkflowVideoRunRequest = Readonly<{
 }>;
 
 export type WorkflowVideoRunResult =
-	| Readonly<{ status: "success"; nodeId: string; taskId: string | null; videoUrl: string; thumbnailUrl: string | null; reused: boolean }>
-	| Readonly<{ status: "waiting_external"; nodeId: string; taskId: string; reused: boolean }>
+	| Readonly<{
+		status: "success";
+		nodeId: string;
+		taskId: string | null;
+		providerAcceptedAt?: string;
+		videoUrl: string;
+		thumbnailUrl: string | null;
+		reused: boolean;
+		mediaProbeEvidence?: WorkflowMediaProbeEvidence;
+	}>
+	| Readonly<{ status: "waiting_external"; nodeId: string; taskId: string | null; observationFailure?: { observedAt: string; message: string }; providerAcceptedAt?: string; reused: boolean }>
 	| Readonly<{
 		status: "failed";
 		nodeId: string;
 		taskId: string | null;
+		providerAcceptedAt?: string;
+		workflowSubmissionState?: "rejected_pre_upstream" | "rejected_by_provider" | "uncertain";
 		errorMessage: string;
 		errorCode?: string | null;
 		providerRejectedReferenceIds?: readonly string[];
@@ -397,14 +654,18 @@ export type WorkflowVideoEstimateRequest = Readonly<{
 	projectId: string | null;
 	modelKey: string;
 	resolution: string;
+	size?: string;
 	aspectRatio: string;
-	clips: readonly Readonly<{ itemId: string; durationSeconds: number }>[];
+	/** Structural count of image references declared by the prompt package. */
+	referenceImageCount?: number;
+	clips: readonly Readonly<{ itemId: string; durationSeconds: number; videoInputMode?: "image_to_video" | "reference_to_video" | "text_to_video"; referenceImageCount?: number }>[];
 }>;
 
 export type WorkflowVideoEstimateResult = Readonly<{
 	estimateIdentity: string;
 	modelKey: string;
 	resolution: string;
+	size?: string;
 	aspectRatio: string;
 	generationContract?: VideoGenerationContract;
 	estimatedCredits: number;
@@ -430,6 +691,7 @@ export type WorkflowVideoConcatResult = Readonly<{
 	assetId: string;
 	clipCount: number;
 	reusedSingleClip: boolean;
+	mediaProbeEvidence?: WorkflowMediaProbeEvidence;
 	concatPolicy?: Readonly<{
 		joinMode: "hard_cut" | "xfade";
 		xfadeSeconds: number;
@@ -447,15 +709,20 @@ export type WorkflowNodeExecutionContext = Readonly<{
 	workflowKey: string | null;
 	node: WorkflowNodeSnapshot;
 	inputs: WorkflowInputPorts;
+	persistedInputSource?: WorkflowPersistedInputSource;
 	flowVersionData?: unknown;
 	/** Frozen per-execution project context; authoritative for selected assets. */
 	projectContext?: WorkflowProjectContext | null;
 	flowVersionId?: string;
 	runtimeItemIndex?: number;
+	runtimeItemLineage?: readonly WorkflowItemLineageV1[];
+	/** Authored node ancestry for nested inline workflow stages; never parsed from runtime IDs. */
+	runtimeParentNodeIds?: readonly string[];
 	resumeOutputRefs?: WorkflowNodeOutputV1;
 	resumeOnly?: boolean;
 	inputProvenance?: readonly WorkflowInputBindingProvenanceV1[];
 	checkpointOutputRefs?: (outputRefs: WorkflowNodeOutputV1) => Promise<void>;
+	reportAgentActivity?: (activity: WorkflowAgentActivitySnapshot) => void | Promise<void>;
 	abortSignal?: AbortSignal;
 }>;
 
@@ -464,8 +731,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const WORKFLOW_PROVIDER_STATUS_POLL_MS = 5_000;
+const WORKFLOW_MEDIA_READINESS_MAX_POLLS = 120;
+/*
+ * readiness 关卡一次要探测的是一整批片段，而每次探测都会占用 media-worker 的一个
+ * ffmpeg 作业位（MEDIA_WORKER_MAX_FFMPEG）。整批并发会把作业位全部吃满：同一轮里
+ * 没有任何探测能提前完成，随后真正的 concat 也要排队等这些作业位。批次按作业位的
+ * 一半推进，让一轮探测始终留出并发余量。
+ */
+const WORKFLOW_MEDIA_PROBE_CONCURRENCY = 2;
 const WORKFLOW_AGENT_STATUS_POLL_MS = 5_000;
 const WORKFLOW_AGENT_BALANCE_POLL_MS = 60_000;
+/** BeatSheet 前 N 个 clip 的确定性生产选择器；同时是 BeatSheet 作者的物理片段预算来源。 */
+export const BEAT_SHEET_TAKE_EXECUTOR_REF = "video.beat-sheet.take/v1";
+
+async function probeWorkflowVideoUrls(
+	urls: readonly string[],
+): Promise<Array<Awaited<ReturnType<typeof probeMediaViaMediaWorker>>>> {
+	const results = new Array<Awaited<ReturnType<typeof probeMediaViaMediaWorker>>>(urls.length);
+	let cursor = 0;
+	const workers = Array.from(
+		{ length: Math.min(WORKFLOW_MEDIA_PROBE_CONCURRENCY, urls.length) },
+		async () => {
+			while (cursor < urls.length) {
+				const index = cursor;
+				cursor += 1;
+				results[index] = await probeMediaViaMediaWorker({ url: urls[index]! });
+			}
+		},
+	);
+	await Promise.all(workers);
+	return results;
+}
 
 function workflowAgentExternalCheckSchedule(input: Readonly<{
 	deliveryEvidence: unknown;
@@ -498,7 +794,8 @@ function runtimeProductionStartDeadline(
 	const flowData = isRecord(context.flowVersionData) ? context.flowVersionData : null;
 	const control = parseWorkflowExecutionControl(flowData?.workflowExecutionControl);
 	if (!control) return null;
-	return control.productionStartDeadline.controlledNodeIds.includes(context.node.id)
+	return [context.node.id, ...(context.runtimeParentNodeIds ?? [])]
+		.some(nodeId => control.productionStartDeadline.controlledNodeIds.includes(nodeId))
 		? control.productionStartDeadline
 		: null;
 }
@@ -512,13 +809,97 @@ function firstInput(inputs: WorkflowInputPorts, port: string): unknown {
 	return inputs[port]?.[0];
 }
 
+function workflowMediaExecutionMode(context: WorkflowNodeExecutionContext): "once" | "each" {
+	const executionMode = resolveWorkflowNodeExecutionMode(context.node);
+	if (executionMode !== "once" && executionMode !== "each") {
+		throw new Error(`Workflow media node ${context.node.id} requires once or each executionMode`);
+	}
+	return executionMode;
+}
+
+/** Collect only explicit upstream provenance handles; no semantic routing occurs. */
+/** The performance modes the chapter author tagged on the story events of one Clip window (the clip-sequence port, not the source segment), in order of appearance. */
+function windowPerformanceModes(clipSegment: unknown): string[] {
+	const events = isRecord(clipSegment) && Array.isArray(clipSegment.storyEvents) ? clipSegment.storyEvents : [];
+	return distinctPerformanceModes(events.map((event) => (isRecord(event) ? event.performance : undefined)));
+}
+
+function mountedKnowledgeCardsFromInputs(inputs: WorkflowInputPorts): string[] {
+	const ids = new Set<string>();
+	const visit = (value: unknown, depth: number): void => {
+		if (depth > 8 || !value) return;
+		if (Array.isArray(value)) {
+			value.forEach((item) => visit(item, depth + 1));
+			return;
+		}
+		if (!isRecord(value)) return;
+		const provenanceValues: unknown[] = [];
+		if (isRecord(value.executionProvenance)) provenanceValues.push(value.executionProvenance);
+		const packet = isRecord(value.authoringEvidencePacket) ? value.authoringEvidencePacket : null;
+		if (packet && isRecord(packet.dependencyProvenance)) provenanceValues.push(packet.dependencyProvenance);
+		if (packet && Array.isArray(packet.dependencyProvenanceHistory)) {
+			provenanceValues.push(...packet.dependencyProvenanceHistory);
+		}
+		for (const provenanceValue of provenanceValues) {
+			if (!isRecord(provenanceValue) || !Array.isArray(provenanceValue.loadedKnowledgeSources)) continue;
+			for (const source of provenanceValue.loadedKnowledgeSources) {
+				if (!isRecord(source)) continue;
+				const cardId = typeof source.cardId === "string" ? source.cardId.trim() : "";
+				if (cardId) ids.add(cardId);
+			}
+		}
+		for (const nested of Object.values(value)) visit(nested, depth + 1);
+	};
+	visit(inputs, 0);
+	return [...ids];
+}
+
+function workflowSnapshotFact(
+	context: WorkflowNodeExecutionContext,
+	callConfig: Record<string, unknown> | null,
+	field: string,
+): unknown {
+	const directValue = callConfig?.[field];
+	if (directValue !== undefined) {
+		return directValue;
+	}
+	// The trigger payload is frozen into the immutable execution snapshot.  A
+	// recovery or queue projection may omit the trigger output from the local
+	// input map, so read the same server-owned field from that snapshot rather
+	// than treating a missing edge projection as a missing user request.
+	const seen = new Set<object>();
+	const findValue = (value: unknown): unknown => {
+		if ((!isRecord(value) && !Array.isArray(value)) || seen.has(value)) return undefined;
+		seen.add(value);
+		if (isRecord(value) && field in value) return value[field];
+		for (const child of Object.values(value)) {
+			const found = findValue(child);
+			if (found !== undefined) return found;
+		}
+		return undefined;
+	};
+	const snapshotValue = findValue(context.flowVersionData);
+	if (snapshotValue !== undefined) return snapshotValue;
+	return null;
+}
+
+function workflowAcceptedTurnSourceInput(context: WorkflowNodeExecutionContext, callConfig: Record<string, unknown> | null): ReturnType<typeof parseWorkflowAcceptedTurnSource> {
+	return parseWorkflowAcceptedTurnSource(workflowSnapshotFact(context, callConfig, WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD), context.ownerId);
+}
+
+function workflowActionableDeliverySourceInput(context: WorkflowNodeExecutionContext, callConfig: Record<string, unknown> | null): ReturnType<typeof parseWorkflowActionableDeliverySource> {
+	return parseWorkflowActionableDeliverySource(workflowSnapshotFact(context, callConfig, WORKFLOW_ACTIONABLE_DELIVERY_SOURCE_FIELD), context.ownerId);
+}
+
 function runtimeAuthoritativeSourceInstruction(
 	inputs: WorkflowInputPorts,
 	outputArtifactType: string,
 ): string {
 	if (
 		outputArtifactType !== "tapcanvas.beat-sheet/v2" &&
-		outputArtifactType !== "tapcanvas.launch-beat-sheet/v1"
+		outputArtifactType !== "tapcanvas.launch-beat-sheet/v1" &&
+		outputArtifactType !== OPENING_CLIP_ARTIFACT_TYPE &&
+		outputArtifactType !== OPENING_FRAME_PLAN_ARTIFACT_TYPE
 	) return "";
 	for (const values of Object.values(inputs)) {
 		for (const value of values) {
@@ -530,6 +911,7 @@ function runtimeAuthoritativeSourceInstruction(
 			if (sources.length === 0) continue;
 			const sourceFacts = sources.map((source) => ({
 				sourceId: readString(source, "sourceId") || readString(source, "nodeId"),
+				kind: source.kind,
 				sourceFingerprint: readString(source, "sourceFingerprint")
 					|| sha256Hex(readString(source, "content")),
 				sourceRevision: source.sourceRevision,
@@ -537,7 +919,11 @@ function runtimeAuthoritativeSourceInstruction(
 			if (sourceFacts.some((source) => !source.sourceId)) continue;
 			return [
 				"运行时权威来源重申（确定性事实，优先级高于本提示中的任何示例、历史内容或模型记忆）：",
-				"上游端口事实中的 authoritativeSources.content 必须逐字作为本节点唯一故事来源。此处只重申其冻结身份，避免在同一模型请求中重复发送整章正文；不得用 canvasFacts.nodes 是否为空否定真源，也不得用任何旧会话、Skill 示例、历史资产计划或常识替代它。不得改名、换人、换武器、换场景、换世界观。输出根对象必须逐字回显运行时冻结的 sourceId 与 sourceFingerprint；输出前必须逐字反查 sourceFidelityAudit 与 beats 的人物、职业、道具、空间、对白、因果和结尾状态：",
+				outputArtifactType === OPENING_CLIP_ARTIFACT_TYPE
+					? "authoritativeSources.content 是真实来源正文，不能因其他画布事实缺失而忽略。只输出来源索引与绝对 UTF-16 偏移；宿主会从冻结来源绑定 ID、指纹和精确原文，禁止自行复制来源标识或伪造来源内容。"
+				: outputArtifactType === OPENING_FRAME_PLAN_ARTIFACT_TYPE
+					? "authoritativeSources.content 是开场静态首帧的故事依据；从原文开篇可见瞬间设计单帧构图。不要输出视频运镜或跨时间动作序列；参考资产只从 projectAssetCandidates 精确选择。"
+					: "authoritativeSources.content 保留其来源身份；不能因 canvasFacts.nodes 为空否定该来源。以下只投影 sourceId、sourceFingerprint、kind 与 revision，不重复正文，也不把创作请求自动认定为已有叙事。输出根对象必须逐字回显冻结的 sourceId 与 sourceFingerprint。用户要求、既有内容与可创作部分由 Agent 依据完整父意图、来源事实及 Skill 判断。",
 				JSON.stringify(sourceFacts),
 			].join("\n");
 		}
@@ -555,24 +941,7 @@ function resolveAuthoritativeSourceLineage(
 				? value.canvasFacts.authoritativeSources.filter(isRecord)
 				: [];
 			if (sources.length === 0) continue;
-			const normalized = sources.map((source, index) => {
-				const sourceId = readString(source, "sourceId") || readString(source, "nodeId");
-				const content = readString(source, "content");
-				if (!sourceId || !content) {
-					throw new Error(`authoritativeSources[${index}] requires sourceId and content`);
-				}
-				const sourceFingerprint = readString(source, "sourceFingerprint") || sha256Hex(content);
-				if (sourceFingerprint !== sha256Hex(content)) {
-					throw new Error(`authoritativeSources[${index}] sourceFingerprint does not match content`);
-				}
-				return { sourceId, sourceFingerprint };
-			});
-			if (normalized.length === 1) return normalized[0];
-			const sourceSetHash = sha256Hex(JSON.stringify(normalized));
-			return {
-				sourceId: `source-set:sha256:${sourceSetHash}`,
-				sourceFingerprint: sourceSetHash,
-			};
+			return resolveWorkflowAuthoritativeSourceLineage(sources);
 		}
 	}
 	throw new Error("BeatSheet Agent requires non-empty authoritativeSources lineage");
@@ -588,6 +957,197 @@ function runtimeBeatSheetInstruction(inputs: WorkflowInputPorts): string {
 		"资产规划必须读取并服从该结构化事实投影中的 castManifest、meta.sourceAssets、beats.characters、beats.continuity、beats.setting 与 beats.assetObjectContracts。不得把角色姓名、职业、武器、场景或参考资产改写成同音字、旧版本或模型常识；已有 referenceAssetIds/meta.sourceAssets 必须优先复用。",
 		"若本次 ProjectContext 带有 selectedAssetIds，它们是用户在本次执行边界明确指定的真实参考资产。必须依据 selectedAssetSnapshot 的结构化来源事实把每一个 selectedAssetId 绑定到对应 assetObjectContracts，并在该对象每次出现的合同上逐字写入 referenceAssetIds=[对应 selectedAssetId]；不得遗漏任何已选资产，不得引用清单外资产，也不得因为展示名、内部 role 名或 physicalIdentityKey 不同而另建替代图片。职责判断属于 Agent 的语义责任；无法确定时必须在同一创作链内继续核对 selectedAssetSnapshot，不能把 selectedAssetId 留空后放行资产生成。",
 	].join("\n");
+}
+
+/**
+ * BeatSheet 物理片段预算：同一冻结工作流版本里的 take 节点确定性地只生产
+ * BeatSheet 的前 N 个 clip。N 是本次执行真实会提交给供应商的物理片段数量，
+ * 属于执行配置事实。这里只读取它，不改变截断语义。
+ */
+function resolveBeatSheetProductionClipBudget(flowVersionData: unknown): number | null {
+	if (!isRecord(flowVersionData) || !Array.isArray(flowVersionData.nodes)) return null;
+	let budget: number | null = null;
+	for (const node of flowVersionData.nodes) {
+		if (!isRecord(node) || !isRecord(node.data)) continue;
+		const spec = isRecord(node.data.workflowAtomicSpec) ? node.data.workflowAtomicSpec : null;
+		if (!spec || readString(spec, "executorRef") !== BEAT_SHEET_TAKE_EXECUTOR_REF) continue;
+		const raw = node.data.workflowBeatSheetTakeCount;
+		if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) continue;
+		budget = budget === null ? raw : Math.min(budget, raw);
+	}
+	return budget;
+}
+
+function positiveNumber(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** Provider duration options and explicitly frozen execution bounds, never source speech classification. */
+function runtimeBeatSheetCapacityInstruction(
+	inputs: WorkflowInputPorts,
+	flowVersionData: unknown,
+	outputArtifactType: string,
+): string {
+	if (outputArtifactType !== "tapcanvas.beat-sheet/v2") return "";
+	const contract = (inputs["delivery-contract"] ?? []).find(
+		(value): value is Record<string, unknown> => isRecord(value) && isRecord(value.generationContract),
+	);
+	if (!contract) return "";
+	const generation = isRecord(contract.generationContract) ? contract.generationContract : null;
+	const durationOptions = generation && Array.isArray(generation.durationOptions)
+		? generation.durationOptions
+			.filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
+			.sort((left, right) => left - right)
+		: [];
+	const maxDurationSeconds = generation ? positiveNumber(generation.maxDurationSeconds) : null;
+	const targetDurationSeconds = positiveNumber(contract.targetDurationSeconds);
+	const chapterWide = targetDurationSeconds === null;
+	const productionClipBudget = chapterWide
+		? resolveBeatSheetProductionClipBudget(flowVersionData)
+		: maxDurationSeconds === null
+			? null
+			: Math.max(1, Math.ceil(targetDurationSeconds / maxDurationSeconds));
+	const facts: string[] = [];
+	if (durationOptions.length > 0) {
+		facts.push(`供应商单 clip 允许时长 durationOptions=${JSON.stringify(durationOptions)}${maxDurationSeconds === null ? "" : `，最大 ${String(maxDurationSeconds)} 秒`}；beats[].durationSeconds 只允许取这些值。`);
+	}
+	if (targetDurationSeconds !== null) {
+		facts.push(`本次交付范围的用户冻结总时长为 ${String(targetDurationSeconds)} 秒；Σbeats[].durationSeconds 必须恰好等于该时长。`);
+	}
+	if (productionClipBudget !== null) {
+		facts.push(chapterWide
+			? `本次执行只生产前 ${String(productionClipBudget)} 个 clip：第 ${String(productionClipBudget + 1)} 个及之后的 beat 不会进入成片，完整交付必须在 beats[0..${String(productionClipBudget - 1)}] 内完成覆盖。`
+			: `本次执行只生产这 ${String(productionClipBudget)} 个 clip（与窗口时长一致）；不要额外规划不会进入成片的 beat。`);
+	}
+	if (facts.length === 0) return "";
+	return [
+		"运行时物理片段容量事实（确定性算术，不是创作判断；提交前逐项自检）：",
+		"一个 beat 就是一个供应商物理 clip：beats[clipIndex] 与 blockingPlans[clipIndex] 一一对应，其 durationSeconds 会原样提交给视频模型生成该片段，不能由上层再拆分或合并。",
+		...facts,
+		"内容需要更长总时长时增加 beat 数量，不要拉长单个 beat：单个 beat 超出供应商允许时长就无法提交给供应商，而增加 beat 只会增加片段数量。",
+	].join("\n");
+}
+
+/**
+ * BeatSheet 的嵌套结构合同清单。
+ *
+ * 提交边界会按共享 schema 拒绝 compositionContract/backgroundPlan/sceneCard/objectStates
+ * 的缺键与越界枚举，但这些要求此前只存在于校验器里：作者要等被拒才知道，于是一份计划在
+ * 多个物理窗口间反复补同一个键。这里把共享 schema 自己声明的必填键与枚举直接投影给作者，
+ * 与校验器同一事实来源（不复制、不改写），使首次提交就能自检。它只陈述结构，不判断语义。
+ */
+function runtimeBeatSheetStructuralChecklist(): string {
+	const requiredKeys = (schema: unknown): string[] => {
+		if (!isRecord(schema) || !Array.isArray(schema.required)) return [];
+		return schema.required.filter((key): key is string => typeof key === "string" && key.length > 0);
+	};
+	const enumValues = (schema: unknown, key: string): readonly string[] => {
+		if (!isRecord(schema) || !isRecord(schema.properties)) return [];
+		const property = schema.properties[key];
+		if (!isRecord(property) || !Array.isArray(property.enum)) return [];
+		return property.enum.filter((value): value is string => typeof value === "string");
+	};
+	const itemEnumValues = (schema: unknown, arrayKey: string, itemKey: string): readonly string[] => {
+		if (!isRecord(schema) || !isRecord(schema.properties)) return [];
+		const array = schema.properties[arrayKey];
+		if (!isRecord(array) || !isRecord(array.items)) return [];
+		return enumValues(array.items, itemKey);
+	};
+	const blockingPlanKeys = [...blockingPlanFields];
+	const backgroundPlanKeys = requiredKeys(backgroundPlanSchema);
+	const compositionKeys = requiredKeys(compositionSchema);
+	const sceneCardKeys = requiredKeys(sceneReferenceCardSchema);
+	const sceneCardProperties = isRecord(sceneReferenceCardSchema) && isRecord(sceneReferenceCardSchema.properties)
+		? sceneReferenceCardSchema.properties
+		: {};
+	const sceneLightingKeys = requiredKeys(sceneCardProperties.sceneLightingSpec);
+	const lines = [
+		"运行时结构合同清单（与提交边界校验同一事实来源；提交前逐项自检）：",
+		"objectRegistry 每项必填字段为 [objectId,kind,name,physicalIdentityKey,referenceImageNodeIds,referenceAssetIds,referenceRole,identityInvariant]；forbiddenTransfer/scale 是可省略字段，不是必填占位；若提交则必须是非空字符串，不能用空字符串、null 或数字表示缺省；physicalIdentityKey 仅 character 必填、其它 kind 必须为 null；referenceImageNodeIds 必须是字符串数组；referenceRole 只能是 none/identity/wardrobe/prop/environment/palette/composition/vfx。",
+		`objectStates 每项字段恰好为 ${JSON.stringify([...clipObjectStateFields])}；referenceAssetIds/referenceImageNodeIds 必须显式声明本拍的有序选择，空数组表示本拍不使用，registry 引用不会被继承。`,
+		`blockingPlans 每项允许字段 ${JSON.stringify(blockingPlanKeys)}；clipIndex 必须等于零基位置；durationSeconds 必须等于同位置 beats[].durationSeconds；characters 必须恰好覆盖该拍 beats[].characters 声明的角色，不多不少。`,
+			`blockingPlans[].backgroundPlan 必填键 ${JSON.stringify(backgroundPlanKeys)}；referenceAssetBindings 必须是数组，每项为 {assetId, role}，role 只能取 ${JSON.stringify(["layout", "content", "identity", "style"])}；注意：referenceAssetBindings 里的 assetId 必须是当前项目已存在的真实资产ID，若本场景为新生成的背景底图无前置资产引用，referenceAssetBindings 必须填空数组 []，严禁将自创的临时 scene assetId 填入引用列表。`,
+		`blockingPlans[].compositionContract 必填键 ${JSON.stringify(compositionKeys)}；focusKind 只能取 ${JSON.stringify(enumValues(compositionSchema, "focusKind"))}，shotScale 只能取 ${JSON.stringify(enumValues(compositionSchema, "shotScale"))}，environmentVisualWeight 只能取 ${JSON.stringify(enumValues(compositionSchema, "environmentVisualWeight"))}，focalPoint 为归一化 [x,y]；subjects 每项必填键 ${JSON.stringify(requiredKeys((compositionSchema.properties as Record<string, Record<string, unknown>>).subjects?.items))}，其中 visualWeight/depthLayer/centerPlacement 分别只能取 ${JSON.stringify(itemEnumValues(compositionSchema, "subjects", "visualWeight"))}/${JSON.stringify(itemEnumValues(compositionSchema, "subjects", "depthLayer"))}/${JSON.stringify(itemEnumValues(compositionSchema, "subjects", "centerPlacement"))}。`,
+			`assetPlans 按对象 kind 分别校验，禁止跨 kind 放键：只有 scene/environment 计划才提交 sceneCard（必填键 ${JSON.stringify(sceneCardKeys)}，其中 sceneProfileVersion="scene-card/v1"、sceneAssetRole="space_anchor"、sceneOccupancy="none"；sceneCard.sceneLightingSpec 必填键 ${JSON.stringify(sceneLightingKeys)} 且 version="scene-lighting/v1"），且 scene 计划不得再提交顶层 prompt/negativePrompt；character 计划提交四视图生图 prompt 与 negativePrompt（四视图设定板规格由宿主盖章，不要写 identityBoardSpec）；其余 kind（prop/vfx/palette/composition/wardrobe）提交 prompt 与 negativePrompt。请特别注意：凡是 objectRegistry 里 kind 为 scene 或 environment 的对象，其对应的 assetPlans 必须完整提供 sceneCard 及其全部必填字段（包含 sceneLightingSpec），漏给 scene 计划提供 sceneCard 会被直接判缺键拒绝。`,
+			"assetPlans 每项还必须提供非空的 identityAnchors 与 prohibitedDrift 字符串数组。",
+			"参考职责覆盖与已有资产排除（关键硬约束）：仅在 beats[].assetObjectContracts 中出现、referenceRole 不为 none 且没有绑定真实已就绪参考图（referenceAssetIds/referenceImageNodeIds 均为空）的对象（如未绑图的新建场景或未绑图角色），才在 assetPlans 中建立生成计划（通过 objectId 绑定到该对象）。凡是 objectRegistry 中已绑定了真实参考图（referenceAssetIds/referenceImageNodeIds 非空）的既有资产角色或场景，代表已有可用资产，严禁在 assetPlans 中重复创建生成计划！",
+		];
+	return lines.join("\n");
+}
+
+function healBeatSheetExistingAssetPlans(rawText: string): string | null {
+	try {
+		const parsed = JSON.parse(rawText);
+		if (!isRecord(parsed) || !Array.isArray(parsed.objectRegistry) || !Array.isArray(parsed.assetPlans)) {
+			return null;
+		}
+		const existingAssetObjectIds = new Set<string>();
+		for (const obj of parsed.objectRegistry) {
+			if (isRecord(obj) && typeof obj.objectId === "string") {
+				const assetIds = Array.isArray(obj.referenceAssetIds) ? obj.referenceAssetIds : [];
+				const nodeIds = Array.isArray(obj.referenceImageNodeIds) ? obj.referenceImageNodeIds : [];
+				if (assetIds.length > 0 || nodeIds.length > 0) {
+					existingAssetObjectIds.add(obj.objectId);
+				}
+			}
+		}
+		if (existingAssetObjectIds.size === 0) return null;
+		const originalLength = parsed.assetPlans.length;
+		const filteredPlans = parsed.assetPlans.filter((plan: unknown) => {
+			if (!isRecord(plan) || typeof plan.objectId !== "string") return true;
+			if (!existingAssetObjectIds.has(plan.objectId)) return true;
+			const kind = typeof plan.role === "string" ? plan.role.split("://")[0] : "";
+			const isScene = kind === "scene" || kind === "environment";
+			if (!isScene && (!plan.prompt || typeof plan.prompt !== "string" || !plan.prompt.trim())) {
+				return false;
+			}
+			return true;
+		});
+		if (filteredPlans.length === originalLength) return null;
+		return JSON.stringify({ ...parsed, assetPlans: filteredPlans });
+	} catch {
+		return null;
+	}
+}
+
+function applyExpandedSourceToCanvasFacts(
+	canvasFacts: unknown,
+	expandedSource: unknown,
+): unknown {
+	if (!isRecord(canvasFacts) || !isRecord(expandedSource)) return canvasFacts;
+	const expandedText = readString(expandedSource, "text");
+	if (!expandedText) return canvasFacts;
+	const sources = Array.isArray(canvasFacts.authoritativeSources)
+		? canvasFacts.authoritativeSources.filter(isRecord)
+		: [];
+	if (sources.length === 0) return canvasFacts;
+	const upstreamProvenance = isRecord(expandedSource.executionProvenance)
+		? expandedSource.executionProvenance
+		: null;
+	const upstreamCandidateSets = Array.isArray(expandedSource.retrievalCandidateSets)
+		? expandedSource.retrievalCandidateSets.filter(isRecord)
+		: [];
+	const expandedDraft = {
+		content: expandedText,
+		sourceFingerprint: sha256Hex(expandedText),
+	};
+	return {
+		...canvasFacts,
+		// A generated draft never changes the identity or content of its sources.
+		// This applies equally to chapters, uploaded material and chat requests.
+		// The author decides how to use the draft against the preserved evidence.
+		expandedSourceDraft: expandedDraft,
+		sourceProcessing: "optional_text_expansion_non_authoritative",
+		...(upstreamProvenance || upstreamCandidateSets.length > 0
+			? {
+				authoringEvidencePacket: {
+					protocolVersion: "tapcanvas.authoring-evidence/v1",
+					...(upstreamProvenance ? { dependencyProvenance: upstreamProvenance } : {}),
+					...(upstreamCandidateSets.length > 0 ? { retrievalCandidateSets: upstreamCandidateSets } : {}),
+				},
+			}
+			: {}),
+	};
 }
 
 /**
@@ -636,17 +1196,15 @@ export function validateWorkflowBeatSheetProjectAssetBindings(input: Readonly<{
 				? readString(contract, "physicalIdentityKey")
 				: readString(contract, "name");
 			const role = kind && name ? `${kind}://${name}` : `beats[${beatIndex}].assetObjectContracts[${contractIndex}]`;
-			const referenceAssetIds = Array.isArray(contract.referenceAssetIds)
-				? uniqueStrings(contract.referenceAssetIds.flatMap((value) => (
-					typeof value === "string" && value.trim() ? [value.trim()] : []
-				)))
-				: [];
-			if (referenceAssetIds.length > 1) {
-				return `beats[${beatIndex}].assetObjectContracts[${contractIndex}].referenceAssetIds must contain at most one exact project asset`;
+			let referenceAssetIds: string[];
+			try {
+				referenceAssetIds = resolveWorkflowProjectImageReferences(contract, projectContext);
+			} catch (error: unknown) {
+				return `beats[${beatIndex}].assetObjectContracts[${contractIndex}]: ${error instanceof Error ? error.message : String(error)}`;
 			}
 			for (const assetId of referenceAssetIds) {
 				if (!readyProjectAssetIds.has(assetId)) {
-					return `beats[${beatIndex}].assetObjectContracts[${contractIndex}].referenceAssetIds contains assetId=${assetId} outside the frozen ready production image set; allowed projectAssetIds=${JSON.stringify([...readyProjectAssetIds])}`;
+					return `beats[${beatIndex}].assetObjectContracts[${contractIndex}].referenceAssetIds contains assetId=${assetId} outside the frozen ready production image set; obtain exact allowed IDs through frozenAssetMatch when that read capability is available`;
 				}
 				const previousRole = roleByProjectAssetId.get(assetId);
 				if (previousRole && previousRole !== role) {
@@ -659,56 +1217,14 @@ export function validateWorkflowBeatSheetProjectAssetBindings(input: Readonly<{
 	}
 	const missingSelectedAssetIds = [...selectedAssetIds].filter((assetId) => !referencedSelectedAssetIds.has(assetId));
 	if (missingSelectedAssetIds.length > 0) {
-		return `BeatSheet omitted explicitly selected assets; bind every missing ID to the matching assetObjectContracts.referenceAssetIds using selectedAssetSnapshot source facts: ${JSON.stringify(missingSelectedAssetIds)}`;
+		return `BeatSheet omitted explicitly selected assets; bind every missing ID to the matching root objectRegistry[].referenceAssetIds using selectedAssetSnapshot source facts: ${JSON.stringify(missingSelectedAssetIds)}. One object may retain multiple ordered image IDs. Do not write beats[].assetObjectContracts: those fields are derived from objectRegistry and objectStates. Frozen selectedAssetSnapshot=${JSON.stringify(projectContext.assetSnapshot.filter((asset) => selectedAssetIds.has(asset.assetId)).map((asset) => ({
+			assetId: asset.assetId, nodeId: asset.nodeId, flowId: asset.flowId,
+			canonicalName: asset.canonicalName, kind: asset.kind, referenceType: asset.referenceType, sourceFacts: asset.sourceFacts,
+		})))}`;
 	}
 	return null;
 }
 
-function runtimeProjectAssetCandidatesInstruction(
-	projectContext: WorkflowProjectContext | null,
-	allowedRoles: readonly string[],
-): string {
-	if (!projectContext || allowedRoles.length === 0) return "";
-	const selectedAssetIdSet = new Set(projectContext.selectedAssetIds);
-	const candidates = projectContext.assetSnapshot
-		.filter((asset) => (
-			asset.projectId === projectContext.projectId
-			&& projectContext.projectAssetIds.includes(asset.assetId)
-			&& asset.mediaKind === "image"
-			&& asset.state === "ready"
-			&& asset.productionEligible
-		))
-		.map((asset) => ({
-			assetId: asset.assetId,
-			canonicalName: asset.canonicalName,
-			kind: asset.kind,
-			referenceType: asset.referenceType,
-			sourceFacts: asset.sourceFacts,
-			origin: asset.origin,
-			nodeId: asset.nodeId,
-			assetUsage: asset.assetUsage,
-		}));
-	if (candidates.length === 0 && selectedAssetIdSet.size === 0) return "";
-	return [
-		"运行时当前项目可复用图片资产（确定性身份清单，优先级高于 BeatSheet 中可能过期的历史 assetId）：",
-		"只有下面清单中的 assetId 才能作为本项目 existingAssetId。必须在唯一首稿中依据角色肉身、场景空间与 sourceFacts 做语义身份判断；canonicalName、展示名或章节称谓不要求逐字相等。确认同一身份时填写精确 existingAssetId 和 existingProjectId，确认是新身份或不同可见状态时才保留生成计划。禁止仅因名称别名重复生成，也禁止把相似但不同的对象强行复用。BeatSheet 的历史 referenceAssetIds 只有仍出现在本清单中时有效；selectedAssetIds 是用户显式选择事实，必须覆盖，但不排斥同时复用清单中的其它同项目资产。runtime 后续只验证精确 ID 的权限、就绪状态和项目归属，不做语义纠偏。",
-		JSON.stringify({
-			projectId: projectContext.projectId,
-			selectedAssetIds: projectContext.selectedAssetIds,
-			candidates: candidates.map((asset) => ({
-				assetId: asset.assetId,
-				canonicalName: asset.canonicalName,
-				kind: asset.kind,
-				referenceType: asset.referenceType,
-				sourceFacts: asset.sourceFacts,
-				origin: asset.origin,
-				nodeId: asset.nodeId,
-				assetUsage: asset.assetUsage,
-				selected: selectedAssetIdSet.has(asset.assetId),
-			})),
-		}),
-	].join("\n");
-}
 
 function sanitizeWorkflowCallConfig(
 	callConfig: Record<string, unknown> | null,
@@ -856,6 +1372,31 @@ function workflowDeliveryScope(flowVersionData: unknown): Readonly<{
 	};
 }
 
+function frozenWorkflowImageConfigurations(flowVersionData: unknown): readonly Readonly<{
+	modelKey: string; aspectRatio: string; size: string; quality: string;
+}>[] {
+	const found = new Map<string, Readonly<{ modelKey: string; aspectRatio: string; size: string; quality: string }>>();
+	const visited = new Set<object>();
+	const visit = (value: unknown): void => {
+		if (!value || typeof value !== "object" || visited.has(value)) return;
+		visited.add(value);
+		if (Array.isArray(value)) { value.forEach(visit); return; }
+		if (!isRecord(value)) return;
+		const data = isRecord(value.data) ? value.data : null;
+		const spec = data && isRecord(data.workflowAtomicSpec) ? data.workflowAtomicSpec : null;
+		if (data && spec?.executorRef === "tapcanvas.image.generate/v1") {
+			const config = { modelKey: readString(data, "workflowImageModelKey"),
+				aspectRatio: readString(data, "workflowImageAspectRatio"),
+				size: readString(data, "workflowImageSize"),
+				quality: readString(data, "workflowImageQuality") };
+			if (config.modelKey) found.set(JSON.stringify(config), config);
+		}
+		Object.values(value).forEach(visit);
+	};
+	visit(flowVersionData);
+	return [...found.values()];
+}
+
 /**
  * 在输入端口中查找携带 assetPlans 数组（视频 writer 类冻结资产计划）的端口。
  * 只做结构探测，不承载语义判断；用于运行时自动注入资产精确声明合同。
@@ -936,66 +1477,6 @@ function resolveFrozenClipIds(inputs: WorkflowInputPorts): string[] {
 }
 
 /**
- * Freeze reusable project-image identities by the role declared in the asset
- * plan. This is a structural identity contract, not a semantic asset match:
- * only visible, ready, production-eligible project images are considered, and
- * the current canvas is preferred over older project-level copies. Preview-only
- * and story-preview workflow outputs therefore cannot become authoritative
- * reuse facts.
- */
-type ReusableWorkflowAssetRoleFact = Readonly<{
-	planAssetId?: string;
-	existingAssetId?: string;
-	existingProjectId?: string;
-	existingNodeId?: string;
-	existingImageUrl?: string;
-}>;
-
-type ReusableWorkflowAssetRoleFacts = Readonly<Record<string, ReusableWorkflowAssetRoleFact>>;
-
-function reusableProjectAssetRoleFacts(
-	projectContext: WorkflowProjectContext | null,
-	allowedRoles: readonly string[],
-): ReusableWorkflowAssetRoleFacts {
-	if (!projectContext || allowedRoles.length === 0) return {};
-	const visibleAssetIds = new Set(projectContext.projectAssetIds);
-	const allowedRoleSet = new Set(allowedRoles);
-	const facts: Record<string, { existingAssetId: string; existingProjectId: string; existingNodeId?: string }> = {};
-	const candidates = projectContext.assetSnapshot
-		.filter((asset) => (
-			visibleAssetIds.has(asset.assetId)
-			&& asset.projectId === projectContext.projectId
-			&& asset.mediaKind === "image"
-			&& asset.state === "ready"
-			&& asset.productionEligible
-			&& asset.canonicalName
-		))
-		.sort((left, right) => {
-			const leftCurrentCanvas = left.flowId === projectContext.canvasId ? 0 : 1;
-			const rightCurrentCanvas = right.flowId === projectContext.canvasId ? 0 : 1;
-			if (leftCurrentCanvas !== rightCurrentCanvas) return leftCurrentCanvas - rightCurrentCanvas;
-			return right.updatedAt.localeCompare(left.updatedAt);
-		});
-	for (const asset of candidates) {
-		const roleKind = ["character", "scene", "prop", "vfx", "palette", "composition"].includes(asset.kind)
-			? asset.kind
-			: ["character", "scene", "prop", "vfx", "palette", "composition"].includes(asset.referenceType ?? "")
-				? asset.referenceType ?? ""
-				: "";
-		if (!roleKind) continue;
-		const role = `${roleKind}://${asset.canonicalName}`;
-		if (!allowedRoleSet.has(role)) continue;
-		if (facts[role]) continue;
-		facts[role] = {
-			existingAssetId: asset.assetId,
-			existingProjectId: projectContext.projectId,
-			...(asset.nodeId ? { existingNodeId: asset.nodeId } : {}),
-		};
-	}
-	return facts;
-}
-
-/**
  * A BeatSheet referenceAssetIds binding is an Agent-authored, exact asset
  * identity decision.  It must outrank display-name matching: physicalIdentityKey
  * identifies the body across aliases, while a material's canonicalName remains
@@ -1005,7 +1486,7 @@ function reusableReferencedProjectAssetRoleFacts(
 	inputs: WorkflowInputPorts,
 	projectContext: WorkflowProjectContext | null,
 	allowedRoles: readonly string[],
-): ReusableWorkflowAssetRoleFacts {
+): WorkflowReusableAssetRoleFacts {
 	if (!projectContext || allowedRoles.length === 0) return {};
 	const beatSheetInput = firstInput(inputs, "beat-sheet");
 	let beatSheet: unknown = beatSheetInput;
@@ -1026,7 +1507,7 @@ function reusableReferencedProjectAssetRoleFacts(
 			&& isWorkflowProjectImageReady(asset)
 		))
 		.map((asset) => [asset.assetId, asset] as const));
-	const facts: Record<string, ReusableWorkflowAssetRoleFact> = {};
+	const facts: Record<string, readonly WorkflowReusableAssetReference[]> = {};
 	for (const [beatIndex, beat] of beatSheet.beats.entries()) {
 		if (!isRecord(beat) || !Array.isArray(beat.assetObjectContracts)) continue;
 		for (const [contractIndex, contract] of beat.assetObjectContracts.entries()) {
@@ -1037,28 +1518,23 @@ function reusableReferencedProjectAssetRoleFacts(
 				: readString(contract, "name");
 			const role = kind && name ? `${kind}://${name}` : "";
 			if (!role || !allowedRoleSet.has(role)) continue;
-			const referenceAssetIds = Array.isArray(contract.referenceAssetIds)
-				? uniqueStrings(contract.referenceAssetIds.flatMap((value) => (
-					typeof value === "string" && value.trim() ? [value.trim()] : []
-				)))
-				: [];
-			if (referenceAssetIds.length > 1) {
-				throw new Error(`beats[${beatIndex}].assetObjectContracts[${contractIndex}] has multiple canonical referenceAssetIds`);
-			}
-			const referenceAssetId = referenceAssetIds[0];
-			if (!referenceAssetId) continue;
-			const asset = readyAssetById.get(referenceAssetId);
-			if (!asset) continue;
-			const nextFact: ReusableWorkflowAssetRoleFact = {
-				existingAssetId: asset.assetId,
-				existingProjectId: projectContext.projectId,
-				...(asset.nodeId ? { existingNodeId: asset.nodeId } : {}),
-			};
-			const previous = facts[role];
-			if (previous && JSON.stringify(previous) !== JSON.stringify(nextFact)) {
-				throw new Error(`Frozen BeatSheet role ${role} has conflicting exact project asset bindings`);
-			}
-			facts[role] = nextFact;
+			const referenceAssetIds = resolveWorkflowProjectImageReferences(contract, projectContext);
+			if (referenceAssetIds.length === 0) continue;
+			const existingAssets = referenceAssetIds.map((referenceAssetId) => {
+				const asset = readyAssetById.get(referenceAssetId);
+				if (!asset) throw new Error(`Unresolved frozen asset ${referenceAssetId}`);
+				return {
+					planAssetId: asset.assetId,
+					existingAssetId: asset.assetId,
+					existingProjectId: projectContext.projectId,
+					...(asset.nodeId ? { existingNodeId: asset.nodeId } : {}),
+				};
+			});
+			// Different clips may choose different views of the same object.
+			// Union the reusable inventory here; consumers remain image-specific.
+			const previous = facts[role] ?? [];
+			facts[role] = [...previous, ...existingAssets.filter((asset) =>
+				!previous.some((reference) => reference.existingAssetId === asset.existingAssetId))];
 		}
 	}
 	return facts;
@@ -1074,15 +1550,20 @@ function reusableReferencedProjectAssetRoleFacts(
 function reusableUpstreamAssetRoleFacts(
 	inputs: WorkflowInputPorts,
 	allowedRoles: readonly string[],
-): ReusableWorkflowAssetRoleFacts {
+): WorkflowReusableAssetRoleFacts {
 	const input = firstInput(inputs, "asset-bindings");
 	if (input === undefined || input === null) return {};
 	if (!isWorkflowCollection(input)) {
 		throw new Error("Upstream reusable asset bindings must be a workflow collection");
 	}
 	const allowedRoleSet = new Set(allowedRoles);
-	const facts: Record<string, ReusableWorkflowAssetRoleFact> = {};
-	for (const [index, item] of input.items.entries()) {
+	const facts: Record<string, readonly WorkflowReusableAssetReference[]> = {};
+	const uses = input.items.flatMap(item => {
+		if (!isRecord(item.value)) throw new Error("Materialized receipt must be an object");
+		const receipt = item.value;
+		return materializedAssetUses(receipt.assetPlan).map(assetPlan => ({ value: { ...receipt, assetPlan } }));
+	});
+	for (const [index, item] of uses.entries()) {
 		if (!isRecord(item.value) || !isRecord(item.value.assetPlan)) {
 			throw new Error(`Upstream asset binding ${index + 1} requires a validated assetPlan`);
 		}
@@ -1094,30 +1575,38 @@ function reusableUpstreamAssetRoleFacts(
 		if (!planAssetId || !existingNodeId || !existingImageUrl) {
 			throw new Error(`Upstream asset binding ${index + 1} requires assetId, nodeId and persistent imageUrl`);
 		}
-		const nextFact: ReusableWorkflowAssetRoleFact = {
+		const nextFact: WorkflowReusableAssetReference = {
 			planAssetId,
+			...(readString(item.value.assetPlan, "existingAssetId") ? {
+				existingAssetId: readString(item.value.assetPlan, "existingAssetId"),
+				existingProjectId: readString(item.value.assetPlan, "existingProjectId"),
+			} : {}),
 			existingNodeId,
 			existingImageUrl,
 		};
-		const previous = facts[role];
-		if (previous && JSON.stringify(previous) !== JSON.stringify(nextFact)) {
-			throw new Error(`Upstream asset role ${role} has conflicting materialized bindings`);
+		const previous = facts[role] ?? [];
+		if (previous.some((reference) => reference.planAssetId === planAssetId)) {
+			throw new Error(`Upstream asset role ${role} has duplicate materialized identity ${planAssetId}`);
 		}
-		facts[role] = nextFact;
+		facts[role] = [...previous, nextFact];
 	}
 	return facts;
 }
 
-function reusableWorkflowAssetRoleFacts(
+export function reusableWorkflowAssetRoleFacts(
 	inputs: WorkflowInputPorts,
 	projectContext: WorkflowProjectContext | null,
 	allowedRoles: readonly string[],
-): ReusableWorkflowAssetRoleFacts {
-	return {
-		...reusableProjectAssetRoleFacts(projectContext, allowedRoles),
-		...reusableReferencedProjectAssetRoleFacts(inputs, projectContext, allowedRoles),
-		...reusableUpstreamAssetRoleFacts(inputs, allowedRoles),
-	};
+): WorkflowReusableAssetRoleFacts {
+	const upstream = reusableUpstreamAssetRoleFacts(inputs, allowedRoles);
+	const referenced = reusableReferencedProjectAssetRoleFacts(inputs, projectContext, allowedRoles);
+	return Object.fromEntries([...new Set([...Object.keys(upstream), ...Object.keys(referenced)])].map(role => {
+		// Preserve distinct authored views. Only an exact media identity can be
+		// replaced by its actual materialization receipt; a role is not an asset.
+		const receipts = upstream[role] ?? [];
+		const materializedIds = new Set(receipts.map(reference => reference.planAssetId));
+		return [role, [...receipts, ...(referenced[role] ?? []).filter(reference => !materializedIds.has(reference.planAssetId))]];
+	}));
 }
 
 function knowledgeQuery(inputs: WorkflowInputPorts, data: Record<string, unknown>): string {
@@ -1134,12 +1623,7 @@ function knowledgeCardId(inputs: WorkflowInputPorts, data: Record<string, unknow
 }
 
 function knowledgeLimit(data: Record<string, unknown>): number {
-	const value = data.workflowKnowledgeLimit;
-	if (value === undefined) return 5;
-	if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > 12) {
-		throw new Error("Workflow Knowledge Search limit must be an integer between 1 and 12");
-	}
-	return Number(value);
+  return normalizeKnowledgeCandidateLimit(data.workflowKnowledgeLimit);
 }
 
 function toolInvocationArguments(inputs: WorkflowInputPorts, data: Record<string, unknown>): Record<string, unknown> {
@@ -1155,6 +1639,22 @@ function toolInvocationArguments(inputs: WorkflowInputPorts, data: Record<string
 	}
 	if (!isRecord(parsed)) throw new Error("Workflow Tool Invocation arguments must be a JSON object");
 	return parsed;
+}
+
+function workflowToolInvocationDeliveryMetadata(
+	inputs: WorkflowInputPorts,
+): Readonly<{ deliveryEvidence?: unknown; deliveryVerification?: unknown }> {
+	const inputValue = firstInput(inputs, "arguments");
+	if (!isRecord(inputValue)) return {};
+	return {
+		...(inputValue.deliveryEvidence !== undefined ? { deliveryEvidence: inputValue.deliveryEvidence } : {}),
+		...(inputValue.deliveryVerification !== undefined ? { deliveryVerification: inputValue.deliveryVerification } : {}),
+	};
+}
+
+function stripWorkflowToolInvocationDeliveryMetadata(args: Record<string, unknown>): Record<string, unknown> {
+	const { deliveryEvidence: _deliveryEvidence, deliveryVerification: _deliveryVerification, ...toolArgs } = args;
+	return toolArgs;
 }
 
 function output(input: Readonly<{
@@ -1340,6 +1840,41 @@ function parseDeliveryVerification(value: unknown): { status: string } | null {
 	return typeof value.status === "string" ? { status: value.status } : null;
 }
 
+type FlowPatchDeliveryReceipt = Readonly<{
+	targetNodeId: string;
+	contentLength: number;
+	updatedAt: string | null;
+}>;
+
+/**
+ * Verify a flow-patch write from the persisted read-back receipt.  This is a
+ * structural delivery check: it proves that the configured node was patched
+ * and now has non-empty text.  It intentionally does not score or judge the
+ * text itself.
+ */
+function verifyFlowPatchDeliveryReceipt(
+	result: unknown,
+	targetNodeId: string,
+): FlowPatchDeliveryReceipt | null {
+	if (!isRecord(result) || result.ok !== true) return null;
+	const snapshots = result.patchedNodeSnapshots;
+	if (!Array.isArray(snapshots)) return null;
+	const target = snapshots.find((snapshot) => (
+		isRecord(snapshot) && snapshot.id === targetNodeId
+	));
+	if (!isRecord(target) || !isRecord(target.data)) return null;
+	const content = typeof target.data.content === "string" ? target.data.content.trim() : "";
+	if (!content) return null;
+	const updatedAt = typeof result.updatedAt === "string" && result.updatedAt.trim()
+		? result.updatedAt.trim()
+		: null;
+	return {
+		targetNodeId,
+		contentLength: content.length,
+		updatedAt,
+	};
+}
+
 type WorkflowAgentTerminalStatus = "succeeded" | "suspended" | "needs_input" | "failed";
 
 function parseAgentRequestTerminal(value: unknown): Readonly<{
@@ -1404,11 +1939,49 @@ function projectWorkflowAtomicDelivery(input: Readonly<{
 
 function previousAgentEvidence(context: WorkflowNodeExecutionContext): Record<string, unknown> | null {
 	if (!context.resumeOutputRefs) return null;
-	if (context.runtimeItemIndex === undefined) return context.resumeOutputRefs.evidence;
+	if (context.resumeOutputRefs.nodeId === context.node.id) return context.resumeOutputRefs.evidence;
 	const previousItemRun = context.resumeOutputRefs.itemRuns.find(
 		(run) => run.runtimeNodeId === context.node.id,
 	);
 	return previousItemRun?.evidence ?? null;
+}
+
+function typedAgentResultSuspensionIsContinuable(
+	deliveryEvidence: unknown,
+	requestTerminal: ReturnType<typeof parseAgentRequestTerminal>,
+): boolean {
+	if (requestTerminal?.status !== "suspended" || !isRecord(deliveryEvidence)) return false;
+	if (deliveryEvidence.retryablePhysicalFailure === true) return true;
+	if (isRecord(deliveryEvidence.recoveryCheckpoint)) return true;
+	return deliveryEvidence.source === "agents_cli_durable_turn_status"
+		&& (deliveryEvidence.state === "running"
+			|| deliveryEvidence.state === "suspended"
+			|| deliveryEvidence.state === "unknown");
+}
+
+function typedAgentProviderReplanEvidence(
+	agentResult: WorkflowAgentRunResult,
+): Readonly<Record<string, unknown>> | null {
+	const failure = isRecord(agentResult.structuredOutputFailure)
+		? agentResult.structuredOutputFailure
+		: isRecord(agentResult.deliveryEvidence) && isRecord(agentResult.deliveryEvidence.structuredOutputFailure)
+			? agentResult.deliveryEvidence.structuredOutputFailure
+			: null;
+	const providerFailure = failure && isRecord(failure.providerFailure)
+		? failure.providerFailure
+		: isRecord(agentResult.deliveryEvidence) && isRecord(agentResult.deliveryEvidence.providerResponseRejection)
+			? agentResult.deliveryEvidence.providerResponseRejection
+			: null;
+	if (!providerFailure) return null;
+	if (
+		providerFailure.recoveryMode !== "agent_replan"
+		|| providerFailure.responseScope !== "current_provider_response_only"
+		|| providerFailure.acceptedSideEffect !== false
+		|| providerFailure.terminalState !== "failed"
+		|| typeof providerFailure.providerCode !== "string"
+		|| !providerFailure.providerCode.trim()
+	) return null;
+	return providerFailure;
 }
 
 function explicitProviderClipFacts(inputs: WorkflowInputPorts): Readonly<{
@@ -1452,8 +2025,6 @@ function allowedProviderClipDurations(inputs: WorkflowInputPorts): readonly numb
 	return null;
 }
 
-const WORKFLOW_CLIP_WRITER_MAX_OUTPUT_TOKENS = 8_192;
-
 function workflowAgentOutputContractFailure(error: unknown): string | null {
 	if (!isRecord(error) || error.code !== "structured_output_invalid") return null;
 	if (error instanceof Error && error.message.trim()) return error.message.trim();
@@ -1495,6 +2066,74 @@ function requiredAgentMaxOutputTokens(data: Record<string, unknown>): number {
 	return value;
 }
 
+function optionalAgentStructuredOutputTokenBudget(data: Record<string, unknown>): number | undefined {
+	if (data.workflowAgentStructuredOutputTokenBudget === undefined) return undefined;
+	const value = requiredPositiveInteger(data, "workflowAgentStructuredOutputTokenBudget");
+	if (value < WORKFLOW_AGENT_MAX_OUTPUT_TOKENS_MIN || value > WORKFLOW_AGENT_MAX_OUTPUT_TOKENS_MAX) {
+		throw new Error(
+			`workflowAgentStructuredOutputTokenBudget must be between ${WORKFLOW_AGENT_MAX_OUTPUT_TOKENS_MIN} and ${WORKFLOW_AGENT_MAX_OUTPUT_TOKENS_MAX}`,
+		);
+	}
+	return value;
+}
+
+function optionalAgentProjectContextPromptMode(data: Record<string, unknown>): "identity_only" | undefined {
+	const value = data.workflowAgentProjectContextPromptMode;
+	if (value === undefined) return undefined;
+	if (value === "identity_only") return value;
+	throw new Error("workflowAgentProjectContextPromptMode must be identity_only when provided");
+}
+
+function optionalAgentFailurePolicy(
+	data: Record<string, unknown>,
+): "single_submission" | "repair_with_correction" | undefined {
+	const value = data.workflowAgentFailurePolicy;
+	if (value === undefined || value === "single_submission" || value === "repair_with_correction") return value;
+	throw new Error("workflowAgentFailurePolicy must be single_submission or repair_with_correction when provided");
+}
+
+function optionalAgentExecutionPolicy(
+	data: Record<string, unknown>,
+): "single_inference" | "multi_inference" | undefined {
+	const value = data.workflowAgentExecutionPolicy;
+	if (value === undefined || value === "single_inference" || value === "multi_inference") return value;
+	throw new Error("workflowAgentExecutionPolicy must be single_inference or multi_inference when provided");
+}
+
+function optionalAgentToolPolicy(data: Record<string, unknown>): "none" | "scoped" | undefined {
+	const value = data.workflowAgentToolPolicy;
+	if (value === undefined || value === "none" || value === "scoped") return value;
+	throw new Error("workflowAgentToolPolicy must be none or scoped when provided");
+}
+
+function optionalAgentPromptMode(data: Record<string, unknown>): "compact_structured" | undefined {
+	const value = data.workflowAgentPromptMode;
+	if (value === undefined) return undefined;
+	if (value === "compact_structured") return value;
+	throw new Error("workflowAgentPromptMode must be compact_structured when provided");
+}
+
+function agentKnowledgeRetrievalEnabled(data: Record<string, unknown>): boolean {
+	const value = data.workflowKnowledgeRetrieval;
+	if (value === undefined || value === true) return true;
+	if (value === false) return false;
+	throw new Error("workflowKnowledgeRetrieval must be a boolean when provided");
+}
+
+function agentSkillRetrievalEnabled(data: Record<string, unknown>): boolean {
+	const value = data.workflowSkillRetrieval;
+	if (value === undefined || value === true) return true;
+	if (value === false) return false;
+	throw new Error("workflowSkillRetrieval must be a boolean when provided");
+}
+
+function agentExecutionInspectionEnabled(data: Record<string, unknown>): boolean {
+	const value = data.workflowExecutionInspection;
+	if (value === undefined || value === true) return true;
+	if (value === false) return false;
+	throw new Error("workflowExecutionInspection must be a boolean when provided");
+}
+
 function optionalAgentReasoningEffort(
 	data: Record<string, unknown>,
 ): WorkflowAgentReasoningEffort | undefined {
@@ -1517,7 +2156,7 @@ function optionalAgentReasoningEffort(
 function videoPrompt(inputs: WorkflowInputPorts): string {
 	const value = firstInput(inputs, "prompt") ?? firstInput(inputs, "production-plan");
 	if (typeof value === "string" && value.trim()) return value.trim();
-	if (isRecord(value) && typeof value.prompt === "string" && value.prompt.trim()) return value.prompt.trim();
+	if (isRecord(value) && typeof value.prompt === "string" && value.prompt.trim()) return value.prompt;
 	if (isRecord(value) && typeof value.text === "string" && value.text.trim()) return value.text.trim();
 	throw new Error("Video generation requires a non-empty prompt string or Agent result text");
 }
@@ -1529,9 +2168,26 @@ function videoGenerationParameter(
 	dataField: string,
 ): unknown {
 	const productionPlan = firstInput(inputs, "production-plan");
-	return isRecord(productionPlan) && Object.prototype.hasOwnProperty.call(productionPlan, inputField)
-		? productionPlan[inputField]
-		: data[dataField];
+	if (isRecord(productionPlan) && Object.prototype.hasOwnProperty.call(productionPlan, inputField)) {
+		return productionPlan[inputField];
+	}
+	const deliveryContract = firstInput(inputs, "delivery-contract");
+	const generationContract = isRecord(deliveryContract) && isRecord(deliveryContract.generationContract)
+		? deliveryContract.generationContract
+		: null;
+	const promptItem = firstInput(inputs, "prompt");
+	if (isRecord(promptItem) && promptItem.protocolVersion === OPENING_CLIP_PROMPT_PROTOCOL) {
+		if (inputField === "durationSeconds") return promptItem.durationSeconds;
+		if (inputField === "modelKey") return promptItem.modelKey;
+		if (inputField === "resolution") return promptItem.resolution;
+		if (inputField === "aspectRatio") return promptItem.aspectRatio;
+		if (inputField === "size") return promptItem.size;
+	}
+	if (generationContract) {
+		const field = inputField === "modelKey" ? "videoModel" : inputField;
+		if (Object.prototype.hasOwnProperty.call(generationContract, field)) return generationContract[field];
+	}
+	return data[dataField];
 }
 
 function imagePromptPackage(inputs: WorkflowInputPorts): Readonly<{ prompt: string; negativePrompt: string }> {
@@ -1540,6 +2196,20 @@ function imagePromptPackage(inputs: WorkflowInputPorts): Readonly<{ prompt: stri
 		const prompt = readString(value, "prompt");
 		const negativePrompt = readString(value, "negativePrompt");
 		if (!prompt || !negativePrompt) throw new Error("Image prompt package requires non-empty prompt and negativePrompt fields");
+		const identityAnchors = Array.isArray(value.identityAnchors)
+			? uniqueStrings(value.identityAnchors.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0))
+			: [];
+		const prohibitedDrift = Array.isArray(value.prohibitedDrift)
+			? uniqueStrings(value.prohibitedDrift.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0))
+			: [];
+		const isCharacterIdentityAnchor =
+			readString(value, "referenceType") === "character"
+			&& readString(value, "characterAssetRole") === "identity_anchor"
+			&& readString(value, "characterProfileVersion") === "character-card/v3";
+		if (isCharacterIdentityAnchor && (identityAnchors.length === 0 || prohibitedDrift.length === 0)) {
+			throw new Error("Character identity anchor image requires non-empty identityAnchors and prohibitedDrift");
+		}
+
 		return { prompt, negativePrompt };
 	}
 	const raw = typeof value === "string"
@@ -1570,14 +2240,14 @@ function imageReferenceAssetBindings(data: Record<string, unknown>): readonly Wo
 		if (!isRecord(value)) throw new Error(`Workflow image reference binding ${index + 1} must be an object`);
 		const assetId = readString(value, "assetId");
 		const role = readString(value, "role");
-		if (!assetId || (role !== "layout" && role !== "style" && role !== "identity" && role !== "content")) {
+		if (!assetId || !IMAGE_REFERENCE_ROLES.includes(role as typeof IMAGE_REFERENCE_ROLES[number])) {
 			throw new Error(`Workflow image reference binding ${index + 1} has invalid assetId or role`);
 		}
 		const strength = value.strength;
 		if (strength !== undefined && (typeof strength !== "number" || !Number.isFinite(strength) || strength < 0 || strength > 1)) {
 			throw new Error(`Workflow image reference binding ${index + 1} strength must be between 0 and 1`);
 		}
-		return { assetId, role, ...(typeof strength === "number" ? { strength } : {}) };
+		return { assetId, role: role as typeof IMAGE_REFERENCE_ROLES[number], ...(typeof strength === "number" ? { strength } : {}) };
 	});
 	if (new Set(bindings.map((binding) => binding.assetId)).size !== bindings.length) {
 		throw new Error("Workflow image reference binding asset IDs must be unique");
@@ -1587,6 +2257,20 @@ function imageReferenceAssetBindings(data: Record<string, unknown>): readonly Wo
 
 export function workflowImageAssetMetadata(value: unknown): Readonly<Record<string, unknown>> | null {
 	if (!isRecord(value)) return null;
+	if (value.protocolVersion === "tapcanvas.clip-production-asset-item/v1") {
+		if (!readString(value, "registryObjectId") || !readString(value, "displayName")
+			|| !readString(value, "referenceType")) {
+			throw new Error("Clip image asset item is missing its authored semantic identity");
+		}
+		return clipProductionAssetMetadata(value as ClipProductionAssetPlanItem);
+	}
+	if (value.assetPurpose === "blocking_background") {
+		const displayName = readString(value, "displayName");
+		const sourcePlanAssetId = readString(value, "assetId");
+		if (!displayName || !sourcePlanAssetId) throw new Error("Background asset requires its authored name and plan identity");
+		return { referenceType: "scene", assetPurpose: "blocking_background",
+			displayName, canonicalName: displayName, sceneName: displayName, sourcePlanAssetId };
+	}
 	const role = readString(value, "role");
 	if (!role) return null;
 	const parsedRole = parseWorkflowAssetRole(role, "Workflow image asset plan role");
@@ -1597,7 +2281,7 @@ export function workflowImageAssetMetadata(value: unknown): Readonly<Record<stri
 			referenceType: parsedRole.kind,
 			canonicalName: parsedRole.name,
 			displayName,
-			...(parsedRole.kind === "scene" ? { sceneName: parsedRole.name } : {}),
+			...(parsedRole.kind === "scene" ? { ...projectSceneReferenceMetadata(value), sceneName: parsedRole.name } : {}),
 			...(parsedRole.kind === "prop" ? { propName: parsedRole.name } : {}),
 		};
 	}
@@ -1605,6 +2289,10 @@ export function workflowImageAssetMetadata(value: unknown): Readonly<Record<stri
 	const roleName = readString(value, "roleName");
 	const characterAssetRole = readString(value, "characterAssetRole");
 	const characterProfileVersion = readString(value, "characterProfileVersion");
+	const identityBoardSpec = characterIdentityBoardSpec(
+		value.identityBoardSpec,
+		"Workflow image asset plan identityBoardSpec",
+	);
 	const identityAnchors = Array.isArray(value.identityAnchors)
 		? uniqueStrings(value.identityAnchors.flatMap((entry) => typeof entry === "string" && entry.trim() ? [entry.trim()] : []))
 		: [];
@@ -1628,6 +2316,7 @@ export function workflowImageAssetMetadata(value: unknown): Readonly<Record<stri
 		physicalIdentityKey: parsedRole.name,
 		characterAssetRole: "identity_anchor",
 		characterProfileVersion: "character-card/v3",
+		...(identityBoardSpec ? { identityBoardSpec } : {}),
 		identityAnchors,
 		prohibitedDrift,
 	};
@@ -1651,6 +2340,9 @@ async function executeRegisteredWorkflowNodeOnce(
 	if (hasWorkflowPluginExecutorRefPrefix(executorRef)) {
 		return executeWorkflowPluginNode(context, dependencies, executorRef);
 	}
+	if (executorRef === "workflow.pipeline.run/v1") {
+		return runWorkflowPipelineNode(context, dependencies, executeRegisteredWorkflowNode);
+	}
 
 	if (executorRef === "workflow.trigger/v1") {
 		const configuredPayload = data.workflowTriggerPayload;
@@ -1668,7 +2360,9 @@ async function executeRegisteredWorkflowNodeOnce(
 	}
 
 	if (executorRef === "workflow.input.text/v1") {
-		const text = readString(data, "workflowTextInput") || readString(data, "prompt") || readString(data, "content");
+		const trigger = firstInput(context.inputs, "trigger");
+		const triggerSource = isRecord(trigger) ? readString(trigger, "source") : "";
+		const text = readString(data, "workflowTextInput") || readString(data, "prompt") || readString(data, "content") || triggerSource;
 		if (!text) {
 			return {
 				ok: false,
@@ -1698,13 +2392,527 @@ async function executeRegisteredWorkflowNodeOnce(
 			code,
 			input: firstInput(context.inputs, "input"),
 		});
+		const rawInput = firstInput(context.inputs, "input");
+		const deliveryMetadata = isRecord(rawInput)
+			? {
+				...(rawInput.deliveryEvidence !== undefined ? { deliveryEvidence: rawInput.deliveryEvidence } : {}),
+				...(rawInput.deliveryVerification !== undefined ? { deliveryVerification: rawInput.deliveryVerification } : {}),
+			}
+			: {};
+		const outputValue = Object.keys(deliveryMetadata).length > 0 && isRecord(javascriptResult.output)
+			? { ...javascriptResult.output, ...deliveryMetadata }
+			: javascriptResult.output;
 		return output({
 			node: context.node,
 			executorRef,
-			ports: { result: javascriptResult.output },
-			artifacts: [{ type: "tapcanvas.json/v1", identity: null, value: javascriptResult.output }],
+			ports: { result: outputValue },
+			artifacts: [{ type: "tapcanvas.json/v1", identity: null, value: outputValue }],
 			evidence: { durationMs: javascriptResult.durationMs, isolation: "local-child-process" },
 		});
+	}
+
+	if (executorRef === "video.opening-clip.prepare/v1") {
+		try {
+			const projection = projectOpeningClip({
+				executionId: context.executionId,
+				nodeId: context.node.id,
+				openingClip: firstInput(context.inputs, "opening-clip"),
+				deliveryContract: firstInput(context.inputs, "delivery-contract"),
+			});
+			return output({
+				node: context.node,
+				executorRef,
+				ports: {
+					"clip-prompts": projection.clipPromptCollection,
+					"accepted-opening-clip": projection.acceptedOpeningClip,
+				},
+				artifacts: [
+					{ type: "tapcanvas.clip-prompts/v2", identity: projection.clipPromptCollection.collectionId, value: projection.clipPromptCollection },
+					{ type: "tapcanvas.accepted-opening-clip/v3", identity: projection.acceptedOpeningClip.clipId, value: projection.acceptedOpeningClip },
+				],
+				evidence: {
+					clipId: projection.acceptedOpeningClip.clipId,
+					contentHash: projection.acceptedOpeningClip.contentHash,
+					sourceRangeCount: projection.acceptedOpeningClip.sourceRanges.length,
+				},
+			});
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.opening-frame.prepare/v1") {
+		try {
+			const promptPackage = projectOpeningFramePromptPackage({
+				framePlan: firstInput(context.inputs, "frame-plan"),
+				projectContext: runtimeProjectContext(context),
+			});
+			return output({
+				node: context.node,
+				executorRef,
+				ports: { "prompt-package": promptPackage },
+				artifacts: [{
+					type: "tapcanvas.opening-frame-prompt-package/v1",
+					identity: `${context.executionId}:${context.node.id}:opening-frame`,
+					value: promptPackage,
+				}],
+				evidence: { referenceAssetCount: promptPackage.referenceAssetBindings.length },
+			});
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.chapter-sequence.project/v2") {
+		try {
+			const projection = projectChapterSequence({
+				executionId: context.executionId,
+				nodeId: context.node.id,
+				sequence: firstInput(context.inputs, "chapter-sequence"),
+				deliveryContract: firstInput(context.inputs, "delivery-contract"),
+			});
+			return output({
+				node: context.node, executorRef,
+				ports: { "chapter-sequence": projection.chapterSequence, "clip-sequences": projection.clipCollection,
+					"clip-segments": projection.sourceSegmentsCollection, "source-receipt": projection.sourceReceipt },
+				artifacts: [
+					{ type: BOUND_CHAPTER_SEQUENCE_ARTIFACT_TYPE, identity: `${context.executionId}:${context.node.id}:chapter-sequence`, value: projection.chapterSequence },
+					{ type: CHAPTER_SEQUENCE_CLIPS_ARTIFACT_TYPE, identity: projection.clipCollection.collectionId, value: projection.clipCollection },
+					{ type: "tapcanvas.clip-source-segments/v1", identity: projection.sourceSegmentsCollection.collectionId, value: projection.sourceSegmentsCollection },
+				],
+				evidence: { clipCount: projection.clipCollection.items.length },
+			});
+		} catch (error: unknown) {
+			return workflowActionFailure(context.node, executorRef, error);
+		}
+	}
+
+	if (executorRef === "video.clip-production.aggregate/v1") {
+		try {
+			const result = aggregateClipProduction({ executionId: context.executionId, nodeId: context.node.id,
+				sourceSegments: firstInput(context.inputs, "source-segments"),
+				promptPackages: firstInput(context.inputs, "prompt-packages"), estimates: firstInput(context.inputs, "estimates"),
+				videoAssets: firstInput(context.inputs, "video-assets"), preparedNodes: firstInput(context.inputs, "prepared-nodes") });
+			return output({ node: context.node, executorRef, ports: result.ports,
+				evidence: { clipCount: result.clipCount, selectedOutputPorts: result.selectedOutputPorts },
+				artifacts: [
+					{ type: "tapcanvas.prompt-package/v2", identity: context.executionId, value: result.ports["prompt-package"] },
+					{ type: "tapcanvas.video-estimate/v1", identity: `${context.executionId}:${context.node.id}:estimate`, value: result.ports.estimate },
+					...(result.ports["prepared-nodes"] === undefined ? [] : [{ type: "tapcanvas.video-node/v1", identity: `${context.executionId}:${context.node.id}:prepared-nodes`, value: result.ports["prepared-nodes"] }]),
+					...(result.ports["video-assets"] === undefined ? [] : [{ type: "tapcanvas.video-clips/v1", identity: `${context.executionId}:${context.node.id}:video-assets`, value: result.ports["video-assets"] }]),
+				] });
+		} catch (error: unknown) { return workflowActionFailure(context.node, executorRef, error); }
+	}
+
+	if (executorRef === "video.chapter-assets.seeds/v1") {
+		try {
+			const projection = projectChapterAssetSeeds({
+				executionId: context.executionId,
+				nodeId: context.node.id,
+				outline: firstInput(context.inputs, "asset-outline"),
+			});
+			return output({
+				node: context.node, executorRef,
+				ports: { "asset-seeds": projection.collection },
+				artifacts: [{ type: "tapcanvas.chapter-asset-seeds/v1", identity: projection.collection.collectionId, value: projection.collection }],
+				evidence: { objectCount: projection.objectCount },
+			});
+		} catch (error: unknown) {
+			return workflowActionFailure(context.node, executorRef, error);
+		}
+	}
+
+	if (executorRef === "video.chapter-assets.collect/v1") {
+		try {
+			const collected = collectChapterAssetParts({
+				parts: firstInput(context.inputs, "asset-parts"),
+				seeds: firstInput(context.inputs, "asset-seeds"),
+			});
+			return output({
+				node: context.node, executorRef,
+				ports: { "chapter-assets": collected.chapterAssets },
+				artifacts: [{ type: "tapcanvas.chapter-asset-plan/v3", identity: `${context.executionId}:${context.node.id}:chapter-assets`, value: collected.chapterAssets }],
+				evidence: { objectCount: collected.objectCount, backgroundPlanCount: collected.backgroundPlanCount },
+			});
+		} catch (error: unknown) {
+			return workflowActionFailure(context.node, executorRef, error);
+		}
+	}
+
+	if (executorRef === "video.clip-production.collect/v1") {
+		try {
+			const packetCollection = firstInput(context.inputs, "packets");
+			const sourceSegmentCollection = firstInput(context.inputs, "clip-segments");
+			if (!isWorkflowCollection(packetCollection)) {
+				throw new Error("clip-production collector requires the per-Clip Agent result WorkflowCollection on packets");
+			}
+			if (!isWorkflowCollection(sourceSegmentCollection)) {
+				throw new Error("clip-production collector requires the frozen source segmentation WorkflowCollection on clip-segments");
+			}
+			if (packetCollection.items.length !== sourceSegmentCollection.items.length) {
+				throw new Error(`clip-production packet count must match source segments: expected=${sourceSegmentCollection.items.length}:actual=${packetCollection.items.length}`);
+			}
+			const packets = packetCollection.items.map((item, index) => {
+				if (!isRecord(item.value) || typeof item.value.text !== "string") {
+					throw new Error(`packets[${index}] must contain the typed Agent result text`);
+				}
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(item.value.text);
+				} catch (error: unknown) {
+					throw new Error(`packets[${index}] is not valid packet JSON: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				const sourceSegment = sourceSegmentCollection.items[index]?.value;
+				const packet = verifyClipProductionPacketSourceBinding(
+					parsed, sourceSegment,
+				);
+				if (packet.clipId !== item.itemId) {
+					throw new Error(`packets[${index}] Agent result item identity differs from packet clipId`);
+				}
+				return packet;
+			});
+			const projection = projectClipProductionPackets({
+				executionId: context.executionId,
+				nodeId: context.node.id,
+				packets,
+				sourceSegmentCollection,
+				chapterAssets: firstInput(context.inputs, "chapter-assets"),
+			});
+			return output({
+				node: context.node,
+				executorRef,
+				ports: {
+					"clip-production": projection.clipProductionCollection,
+					"asset-intents": projection.assetIntentCollection,
+				},
+				artifacts: [
+					{
+						type: CLIP_PRODUCTION_PACKET_COLLECTION_ARTIFACT_TYPE,
+						identity: projection.clipProductionCollection.collectionId,
+						value: projection.clipProductionCollection,
+					},
+					{
+						type: CLIP_PRODUCTION_ASSET_INTENTS_ARTIFACT_TYPE,
+						identity: projection.assetIntentCollection.collectionId,
+						value: projection.assetIntentCollection,
+					},
+				],
+				evidence: {
+					packetCollectionId: packetCollection.collectionId,
+					clipSegmentCollectionId: sourceSegmentCollection.collectionId,
+					clipCount: projection.clipProductionCollection.items.length,
+					assetIntentCount: projection.assetIntentCollection.items.length,
+				},
+			});
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.clip-production.assets.project/v1") {
+		try {
+			const assetIntentCollection = firstInput(context.inputs, "asset-intents");
+			const assetItems = projectClipProductionAssetItems({
+				executionId: context.executionId,
+				nodeId: context.node.id,
+				assetIntentCollection,
+			});
+			return output({
+				node: context.node,
+				executorRef,
+				ports: { "asset-items": assetItems },
+				artifacts: [{ type: "tapcanvas.asset-plan-items/v2", identity: assetItems.collectionId, value: assetItems }],
+				evidence: { itemCount: assetItems.items.length, sourceCollectionId: isWorkflowCollection(assetIntentCollection) ? assetIntentCollection.collectionId : null },
+			});
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.clip-production.nodes.materialize/v1") {
+		try {
+			const deliveryContract = firstInput(context.inputs, "delivery-contract");
+			const contract = isRecord(deliveryContract) ? deliveryContract : null;
+			const generation = contract && isRecord(contract.generationContract) ? contract.generationContract : null;
+			const imageGeneration = contract && isRecord(contract.imageGenerationContract) ? contract.imageGenerationContract : null;
+			const videoModelKey = generation ? readString(generation, "videoModel") : "";
+			const videoResolution = generation ? readString(generation, "resolution") : "";
+			const videoAspectRatio = generation ? readString(generation, "aspectRatio") : "";
+			const imageModelKey = imageGeneration ? readString(imageGeneration, "modelKey") : "";
+			const imageAspectRatio = imageGeneration ? readString(imageGeneration, "aspectRatio") : "";
+			const imageSize = imageGeneration ? readString(imageGeneration, "size") : "";
+			const imageQuality = imageGeneration ? readString(imageGeneration, "quality") : "";
+			if (!videoModelKey || !videoResolution || !videoAspectRatio) {
+				throw new Error("Clip node planning requires frozen video model specifications");
+			}
+			const projected = projectClipProductionNodePlan({
+				executionId: context.executionId, executionFamilyId: context.executionFamilyId,
+				nodeId: context.node.id, workflowKey: context.workflowKey,
+				clipProductionCollection: firstInput(context.inputs, "clip-production"),
+				assetIntentCollection: firstInput(context.inputs, "asset-intents"),
+				deliveryContract,
+				stylePrompt: runtimeProjectContext(context)?.visualStyle?.styleLock?.stylePrompt ?? null,
+			});
+			for (const planned of projected.nodePlan.imageNodes) {
+				if (planned.assetItem.imageSource.mode === "generate" && (!imageModelKey || planned.assetItem.modelKey !== imageModelKey
+					|| (imageAspectRatio && planned.assetItem.aspectRatio !== imageAspectRatio)
+					|| (imageSize && planned.assetItem.size !== imageSize))) {
+					throw new Error(`Image asset ${planned.assetItem.effectAssetId} differs from frozen user image preference`);
+				}
+			}
+			if (!dependencies.materializeClipProductionNodes) throw new Error("Clip node materialization dependency is unavailable");
+			const delivery = workflowDeliveryScope(context.flowVersionData);
+			const projectContext = runtimeProjectContext(context);
+			const persisted = await dependencies.materializeClipProductionNodes({
+				executionId: context.executionId, executionFamilyId: context.executionFamilyId,
+				runtimeNodeId: context.node.id, ownerId: context.ownerId,
+				flowId: delivery?.flowId ?? context.flowId, chapterId: delivery?.chapterId ?? null,
+				nodePlan: projected.nodePlan, videoModelKey, videoResolution, videoAspectRatio,
+				imageModelKey, imageAspectRatio, imageSize, imageQuality,
+				...(generation && readString(generation, "size") ? { videoSize: readString(generation, "size") } : {}),
+				stylePrompt: projectContext?.visualStyle?.styleLock?.stylePrompt ?? null,
+				styleFingerprint: projectContext?.visualStyle?.styleFingerprint ?? null,
+				styleReferenceImages: projectContext?.visualStyle?.referenceImages,
+			});
+			if (persisted.imageNodeIds.length !== projected.nodePlan.imageNodes.length
+				|| persisted.videoNodeIds.length !== projected.nodePlan.videoNodes.length) {
+				throw new Error("Persisted Clip node receipt does not cover the frozen node plan");
+			}
+			// Diagrams are optional; their failure cannot invalidate already persisted media nodes.
+			const stagingDiagrams = await projectOptionalClipStagingDiagrams(
+				dependencies.materializeClipStagingDiagrams
+					? () => dependencies.materializeClipStagingDiagrams!({
+					executionId: context.executionId, executionFamilyId: context.executionFamilyId,
+					runtimeNodeId: context.node.id, ownerId: context.ownerId,
+					flowId: delivery?.flowId ?? context.flowId, chapterId: delivery?.chapterId ?? null,
+					packets: projected.mediaItems.items.map((item) => item.value.packet),
+					}) : undefined,
+				{ executionId: context.executionId, runtimeNodeId: context.node.id },
+			);
+			const expectedDelivery = { artifactType: "tapcanvas.video-node/v1", requirements: ["all_clip_nodes_persisted", "prompts_persisted", "image_dependencies_persisted"] };
+			const deliveryEvidence = { clipCount: persisted.videoNodeIds.length, imageCount: persisted.imageNodeIds.length,
+				videoNodeIds: persisted.videoNodeIds, imageNodeIds: persisted.imageNodeIds, edgeIds: persisted.edgeIds,
+				stagingDiagramNodeIds: stagingDiagrams.nodeIds, stagingDiagramStatus: stagingDiagrams.status,
+				stagingDiagramDiagnostics: stagingDiagrams.diagnostics };
+			const deliveryVerification = { version: 2, status: "satisfied", verifiedBy: "clip_node_canvas_readback", scope: "planned_nodes_only" };
+			const preparedNodes = createWorkflowCollection({
+				collectionId: projected.preparedNodes.collectionId,
+				producerNodeId: context.node.id,
+				producerPortId: "prepared-nodes",
+				itemIds: projected.preparedNodes.items.map((item) => item.itemId),
+				values: projected.preparedNodes.items.map((item) => {
+					const video = projected.nodePlan.videoNodes.find((candidate) => candidate.clipId === item.itemId);
+					if (!video || item.value.nodeId !== video.nodeId || !persisted.videoNodeIds.includes(video.nodeId)) {
+						throw new Error(`Clip ${item.itemId} has no verified persisted video node`);
+					}
+					return { ...item.value, expectedDelivery,
+						deliveryEvidence: { clipId: video.clipId, nodeId: video.nodeId,
+							prompt: video.prompt, referenceImageNodeIds: video.referenceImageNodeIds,
+							firstFrameImageNodeId: video.firstFrameImageNodeId },
+						deliveryVerification };
+				}),
+				parentLineage: projected.preparedNodes.items.map((item) => item.lineage),
+			});
+			return output({ node: context.node, executorRef,
+				ports: { "node-plan": projected.nodePlan, "media-items": projected.mediaItems,
+					"prepared-nodes": preparedNodes,
+					"prompt-package": { ...projected.promptPackage, planningState: "canvas_nodes_verified",
+						expectedDelivery, deliveryEvidence, deliveryVerification } },
+				artifacts: [{ type: "tapcanvas.clip-production-node-plan/v1", identity: context.executionId,
+					value: { ...projected.nodePlan, expectedDelivery, deliveryEvidence, deliveryVerification } }],
+				evidence: { expectedDelivery, deliveryEvidence, deliveryVerification },
+			});
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.chapter-assets.preview/v1") {
+		try {
+			const deliveryContract = firstInput(context.inputs, "delivery-contract");
+			const contract = isRecord(deliveryContract) ? deliveryContract : null;
+			const generation = contract && isRecord(contract.generationContract) ? contract.generationContract : null;
+			const imageGeneration = contract && isRecord(contract.imageGenerationContract) ? contract.imageGenerationContract : null;
+			const imageModelKey = imageGeneration ? readString(imageGeneration, "modelKey") : "";
+			const imageAspectRatio = imageGeneration ? readString(imageGeneration, "aspectRatio") : "";
+			const imageSize = imageGeneration ? readString(imageGeneration, "size") : "";
+			if (!imageModelKey || !imageAspectRatio || !imageSize) {
+				throw new Error("Chapter asset preview requires the frozen image model, aspect ratio and size");
+			}
+			const delivery = workflowDeliveryScope(context.flowVersionData);
+			const assetItems = projectChapterAssetPreviewItems({
+				executionId: context.executionId,
+				nodeId: context.node.id,
+				chapterAssets: firstInput(context.inputs, "chapter-assets"),
+				projectId: delivery?.projectId ?? context.projectId ?? "",
+				imageModelKey, imageAspectRatio, imageSize,
+			});
+			const imageNodes = assetItems.items.map((item) => ({
+				nodeId: workflowImageEffectIdentity({
+					executionFamilyId: context.executionFamilyId,
+					runtimeNodeId: context.node.id,
+					assetIdentity: { assetId: item.value.effectAssetId, generationSpecVersion: item.value.generationSpecVersion },
+				}).canvasNodeId,
+				assetItem: item.value,
+			}));
+			if (imageNodes.length > 0) {
+				if (!dependencies.materializeClipProductionNodes) throw new Error("Clip node materialization dependency is unavailable");
+				const projectContext = runtimeProjectContext(context);
+				const persisted = await dependencies.materializeClipProductionNodes({
+					executionId: context.executionId, executionFamilyId: context.executionFamilyId,
+					runtimeNodeId: context.node.id, ownerId: context.ownerId,
+					flowId: delivery?.flowId ?? context.flowId, chapterId: delivery?.chapterId ?? null,
+					nodePlan: { protocolVersion: "tapcanvas.clip-production-node-plan/v1", executionId: context.executionId,
+						workflowKey: context.workflowKey ?? "", imageNodes, videoNodes: [] },
+					videoModelKey: generation ? readString(generation, "videoModel") : "",
+					videoResolution: generation ? readString(generation, "resolution") : "",
+					videoAspectRatio: generation ? readString(generation, "aspectRatio") : "",
+					imageModelKey, imageAspectRatio, imageSize,
+					imageQuality: imageGeneration ? readString(imageGeneration, "quality") : "",
+					stylePrompt: projectContext?.visualStyle?.styleLock?.stylePrompt ?? null,
+					styleFingerprint: projectContext?.visualStyle?.styleFingerprint ?? null,
+					styleReferenceImages: projectContext?.visualStyle?.referenceImages,
+				});
+				if (persisted.imageNodeIds.length !== imageNodes.length) {
+					throw new Error("Persisted chapter asset cards do not cover the frozen asset plan");
+				}
+			}
+			return output({
+				node: context.node,
+				executorRef,
+				ports: { "asset-items": assetItems },
+				artifacts: [{ type: "tapcanvas.asset-plan-items/v2", identity: assetItems.collectionId, value: assetItems }],
+				evidence: { itemCount: assetItems.items.length, canvasNodeIds: imageNodes.map((node) => node.nodeId) },
+			});
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.clip-production.media.project/v1") {
+		try {
+			const projected = projectClipProductionMediaItem({ executionId: context.executionId, nodeId: context.node.id,
+				mediaItem: firstInput(context.inputs, "media-item") });
+			return output({ node: context.node, executorRef,
+				ports: { "clip-production": projected.clipProductionCollection,
+					"asset-items": projected.assetItems, "prepared-nodes": projected.preparedNodes },
+				evidence: { clipId: projected.clipProductionCollection.items[0]?.itemId,
+					assetCount: projected.assetItems.items.length } });
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.clip-production.project/v1") {
+		try {
+			const promptPackage = projectClipProductionPromptPackage({
+				executionId: context.executionId,
+				workflowKey: context.workflowKey,
+				clipProductionCollection: firstInput(context.inputs, "clip-production"),
+				assetBindings: firstInput(context.inputs, "asset-bindings"),
+				deliveryContract: firstInput(context.inputs, "delivery-contract"),
+				stylePrompt: runtimeProjectContext(context)?.visualStyle?.styleLock?.stylePrompt ?? null,
+			});
+			return output({
+				node: context.node,
+				executorRef,
+				ports: { "prompt-package": promptPackage },
+				artifacts: [{ type: "tapcanvas.prompt-package/v2", identity: context.executionId, value: promptPackage }],
+				evidence: {
+					deliveryEvidence: promptPackage.deliveryEvidence,
+					qualityAssessment: promptPackage.qualityAssessment,
+					deliveryVerification: promptPackage.deliveryVerification,
+					directPacketHandoff: true,
+				},
+			});
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.opening-clip.bind-ledger/v1") {
+		try {
+			const openingPrefix = bindOpeningClipPrefixToSourceLedger({
+				acceptedOpeningClip: firstInput(context.inputs, "accepted-opening-clip"),
+				deliveryContract: firstInput(context.inputs, "delivery-contract"),
+				sourceLedger: firstInput(context.inputs, "source-ledger"),
+			});
+			return output({
+				node: context.node,
+				executorRef,
+				ports: { "opening-prefix": openingPrefix },
+				artifacts: [{ type: "tapcanvas.opening-prefix/v3", identity: openingPrefix.acceptedOpeningClip.clipId, value: openingPrefix }],
+				evidence: {
+					clipId: openingPrefix.acceptedOpeningClip.clipId,
+					sourceUnitRefCount: openingPrefix.sourceUnitRefs.length,
+					sourceRangeCount: openingPrefix.acceptedOpeningClip.sourceRanges.length,
+				},
+			});
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	if (executorRef === "video.clip-design-inputs/v1" || executorRef === "video.beat-sheet.assemble/v1") {
+		try {
+			let plan = parseChapterBeatPlan(firstInput(context.inputs, "chapter-plan"));
+			const assets = parseChapterAssetPlan(firstInput(context.inputs, "chapter-assets"));
+            const sourceLedger = parseSourceUnitLedger(firstInput(context.inputs, "source-ledger"));
+			if (executorRef === "video.clip-design-inputs/v1") {
+				const values = buildClipDesignInputs(plan, assets, sourceLedger);
+				const collection = createWorkflowCollection({ collectionId: `${context.executionId}:${context.node.id}:clips`,
+					producerNodeId: context.node.id, producerPortId: "clip-design-inputs", values,
+					itemIds: values.map(value => `${plan.sourceFingerprint}:clip:${value.clipIndex}`) });
+				return output({ node: context.node, executorRef, ports: { "clip-design-inputs": collection },
+					artifacts: [{ type: "tapcanvas.clip-design-inputs/v1", identity: collection.collectionId, value: collection }],
+					evidence: { itemCount: values.length } });
+			}
+			const collection = firstInput(context.inputs, "clip-designs");
+			if (!isWorkflowCollection(collection)) throw new Error("clip-designs must be a persisted workflow collection");
+			const openingPrefix = firstInput(context.inputs, "opening-prefix");
+			let acceptedOpeningClip: unknown = null;
+			let designs = collection.items.map(item => parseClipDesign(item.value));
+			if (openingPrefix !== undefined) {
+				const splice = spliceOpeningClipPlanPrefix({ openingPrefix, chapterPlan: plan, sourceLedger });
+				if (splice.conflict) throw new Error(`Opening Clip prefix conflict: ${splice.conflict}`);
+				plan = parseChapterBeatPlan(splice.chapterPlan);
+				if (!isRecord(openingPrefix) || !isRecord(openingPrefix.acceptedOpeningClip)) {
+					throw new Error("opening-prefix must contain an acceptedOpeningClip receipt");
+				}
+				acceptedOpeningClip = openingPrefix.acceptedOpeningClip;
+			}
+			const designed = assembleDesignedBeatSheet(plan, assets, designs, sourceLedger);
+			const projectContext = runtimeProjectContext(context);
+			const knownExistingAssetIds = projectContext
+				? frozenReadyProjectImages(projectContext).map((asset) => asset.assetId)
+				: [];
+			const contract = applyWorkflowArtifactJsonObjectContract("tapcanvas.beat-sheet/v2", {
+				contractName: BEAT_SHEET_ARTIFACT_CONTRACT_NAME,
+				contractVersion: BEAT_SHEET_ARTIFACT_CONTRACT_VERSION,
+				requiredStringFields: ["protocolVersion", "sourceId", "sourceFingerprint"],
+				requiredArrayFields: ["beats", "objectRegistry", "assetPlans", "blockingPlans"],
+				allowedFields: Object.keys(designed),
+				...(knownExistingAssetIds.length > 0 ? { knownExistingAssetIds } : {}),
+			});
+			const checked = validateWorkflowAgentOutput({ rawText: JSON.stringify(designed), encoding: "json_object",
+				artifactType: "tapcanvas.beat-sheet/v2", jsonObjectContract: contract });
+			if (!checked.ok) throw new Error(`assembled BeatSheet: ${checked.errorMessage}`);
+			if (acceptedOpeningClip !== null) {
+				const finalizedBeatSheet: unknown = JSON.parse(checked.text);
+				const prefixMerge = mergeOpeningClipPrefix({
+					openingPrefix,
+					fullBeatSheet: finalizedBeatSheet,
+					sourceLedger,
+				});
+				if (prefixMerge.conflict) throw new Error(`Opening Clip prefix conflict: ${prefixMerge.conflict.message}`);
+			}
+			const artifact = { text: checked.text, ...(acceptedOpeningClip !== null ? { acceptedOpeningClip } : {}) };
+			return output({ node: context.node, executorRef, ports: { "beat-sheet": artifact },
+				artifacts: [{ type: "tapcanvas.beat-sheet/v2", identity: null, value: checked.text }],
+				evidence: { itemCount: designs.length, assembly: acceptedOpeningClip === null ? "identity_join" : "opening_prefix_splice" } });
+		} catch (error: unknown) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
 	}
 
 	if (executorRef === "workflow.collection.split/v1") {
@@ -1823,7 +3031,18 @@ async function executeRegisteredWorkflowNodeOnce(
 	}
 
 	if (executorRef === "workflow.collection.concat/v1") {
-		const inputCollections = Object.values(context.inputs).flat();
+		const atomicSpec = isRecord(context.node.data.workflowAtomicSpec) ? context.node.data.workflowAtomicSpec : null;
+		const declaredInputPorts = atomicSpec && Array.isArray(atomicSpec.inputPorts)
+			? atomicSpec.inputPorts.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+			: [];
+		if (declaredInputPorts.length === 0) {
+			return {
+				ok: false,
+				errorCode: "workflow_node_runtime_failed",
+				errorMessage: `Workflow collection concat node ${context.node.id} requires declared inputPorts to define collection order`,
+			};
+		}
+		const inputCollections = declaredInputPorts.flatMap((portId) => context.inputs[portId] ?? []);
 		if (inputCollections.length === 0 || inputCollections.some((value) => !isWorkflowCollection(value))) {
 			return {
 				ok: false,
@@ -1882,7 +3101,7 @@ async function executeRegisteredWorkflowNodeOnce(
 		});
 	}
 
-	if (executorRef === "video.beat-sheet.take/v1") {
+	if (executorRef === BEAT_SHEET_TAKE_EXECUTOR_REF) {
 		const rawCount = data.workflowBeatSheetTakeCount;
 		if (!Number.isInteger(rawCount) || Number(rawCount) < 1 || Number(rawCount) > 1_000) {
 			return {
@@ -1947,6 +3166,25 @@ async function executeRegisteredWorkflowNodeOnce(
 			...(isRecord(source) && typeof source.taskId === "string" ? { sourceTaskId: source.taskId } : {}),
 			text: JSON.stringify(selectedBeatSheet),
 			assets: isRecord(source) && Array.isArray(source.assets) ? source.assets : [],
+			// Keep the upstream author's retrieval receipts attached to the immutable
+			// BeatSheet projection.  The take node is a structural prefix operation;
+			// it must not turn a successfully read Skill/knowledge body into an
+			// untraceable, empty Clip-writer context.
+			...(isRecord(source) && isRecord(source.executionProvenance)
+				? { executionProvenance: source.executionProvenance }
+				: {}),
+			...(isRecord(source) && Array.isArray(source.executionProvenanceHistory)
+				? { executionProvenanceHistory: source.executionProvenanceHistory }
+				: {}),
+			...(isRecord(source) && isRecord(source.knowledgeCandidateSearch)
+				? { knowledgeCandidateSearch: source.knowledgeCandidateSearch }
+				: {}),
+			...(isRecord(source) && isRecord(source.promptExampleCandidateSearch)
+				? { promptExampleCandidateSearch: source.promptExampleCandidateSearch }
+				: {}),
+			...(isRecord(source) && Array.isArray(source.retrievalCandidateSets)
+				? { retrievalCandidateSets: source.retrievalCandidateSets }
+				: {}),
 			beatSheetProjection: {
 				protocolVersion: "tapcanvas.beat-sheet-projection/v1",
 				selection: "prefix",
@@ -1971,6 +3209,86 @@ async function executeRegisteredWorkflowNodeOnce(
 				requestedBeatCount: Number(rawCount),
 			},
 		});
+	}
+
+    if (executorRef === "tapcanvas.chapter-backgrounds.split/v1") {
+        try {
+            const assets = parseChapterAssetPlan(firstInput(context.inputs, "chapter-assets"));
+            const collection = blockingBackgroundPlanCollection(assets.backgroundPlans.map(item => item.plan), context.executionId, context.node.id);
+            return output({ node: context.node, executorRef, ports: { "asset-items": collection }, artifacts: [{ type: "tapcanvas.asset-plan-items/v2", identity: collection.collectionId, value: collection }], evidence: { backgroundCount: collection.items.length } });
+        } catch (error: unknown) { return workflowActionFailure(context.node, executorRef, error); }
+    }
+
+	if (executorRef === "tapcanvas.blocking-backgrounds.split/v1") {
+		try {
+			const collection = blockingBackgroundCollection(firstInput(context.inputs, "beat-sheet"), context.executionId, context.node.id);
+			return output({ node: context.node, executorRef, ports: { "asset-items": collection }, artifacts: [{ type: "tapcanvas.asset-plan-items/v2", identity: collection.collectionId, value: collection }], evidence: { backgroundCount: collection.items.length } });
+		} catch (error: unknown) {
+			return workflowActionFailure(context.node, executorRef, error);
+		}
+	}
+
+	if (executorRef === "tapcanvas.blocking-diagrams.materialize/v1") {
+		if (!dependencies.materializeBlockingDiagrams) {
+			return {
+				ok: false,
+				errorCode: "workflow_node_executor_missing",
+				errorMessage: "Workflow blocking diagram materializer dependency is unavailable",
+			};
+		}
+		const delivery = workflowDeliveryScope(context.flowVersionData);
+		try {
+			const result = await dependencies.materializeBlockingDiagrams({
+				executionId: context.executionId,
+				executionFamilyId: context.executionFamilyId,
+				runtimeNodeId: context.node.id,
+				ownerId: context.ownerId,
+				flowId: delivery?.flowId ?? context.flowId,
+				projectId: delivery?.projectId ?? context.projectId,
+				chapterId: delivery?.chapterId ?? null,
+				beatSheetArtifact: firstInput(context.inputs, "beat-sheet"),
+				backgroundBindings: firstInput(context.inputs, "background-bindings"),
+			});
+			return output({
+				node: context.node,
+				executorRef,
+				ports: { [primaryOutputPort(data, "beat-sheet")]: result.beatSheetArtifact },
+				artifacts: [{
+					type: "tapcanvas.beat-sheet/v2",
+					identity: `${context.executionId}:${context.node.id}:beat-sheet`,
+					value: result.beatSheetArtifact,
+				}],
+				evidence: {
+					blockingDiagramCount: result.bindings.length,
+					blockingDiagramNodeIds: result.bindings.map((binding) => binding.nodeId),
+					reusedBlockingDiagramCount: result.bindings.filter((binding) => binding.reused).length,
+				},
+			});
+		} catch (error: unknown) {
+			return workflowActionFailure(context.node, executorRef, error);
+		}
+	}
+
+	if (executorRef === "video.chapter-assets.prepare/v1") {
+		try {
+			const projectContext = runtimeProjectContext(context);
+			if (!projectContext) throw new Error("Chapter asset preparation requires frozen project context");
+			const collection = prepareChapterAssetCollection({
+				assets: parseChapterAssetPlan(firstInput(context.inputs, "chapter-assets")),
+				projectContext, executionId: context.executionId, nodeId: context.node.id,
+			});
+			return output({ node: context.node, executorRef, ports: { "asset-items": collection },
+				artifacts: [{ type: "tapcanvas.asset-plan-items/v2", identity: collection.collectionId, value: collection }],
+				evidence: { itemCount: collection.items.length, consumerBinding: "deferred_until_design" } });
+		} catch (error: unknown) { return workflowActionFailure(context.node, executorRef, error); }
+	}
+	if (executorRef === "video.asset-consumers.bind/v1") {
+		try {
+			const collection = bindMaterializedAssetConsumers(firstInput(context.inputs, "asset-bindings"), firstInput(context.inputs, "asset-items"));
+			return output({ node: context.node, executorRef, ports: { "asset-bindings": collection },
+				artifacts: [{ type: "tapcanvas.asset-bindings/v1", identity: collection.collectionId, value: collection }],
+				evidence: { itemCount: collection.items.length, binding: "exact_asset_identity" } });
+		} catch (error: unknown) { return workflowActionFailure(context.node, executorRef, error); }
 	}
 
 	if (executorRef === "video.asset-plans.split/v1") {
@@ -2009,8 +3327,10 @@ async function executeRegisteredWorkflowNodeOnce(
 
 	if (executorRef === "video.asset-plans.project/v1") {
 		try {
+			const beatSheet = firstInput(context.inputs, "beat-sheet");
 			const assetPlans = projectVideoAssetPlansFromBeatSheet(
-				firstInput(context.inputs, "beat-sheet"),
+				beatSheet,
+				Object.keys(reusableWorkflowAssetRoleFacts(context.inputs, runtimeProjectContext(context), resolveVideoAssetRoleAllowlist(beatSheet))),
 			);
 			return output({
 				node: context.node,
@@ -2064,7 +3384,12 @@ async function executeRegisteredWorkflowNodeOnce(
 			if (!text) {
 				return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: "Inline video workflow source text is empty" };
 			}
-			const canvasFacts: Record<string, unknown> = { sourceMode, text };
+			const authoritativeSource = freezeWorkflowAuthoritativeSource({
+				sourceId: `inline-text:${context.executionId}:${context.node.id}`,
+				sourceType: "inline_text",
+				content: text,
+			});
+			const canvasFacts: Record<string, unknown> = { sourceMode, text, authoritativeSources: [authoritativeSource] };
 			if (callConfig) canvasFacts.callConfig = callConfig;
 			return output({
 				node: context.node,
@@ -2083,11 +3408,17 @@ async function executeRegisteredWorkflowNodeOnce(
 				};
 			}
 			let acceptedTurnSource: ReturnType<typeof parseWorkflowAcceptedTurnSource>;
+			let actionableDeliverySource: ReturnType<typeof parseWorkflowActionableDeliverySource>;
 			try {
-				acceptedTurnSource = parseWorkflowAcceptedTurnSource(
-					callConfig?.[WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD],
-					context.ownerId,
-				);
+				acceptedTurnSource = workflowAcceptedTurnSourceInput(context, callConfig);
+				actionableDeliverySource = workflowActionableDeliverySourceInput(context, callConfig);
+				console.info("[workflow-source] accepted turn source resolution", {
+					executionId: context.executionId,
+					nodeId: context.node.id,
+					callConfigKeys: callConfig ? Object.keys(callConfig) : [],
+					accepted: Boolean(acceptedTurnSource),
+					actionableDelivery: Boolean(actionableDeliverySource),
+				});
 			} catch (error: unknown) {
 				return {
 					ok: false,
@@ -2098,48 +3429,13 @@ async function executeRegisteredWorkflowNodeOnce(
 			const publicCallConfig = sanitizeWorkflowCallConfig(
 				callConfig
 					? Object.fromEntries(Object.entries(callConfig).filter(
-						([field]) => field !== WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD,
+						([field]) => field !== WORKFLOW_ACCEPTED_TURN_SOURCE_FIELD
+							&& field !== WORKFLOW_ACTIONABLE_DELIVERY_SOURCE_FIELD,
 					))
 					: null,
 				projectContext,
 			);
-			if (acceptedTurnSource && !delivery?.chapterId) {
-				const sourceFlowId = delivery?.flowId ?? projectContext.canvasId;
-				const authoritativeSource = {
-					sourceId: acceptedTurnSource.sourceId,
-					content: acceptedTurnSource.text,
-					sourceFingerprint: acceptedTurnSource.fingerprint,
-				};
-				const canvasFacts = {
-					sourceMode: "public_chat_turn",
-					flowId: sourceFlowId,
-					sourceId: acceptedTurnSource.sourceId,
-					text: acceptedTurnSource.text,
-					sourceFingerprint: acceptedTurnSource.fingerprint,
-					sourceNodeIds: [],
-					nodes: [],
-					authoritativeSources: [authoritativeSource],
-					...(publicCallConfig && Object.keys(publicCallConfig).length > 0
-						? { callConfig: publicCallConfig }
-						: {}),
-				};
-				return output({
-					node: context.node,
-					executorRef,
-					ports: { "canvas-facts": canvasFacts },
-					artifacts: [{
-						type: "tapcanvas.canvas-facts/v1",
-						identity: acceptedTurnSource.sourceId,
-						value: canvasFacts,
-					}],
-					evidence: {
-						sourceMode: "public_chat_turn",
-						sourceId: acceptedTurnSource.sourceId,
-						sourceFingerprint: acceptedTurnSource.fingerprint,
-					},
-				});
-			}
-			if (!dependencies.readCanvasProjectContextFromFlow) {
+			if (!dependencies.readCanvasProjectContextFromSnapshot) {
 				return {
 					ok: false,
 					errorCode: "workflow_node_executor_missing",
@@ -2147,12 +3443,62 @@ async function executeRegisteredWorkflowNodeOnce(
 				};
 			}
 			const sourceFlowId = delivery?.flowId ?? projectContext.canvasId;
-			const facts = await dependencies.readCanvasProjectContextFromFlow({
+			const facts = await dependencies.readCanvasProjectContextFromSnapshot({
+				flowVersionData: context.flowVersionData,
 				flowId: sourceFlowId,
 				ownerId: context.ownerId,
 				projectContext,
 				chapterId: delivery?.chapterId ?? null,
+				allowNoTextSource: Boolean(acceptedTurnSource || actionableDeliverySource),
+				acceptedTurnSource,
+				actionableDeliverySource,
 			});
+			let referenceVideoAnalyses: readonly Record<string, unknown>[] = [];
+			if (facts.referenceVideoNodeIds && facts.referenceVideoNodeIds.length > 0) {
+				if (!dependencies.invokeTool) {
+					return {
+						ok: false,
+						errorCode: "workflow_node_executor_missing",
+						errorMessage: "Reference video analysis requires the TapCanvas tool bridge",
+					};
+				}
+				const analysisPrompt =
+					"请逐秒拆解这段参考视频，输出可执行的复刻事实：镜头边界与景别、主体身份与位置、动作因果和受力、场景背景与空间关系、运镜、光线材质、剪辑/蒙太奇节奏、逐字对白与声音事件。只记录视频中确实出现的内容，不补写未观察到的剧情。";
+				const analysisResults: Record<string, unknown>[] = [];
+				for (const videoNodeId of facts.referenceVideoNodeIds) {
+					const result = await dependencies.invokeTool({
+						executionId: context.executionId,
+						nodeId: context.node.id,
+						ownerId: context.ownerId,
+						projectId: delivery?.projectId ?? context.projectId,
+						flowId: sourceFlowId,
+						chapterId: delivery?.chapterId ?? null,
+						toolName: "tapcanvas_analyze_video",
+						args: { nodeId: videoNodeId, fps: 5, prompt: analysisPrompt },
+					});
+					const data = result.data ?? {};
+					const text = typeof data.text === "string" && data.text.trim()
+						? data.text.trim()
+						: result.content.trim();
+					if (!text) {
+						return {
+							ok: false,
+							errorCode: "workflow_node_runtime_failed",
+							errorMessage: `Reference video analysis returned no text for node ${videoNodeId}`,
+						};
+					}
+					analysisResults.push({
+						nodeId: videoNodeId,
+						text,
+						...(typeof data.model === "string" ? { model: data.model } : {}),
+						...(typeof data.fps === "number" ? { fps: data.fps } : {}),
+						...(typeof data.analysisHash === "string" ? { analysisHash: data.analysisHash } : {}),
+						...(typeof data.promptHash === "string" ? { promptHash: data.promptHash } : {}),
+						...(typeof data.segmentCount === "number" ? { segmentCount: data.segmentCount } : {}),
+					});
+				}
+				referenceVideoAnalyses = analysisResults;
+			}
 			const userRequest = acceptedTurnSource
 				? {
 					kind: "public_chat_turn" as const,
@@ -2163,6 +3509,7 @@ async function executeRegisteredWorkflowNodeOnce(
 				: null;
 			const canvasFacts = {
 				...facts,
+				...(referenceVideoAnalyses.length > 0 ? { referenceVideoAnalyses } : {}),
 				...(userRequest ? { userRequest } : {}),
 				...(publicCallConfig && Object.keys(publicCallConfig).length > 0
 					? { callConfig: publicCallConfig }
@@ -2176,8 +3523,11 @@ async function executeRegisteredWorkflowNodeOnce(
 				evidence: {
 					sourceMode,
 					sourceFlowId,
+					sourceReadBoundary: "acceptance_snapshot",
 					sourceNodeIds: facts.sourceNodeIds,
 					sourceNodeCount: facts.nodes.length,
+					selectedNodeFactCount: facts.selectedNodeFacts?.length ?? 0,
+					missingSelectedNodeIds: facts.missingSelectedNodeIds ?? [],
 				},
 			});
 		}
@@ -2245,7 +3595,11 @@ async function executeRegisteredWorkflowNodeOnce(
 			// 本节点据此冻结本次的显式目标时长与视频模型。
 			// 未显式指定总时长时，只冻结模型的合法单 Clip 窗口，
 			// 由 BeatSheet Agent 根据完整来源自主决定 Clip 数与总时长。
-			const canvasFacts = firstInput(context.inputs, "canvas-facts");
+			const rawCanvasFacts = firstInput(context.inputs, "canvas-facts");
+			const canvasFacts = applyExpandedSourceToCanvasFacts(
+				rawCanvasFacts,
+				firstInput(context.inputs, "expanded-source"),
+			);
 			const callConfig = isRecord(canvasFacts) && isRecord(canvasFacts.callConfig)
 				? canvasFacts.callConfig
 				: null;
@@ -2255,6 +3609,19 @@ async function executeRegisteredWorkflowNodeOnce(
 			const callModelKey = callConfig && typeof callConfig.videoModelKey === "string"
 				? callConfig.videoModelKey.trim()
 				: "";
+			const explicitImageModelKey = callConfig && typeof callConfig.imageModelKey === "string"
+				? callConfig.imageModelKey.trim()
+				: "";
+			const frozenImageConfigurations = frozenWorkflowImageConfigurations(context.flowVersionData);
+			if (frozenImageConfigurations.length > 1) throw new Error("Workflow snapshot contains conflicting image model configurations");
+			const frozenImage = frozenImageConfigurations[0];
+			const callImageModelKey = explicitImageModelKey || frozenImage?.modelKey || "";
+			const callImageAspectRatio = callConfig ? readString(callConfig, "imageAspectRatio") : "";
+			const callImageSize = callConfig ? readString(callConfig, "imageSize") : "";
+			const callImageQuality = callConfig && Object.hasOwn(callConfig, "imageQuality")
+				? readString(callConfig, "imageQuality") : frozenImage?.quality ?? "";
+			const imageAspectRatio = callImageAspectRatio || frozenImage?.aspectRatio || "";
+			const imageSize = callImageSize || frozenImage?.size || "";
 			const targetDurationSeconds = Number.isInteger(callDuration) && (callDuration as number) > 0
 				? callDuration as number
 				: null;
@@ -2349,40 +3716,65 @@ async function executeRegisteredWorkflowNodeOnce(
 						...(requestedClipDurations ? { explicitDurations: requestedClipDurations } : {}),
 					});
 			}
-			// 按次注入参数（triggerPayload.resolution/aspectRatio）的目录校验：
-			// 目录外参数显式失败，避免把非法参数漏给供应商后再收到晦涩报错。
-			const callResolution = callConfig && typeof callConfig.resolution === "string"
-				? callConfig.resolution.trim()
-				: "";
-			const callAspectRatio = callConfig && typeof callConfig.aspectRatio === "string"
-				? callConfig.aspectRatio.trim()
-				: "";
-			if ((callResolution || callAspectRatio) && dependencies.resolveVideoMediaOptions) {
+			// Trigger payload fields have one canonical public spelling. Freeze them
+			// into the provider contract fields here; do not read prompt-model aliases
+			// from callConfig, since those names are not part of the trigger contract.
+			const callResolution = callConfig ? readString(callConfig, "videoResolution") : "";
+			const callAspectRatio = callConfig ? readString(callConfig, "videoAspectRatio") : "";
+			const callSize = callConfig ? readString(callConfig, "videoSize") : "";
+			const frozenResolution = callResolution || readString(data, "workflowVideoResolution");
+			const frozenAspectRatio = callAspectRatio || readString(data, "workflowVideoAspectRatio");
+			const frozenSize = callSize || readString(data, "workflowVideoSize");
+			if (dependencies.resolveVideoMediaOptions) {
 				const mediaOptions = await dependencies.resolveVideoMediaOptions({
 					executionId: context.executionId,
 					runtimeNodeId: context.node.id,
 					ownerId: context.ownerId,
 					modelKey,
 				});
-				if (callResolution && !mediaOptions.resolutionOptions.includes(callResolution)) {
+				durationPlan = {
+					...durationPlan,
+					maxReferenceImages: mediaOptions.maxReferenceImages ?? null,
+					supportsTextToVideo: mediaOptions.supportsTextToVideo ?? null,
+					supportsReferenceImages: mediaOptions.supportsReferenceImages ?? null,
+					supportsFirstLastFrame: mediaOptions.supportsFirstLastFrame ?? null,
+				};
+				if (frozenResolution && !mediaOptions.resolutionOptions.includes(frozenResolution)) {
 					throw new Error(
-						`Video model ${modelKey} does not support resolution ${callResolution}; supported: ${mediaOptions.resolutionOptions.join("/")}`,
+						`Video model ${modelKey} does not support resolution ${frozenResolution}; supported: ${mediaOptions.resolutionOptions.join("/")}`,
 					);
 				}
-				if (callAspectRatio && !mediaOptions.aspectRatioOptions.includes(callAspectRatio)) {
+				if (frozenAspectRatio && !mediaOptions.aspectRatioOptions.includes(frozenAspectRatio)) {
 					throw new Error(
-						`Video model ${modelKey} does not support aspectRatio ${callAspectRatio}; supported: ${mediaOptions.aspectRatioOptions.join("/")}`,
+						`Video model ${modelKey} does not support aspectRatio ${frozenAspectRatio}; supported: ${mediaOptions.aspectRatioOptions.join("/")}`,
 					);
 				}
 			}
-			const contract = buildVideoDeliveryContract({
+			const baseContract = buildVideoDeliveryContract({
+        onlyVideoNodes: callConfig?.onlyVideoNodes === true,
 				executionId: context.executionId,
 				workflowKey: context.workflowKey,
 				executionScope: data.workflowExecutionScope,
-				canvasFacts: firstInput(context.inputs, "canvas-facts"),
+				canvasFacts,
 				durationPlan,
 				requestedClipCount,
 			});
+			const baseGenerationContract = isRecord(baseContract.generationContract)
+				? baseContract.generationContract
+				: null;
+			if (!baseGenerationContract) throw new Error("Video delivery contract did not freeze a generation contract");
+			const contract = {
+				...baseContract,
+				...(callImageModelKey ? { imageGenerationContract: {
+					modelKey: callImageModelKey, aspectRatio: imageAspectRatio, size: imageSize, quality: callImageQuality,
+				} } : {}),
+				generationContract: {
+					...baseGenerationContract,
+					...(frozenResolution ? { resolution: frozenResolution } : {}),
+					...(frozenAspectRatio ? { aspectRatio: frozenAspectRatio } : {}),
+					...(frozenSize ? { size: frozenSize } : {}),
+				},
+			};
 			return output({
 				node: context.node,
 				executorRef,
@@ -2460,6 +3852,7 @@ async function executeRegisteredWorkflowNodeOnce(
 				artifacts: [{ type: promptPackage.artifactType, identity: context.executionId, value: promptPackage }],
 				evidence: {
 					deliveryEvidence: promptPackage.deliveryEvidence,
+					qualityAssessment: promptPackage.qualityAssessment,
 					deliveryVerification: promptPackage.deliveryVerification,
 				},
 			});
@@ -2472,6 +3865,7 @@ async function executeRegisteredWorkflowNodeOnce(
 		const promptPackage = firstInput(context.inputs, "prompt-package");
 		const modelKey = readString(data, "workflowVideoModelKey");
 		const resolution = readString(data, "workflowVideoResolution");
+		const size = readString(data, "workflowVideoSize");
 		const aspectRatio = readString(data, "workflowVideoAspectRatio");
 		if (!isRecord(promptPackage) || !Array.isArray(promptPackage.clips)) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: "Video estimate requires a persisted prompt package" };
@@ -2491,26 +3885,61 @@ async function executeRegisteredWorkflowNodeOnce(
 				if (!itemId || typeof durationSeconds !== "number" || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
 					throw new Error(`Prompt package clip ${index + 1} requires itemId and positive durationSeconds`);
 				}
-				return { itemId, durationSeconds };
+				const videoInputMode: WorkflowVideoEstimateRequest["clips"][number]["videoInputMode"] = value.videoInputMode === "image_to_video" || value.videoInputMode === "reference_to_video" || value.videoInputMode === "text_to_video"
+					? value.videoInputMode
+					: undefined;
+				const referenceImageCount = Array.isArray(value.imageReferences) ? value.imageReferences.length : undefined;
+				return { itemId, durationSeconds, ...(videoInputMode ? { videoInputMode } : {}), ...(referenceImageCount !== undefined ? { referenceImageCount } : {}) };
 			});
-			const estimate = await dependencies.runVideoEstimate({
+			const referenceImageCount = promptPackage.clips.reduce((total, value) => {
+				if (!isRecord(value)) return total;
+				const structuredClip = isRecord(value.structuredClip) ? value.structuredClip : null;
+				const contracts = structuredClip && Array.isArray(structuredClip.assetObjectContracts)
+					? structuredClip.assetObjectContracts
+					: [];
+				return total + contracts.reduce((contractTotal, contractValue) => {
+					if (!isRecord(contractValue)) return contractTotal;
+					const nodeIds = Array.isArray(contractValue.referenceImageNodeIds)
+						? contractValue.referenceImageNodeIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+						: [];
+					const assetIds = Array.isArray(contractValue.referenceAssetIds)
+						? contractValue.referenceAssetIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+						: [];
+					return contractTotal + new Set([...nodeIds, ...assetIds]).size;
+				}, 0);
+			}, 0);
+			const estimateRequest: WorkflowVideoEstimateRequest = {
 				executionId: context.executionId,
 				runtimeNodeId: context.node.id,
 				ownerId: context.ownerId,
 				projectId: delivery?.projectId ?? context.projectId,
 				modelKey,
 				resolution,
+				...(size ? { size } : {}),
 				aspectRatio,
+				referenceImageCount,
 				clips,
+			};
+			const runEstimate = dependencies.runVideoEstimate;
+			const { value: estimate, repairEvidence } = await readWithImmediateDependencyRepair({
+				read: () => runEstimate(estimateRequest),
+				previousEvidence: context.resumeOutputRefs?.evidence ?? null,
 			});
 			return output({
 				node: context.node,
 				executorRef,
 				ports: { estimate },
 				artifacts: [{ type: "tapcanvas.video-estimate/v1", identity: estimate.estimateIdentity, value: estimate }],
-				evidence: { estimateIdentity: estimate.estimateIdentity, estimatedCredits: estimate.estimatedCredits },
+				evidence: { estimateIdentity: estimate.estimateIdentity, estimatedCredits: estimate.estimatedCredits, ...repairEvidence },
 			});
 		} catch (error: unknown) {
+			if (error instanceof ExternalDependencyError) {
+				return waitForReadOnlyDependency({
+					error,
+					previousEvidence: context.resumeOutputRefs?.evidence ?? null,
+					output: output({ node: context.node, executorRef, ports: {}, completed: false }).outputRefs,
+				});
+			}
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
 		}
 	}
@@ -2597,7 +4026,7 @@ async function executeRegisteredWorkflowNodeOnce(
 				executorRef,
 				ports: { "production-plan": productionPlan },
 				artifacts: [{ type: "tapcanvas.production-plan/v1", identity: productionPlan.collectionId, value: productionPlan }],
-				evidence: { itemCount: productionPlan.items.length, voiceManifest },
+				evidence: { itemCount: productionPlan.items.length, voiceManifest, diagnostics: productionPlan.diagnostics },
 			});
 		} catch (error: unknown) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
@@ -2672,6 +4101,18 @@ async function executeRegisteredWorkflowNodeOnce(
 		if (!isWorkflowCollection(videoAssets) || !isRecord(estimate) || !isRecord(promptPackage)) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: "Video concat requires collected video assets, the frozen estimate and its verified prompt package" };
 		}
+		const perClip = Array.isArray(estimate.perClip) ? estimate.perClip : [];
+        const frozenItems = perClip.map(item => {
+            if (!isRecord(item) || typeof item.itemId !== "string" || typeof item.durationSeconds !== "number") {
+                throw new Error("Video concat requires frozen item identities and durations");
+            }
+            return { itemId: item.itemId, durationSeconds: item.durationSeconds };
+        });
+        const coverage = mediaDeliveryCoverage(frozenItems, videoAssets.items.map(item => item.itemId),
+            readMediaDeliveryPolicy(data) !== null);
+        const targetDurationSeconds = coverage.deliveredDurationSeconds;
+        const deliveredById = new Map(videoAssets.items.map(item => [item.itemId, item]));
+        const orderedItems = coverage.completedItemIds.map(id => deliveredById.get(id)!);
 		const promptPackageEvidence = isRecord(promptPackage.deliveryEvidence)
 			? promptPackage.deliveryEvidence
 			: null;
@@ -2686,26 +4127,97 @@ async function executeRegisteredWorkflowNodeOnce(
 				errorMessage: `Video concat requires structurally valid prompt package provenance: ${promptPackageAdmission.issues.join("; ")}`,
 			};
 		}
-		const videoUrls = videoAssets.items.map((item) => persistentHttpUrl(item.value));
+		const videoUrls = orderedItems.map((item) => persistentHttpUrl(item.value));
 		if (videoUrls.some((url) => url === null)) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: "Video concat received an item without a persistent HTTP(S) video URL" };
+		}
+		const persistentVideoUrls = videoUrls.filter((url): url is string => url !== null);
+		const mediaWorkerEnabled = isMediaWorkerEnabled();
+		if (mediaWorkerEnabled) {
+			const mediaProbeResults = await probeWorkflowVideoUrls(persistentVideoUrls);
+			const previousMediaReadinessPolls = typeof context.resumeOutputRefs?.evidence.mediaReadinessPolls === "number"
+				&& Number.isInteger(context.resumeOutputRefs.evidence.mediaReadinessPolls)
+				&& context.resumeOutputRefs.evidence.mediaReadinessPolls >= 0
+				? context.resumeOutputRefs.evidence.mediaReadinessPolls
+				: 0;
+			if (mediaProbeResults.some((probe) => probe === null)) {
+				const mediaReadinessPolls = previousMediaReadinessPolls + 1;
+				if (mediaReadinessPolls >= WORKFLOW_MEDIA_READINESS_MAX_POLLS) {
+					return {
+						ok: false,
+						errorCode: "workflow_node_runtime_failed",
+						errorMessage: `Video concat inputs stayed undecodable after ${WORKFLOW_MEDIA_READINESS_MAX_POLLS} readiness polls`,
+						outputRefs: output({
+							node: context.node,
+							executorRef,
+							ports: {},
+							evidence: {
+								executorCompleted: false,
+								mediaReadiness: "failed",
+								mediaReadinessPolls,
+							},
+						}).outputRefs,
+					};
+				}
+				console.warn("[workflow-video-readiness] waiting before concat", {
+					executionId: context.executionId,
+					nodeId: context.node.id,
+					clipCount: videoUrls.length,
+					mediaReadinessPolls,
+				});
+				const pending = output({
+					node: context.node,
+					executorRef,
+					ports: {},
+					evidence: {
+						executorCompleted: false,
+						mediaReadiness: "waiting",
+						mediaReadinessPolls,
+					},
+				});
+				if (!pending.ok) return pending;
+				return workflowNodeWaiting(
+					pending.outputRefs,
+					workflowExternalPollAfter(WORKFLOW_PROVIDER_STATUS_POLL_MS),
+				);
+			}
+		}
+		const styleFingerprints = uniqueStrings(orderedItems.flatMap((item) => {
+			if (!isRecord(item.value)) return [];
+			const fingerprint = readString(item.value, "styleFingerprint");
+			return fingerprint ? [fingerprint] : [];
+		}));
+		if (styleFingerprints.length > 1) {
+			return {
+				ok: false,
+				errorCode: "workflow_node_runtime_failed",
+				errorMessage: `Video concat received clips with conflicting project style fingerprints: ${JSON.stringify(styleFingerprints)}`,
+			};
+		}
+		const expectedStyleFingerprint = runtimeProjectContext(context)?.visualStyle?.styleFingerprint ?? null;
+		if (expectedStyleFingerprint) {
+			const unboundStyleClip = orderedItems.some((item) => (
+				!isRecord(item.value) || readString(item.value, "styleFingerprint") !== expectedStyleFingerprint
+			));
+			if (unboundStyleClip) {
+				return {
+					ok: false,
+					errorCode: "workflow_node_runtime_failed",
+					errorMessage: `Video concat requires every clip to carry the frozen project style fingerprint ${expectedStyleFingerprint}`,
+				};
+			}
 		}
 		const aspectRatio = readString(estimate, "aspectRatio");
 		const resolution = readString(estimate, "resolution");
 		if (!aspectRatio || !resolution) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: "Video concat estimate is missing aspectRatio or resolution" };
 		}
-		const sourceNodeIds = uniqueStrings(videoAssets.items.flatMap((item) => {
+		const sourceNodeIds = uniqueStrings(orderedItems.flatMap((item) => {
 			const value = isRecord(item.value) ? item.value : null;
 			const id = value ? readString(value, "nodeId") : "";
 			return id ? [id] : [];
 		}));
-		const perClip = Array.isArray(estimate.perClip) ? estimate.perClip : [];
-		const durationValues = perClip.map((item) => isRecord(item) ? item.durationSeconds : null);
-		const targetDurationSeconds = durationValues.length > 0
-			&& durationValues.every((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
-			? durationValues.reduce((sum, value) => sum + value, 0)
-			: null;
+
 		if (!dependencies.runVideoConcat) {
 			return { ok: false, errorCode: "workflow_node_executor_missing", errorMessage: "Workflow video concat runner dependency is unavailable" };
 		}
@@ -2718,7 +4230,7 @@ async function executeRegisteredWorkflowNodeOnce(
 				flowId: delivery?.flowId ?? context.flowId,
 				projectId: context.projectId,
 				chapterId: delivery?.chapterId ?? null,
-				videoUrls: videoUrls.filter((url): url is string => url !== null),
+				videoUrls: persistentVideoUrls,
 				sourceNodeIds,
 				aspectRatio,
 				resolution,
@@ -2735,9 +4247,11 @@ async function executeRegisteredWorkflowNodeOnce(
 					assetId: concatenated.assetId,
 					clipCount: concatenated.clipCount,
 					targetDurationSeconds,
+					deliveryCoverage: coverage,
 					aspectRatio,
 					sourceNodeIds,
 					...(concatenated.concatPolicy ? { concatPolicy: concatenated.concatPolicy } : {}),
+					...(concatenated.mediaProbeEvidence ? { mediaProbeEvidence: concatenated.mediaProbeEvidence } : {}),
 				});
 			}
 			return output({
@@ -2745,10 +4259,12 @@ async function executeRegisteredWorkflowNodeOnce(
 				executorRef,
 				ports: {
 					"master-video": {
+						deliveryCoverage: coverage,
 						videoUrl: concatenated.videoUrl,
 						assetId: concatenated.assetId,
 						clipCount: concatenated.clipCount,
 						targetDurationSeconds,
+						mediaProbeEvidence: concatenated.mediaProbeEvidence ?? null,
 						promptPackageEvidence,
 						promptPackageVerification,
 					},
@@ -2773,15 +4289,32 @@ async function executeRegisteredWorkflowNodeOnce(
 
 	if (executorRef === "tapcanvas.image.generate/v1") {
 		let referenceAssetBindings: readonly WorkflowImageReferenceAssetBinding[];
+		const assetPlanInput = firstInput(context.inputs, "asset-items");
+		const isClipProductionAsset = isRecord(assetPlanInput)
+			&& assetPlanInput.protocolVersion === "tapcanvas.clip-production-asset-item/v1";
+		const clipImageSource = isClipProductionAsset && isRecord(assetPlanInput.imageSource)
+			? assetPlanInput.imageSource : null;
+		const itemGenerationSpec = isClipProductionAsset && isRecord(assetPlanInput.generationSpec)
+			? assetPlanInput.generationSpec
+			: null;
+		if (isClipProductionAsset && (!clipImageSource || (clipImageSource.mode === "generate" && !itemGenerationSpec)
+			|| (clipImageSource.mode !== "generate" && clipImageSource.mode !== "reuse"))) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: "Clip production image item requires its exact generationSpec" };
+		}
 		try {
 			referenceAssetBindings = imageReferenceAssetBindings(data);
+			const item = firstInput(context.inputs, "prompt-package") ?? firstInput(context.inputs, "asset-items");
+			if (isRecord(item) && item.referenceAssetBindings !== undefined) {
+				if (!Array.isArray(item.referenceAssetBindings)) throw new Error("Image item referenceAssetBindings must be an array");
+				referenceAssetBindings = imageReferenceAssetBindings({ workflowImageReferenceAssetBindings: [...referenceAssetBindings, ...item.referenceAssetBindings] });
+			}
 		} catch (error: unknown) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
 		}
-		const modelKey = readString(data, "workflowImageModelKey");
-		const aspectRatio = readString(data, "workflowImageAspectRatio");
-		const imageSize = readString(data, "workflowImageSize");
-		if (!modelKey || !aspectRatio || !imageSize) {
+		const modelKey = itemGenerationSpec ? readString(itemGenerationSpec, "modelKey") : readString(data, "workflowImageModelKey");
+		const aspectRatio = itemGenerationSpec ? readString(itemGenerationSpec, "aspectRatio") : readString(data, "workflowImageAspectRatio");
+		const imageSize = itemGenerationSpec ? readString(itemGenerationSpec, "size") : readString(data, "workflowImageSize");
+		if (clipImageSource?.mode !== "reuse" && (!modelKey || !aspectRatio || !imageSize)) {
 			return {
 				ok: false,
 				errorCode: "workflow_node_runtime_failed",
@@ -2792,12 +4325,29 @@ async function executeRegisteredWorkflowNodeOnce(
 		// 调用者项目资产复用：asset-coverage 在计划里声明 existingImageUrl /
 		// existingNodeId（指向调用者画布真实已就绪节点）时，本节点直接产出复用
 		// 绑定（跳过生成），binding 引用调用者画布中的源节点作为视频参考图。
-		const assetPlanInput = firstInput(context.inputs, "asset-items");
+		const assetRecord = isRecord(assetPlanInput) && assetPlanInput.asset !== undefined
+			? validateAssetRecord(assetPlanInput.asset) : null;
 		const planExistingUrl = isRecord(assetPlanInput) ? readString(assetPlanInput, "existingImageUrl") : "";
 		const planExistingNodeId = isRecord(assetPlanInput) ? readString(assetPlanInput, "existingNodeId") : "";
-		const planExistingAssetId = isRecord(assetPlanInput) ? readString(assetPlanInput, "existingAssetId") : "";
+		const adoptedAssetId = workflowMediaAdoptionAssetId(context.flowVersionData, context.node.id);
+		const declaredExistingAssetId = adoptedAssetId ?? (isRecord(assetPlanInput) ? readString(assetPlanInput, "existingAssetId") : "");
 		const planExistingProjectId = isRecord(assetPlanInput) ? readString(assetPlanInput, "existingProjectId") : "";
+		if (clipImageSource?.mode === "reuse" && (!declaredExistingAssetId || !planExistingProjectId)) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed",
+				errorMessage: "Clip reuse item requires exact existing asset and project IDs" };
+		}
 		const projectContext = runtimeProjectContext(context);
+		const assetMetadata = declaredExistingAssetId ? null : workflowImageAssetMetadata(assetPlanInput);
+		let assetMatch: WorkflowProjectAssetMatchResult | null = null;
+		if (!declaredExistingAssetId && !context.resumeOnly && !workflowMediaRetryForItem(context.flowVersionData, context.node.id)
+			&& projectContext && assetMetadata && dependencies.matchProjectAsset) {
+			try {
+				assetMatch = await dependencies.matchProjectAsset({ projectId: projectContext.projectId, executionFamilyId: context.executionFamilyId, assetMetadata,
+					prompt: isRecord(itemGenerationSpec) ? readString(itemGenerationSpec, "prompt") : isRecord(assetPlanInput) ? readString(assetPlanInput, "prompt") : "",
+					styleFingerprint: projectContext.visualStyle?.styleFingerprint ?? null });
+			} catch (error: unknown) { return workflowActionFailure(context.node, executorRef, error); }
+		}
+		const planExistingAssetId = declaredExistingAssetId || assetMatch?.assetId || "";
 		if (planExistingAssetId && (projectContext || !planExistingUrl)) {
 			if (!projectContext || !dependencies.resolveProjectAsset) {
 				return {
@@ -2820,10 +4370,48 @@ async function executeRegisteredWorkflowNodeOnce(
 					assetId: planExistingAssetId,
 					preferredKind: "image",
 					projectContext,
+					...(assetMatch?.assetVersionId ? { matchedAssetVersionId: assetMatch.assetVersionId } : {}),
+					...(assetMatch?.assetContentFingerprint ? { matchedAssetContentFingerprint: assetMatch.assetContentFingerprint } : {}),
 				});
 				// Material-library assets do not necessarily originate from a canvas node. The
 				// stable asset id remains a valid lineage identity in that case.
-				const reuseNodeId = resolved.nodeId || planExistingNodeId || planExistingAssetId;
+				const clipReuse = isClipProductionAsset ? (() => {
+					const effectAssetId = readString(assetPlanInput, "effectAssetId");
+					const generationSpecVersion = readString(assetPlanInput, "generationSpecVersion");
+					if (!effectAssetId || !generationSpecVersion || readString(assetPlanInput, "assetId") !== effectAssetId) {
+						throw new Error("Clip reuse item has inconsistent stable effect identity");
+					}
+					if (!dependencies.hydrateClipReusedImageNode) throw new Error("Clip reuse canvas hydration is unavailable");
+					const url = persistentHttpUrl(resolved.url);
+					if (!url) throw new Error(`Resolved asset ${planExistingAssetId} has no persistent HTTP(S) image URL`);
+					return dependencies.hydrateClipReusedImageNode({
+						executionId: context.executionId, executionFamilyId: context.executionFamilyId,
+						runtimeNodeId: context.node.id, ownerId: context.ownerId,
+						flowId: delivery?.flowId ?? context.flowId, chapterId: delivery?.chapterId ?? null,
+						effectAssetId, generationSpecVersion,
+						...(assetMatch?.assetId && assetMetadata ? { assetReuseKey: readString(assetMetadata, "assetReuseKey") } : {}),
+						existingAssetId: planExistingAssetId, imageUrl: url,
+					});
+				})() : null;
+				const projection = clipReuse ? null : delivery ? await projectWorkflowAssetReference({
+					executionId: context.executionId, executionFamilyId: context.executionFamilyId,
+					runtimeNodeId: context.node.id, ownerId: context.ownerId,
+					projectId: projectContext.projectId, flowId: delivery.flowId, chapterId: delivery.chapterId,
+					assetId: planExistingAssetId, itemIndex: context.runtimeItemIndex ?? 0,
+					...(isClipProductionAsset ? {
+						assetMetadata: workflowImageAssetMetadata(assetPlanInput) ?? undefined,
+					} : isRecord(assetPlanInput) && readString(assetPlanInput, "role") ? {
+						assetMetadata: {
+							label: readString(assetPlanInput, "displayName"),
+							displayName: readString(assetPlanInput, "displayName"),
+							referenceType: parseWorkflowAssetRole(readString(assetPlanInput, "role"), "Reused asset role").kind,
+							workflowObjectId: readString(assetPlanInput, "objectId"),
+						},
+					} : {}),
+					invokeTool: dependencies.invokeTool,
+				}) : null;
+				const reuseNodeId = clipReuse ? (await clipReuse).nodeId
+					: projection?.status === "success" ? projection.nodeId : resolved.nodeId || planExistingNodeId || planExistingAssetId;
 				return output({
 					node: context.node,
 					executorRef,
@@ -2843,12 +4431,22 @@ async function executeRegisteredWorkflowNodeOnce(
 						media: { protocolVersion: "workflow.media-asset/v1", kind: "image", url: resolved.url, mimeType: resolved.mimeType },
 					}],
 					evidence: {
-						canvasNodeId: resolved.nodeId,
+						canvasNodeId: reuseNodeId,
+						...(projection ? { assetReferenceProjection: projection } : {}),
 						providerStatus: "reused",
-						reused: true,
-						reuseSource: "project_asset_resolver",
+						assetOrigin: "existing_asset",
+						reuseSource: adoptedAssetId ? "explicit_media_adoption" : assetMatch?.assetId ? "agent_exact_identity" : "project_asset_resolver",
+						...(assetMatch ? { assetMatch } : {}),
+						...(adoptedAssetId ? { adoptedAssetId } : {}),
 						assetId: planExistingAssetId,
 						projectId: projectContext.projectId,
+						...(resolved.styleFingerprint ? { sourceStyleFingerprint: resolved.styleFingerprint } : {}),
+						...(projectContext.visualStyle?.styleFingerprint
+							? { targetStyleFingerprint: projectContext.visualStyle.styleFingerprint }
+							: {}),
+						...(resolved.styleFingerprint && projectContext.visualStyle?.styleFingerprint
+							? { styleTransformRequired: resolved.styleFingerprint !== projectContext.visualStyle.styleFingerprint }
+							: {}),
 					},
 				});
 			} catch (error: unknown) {
@@ -2903,7 +4501,7 @@ async function executeRegisteredWorkflowNodeOnce(
 				evidence: {
 					canvasNodeId: planExistingNodeId,
 					providerStatus: "reused",
-					reused: true,
+					assetOrigin: "existing_asset",
 					reuseSource: "caller_asset",
 					imageUrl: reuseUrl,
 					assetId: planExistingAssetId || null,
@@ -2920,7 +4518,24 @@ async function executeRegisteredWorkflowNodeOnce(
 			return { ok: false, errorCode: "workflow_node_executor_missing", errorMessage: "Workflow image runner dependency is unavailable" };
 		}
 		const previousItemRun = context.resumeOutputRefs?.itemRuns.find((run) => run.runtimeNodeId === context.node.id) ?? null;
+		const clipAssetIdentity = isClipProductionAsset
+			? {
+				assetId: readString(assetPlanInput, "effectAssetId"),
+				generationSpecVersion: readString(assetPlanInput, "generationSpecVersion"),
+			}
+			: null;
+		if (clipAssetIdentity && (!clipAssetIdentity.assetId || !clipAssetIdentity.generationSpecVersion
+			|| !isRecord(assetPlanInput) || readString(assetPlanInput, "assetId") !== clipAssetIdentity.assetId)) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: "Clip asset item has inconsistent stable effect identity" };
+		}
 		const result = await dependencies.runImage({
+			...(clipAssetIdentity ? { assetIdentity: clipAssetIdentity }
+				: assetRecord?.source.mode === "generate" ? { assetIdentity: {
+					assetId: assetRecord.assetId, generationSpecVersion: assetRecord.source.generationSpecVersion,
+				} } : {}),
+			mediaDeliveryPolicy: readMediaDeliveryPolicy(data),
+			authorizedRetry: workflowMediaRetryForItem(context.flowVersionData, context.node.id),
+			executionMode: workflowMediaExecutionMode(context),
 			executionId: context.executionId,
 			executionFamilyId: context.executionFamilyId,
 			ownerId: context.ownerId,
@@ -2934,16 +4549,23 @@ async function executeRegisteredWorkflowNodeOnce(
 			modelKey,
 			aspectRatio,
 			imageSize,
+			imageQuality: readString(data, "workflowImageQuality"),
 			referenceAssetBindings,
-			assetMetadata: workflowImageAssetMetadata(assetPlanInput),
+			assetMetadata,
+			styleReferenceImages: projectContext?.visualStyle?.referenceImages,
+			stylePrompt: projectContext?.visualStyle?.styleLock?.stylePrompt ?? null,
+			styleFingerprint: projectContext?.visualStyle?.styleFingerprint ?? null,
 			previousEvidence: previousItemRun?.evidence ?? (context.resumeOutputRefs?.evidence ?? null),
 			resumeOnly: context.resumeOnly === true,
 		});
 		const evidence = {
+			...(assetMatch ? { assetMatch } : {}),
 			canvasNodeId: result.nodeId,
 			taskId: result.taskId,
-			providerStatus: result.status,
-			...(result.status !== "failed" ? { reused: result.reused } : {}),
+			providerStatus: result.status === "waiting_external" && !result.taskId ? "submitting" : result.status === "waiting_external" && result.observationFailure ? "unknown" : result.status,
+			...(result.status === "waiting_external" && result.observationFailure ? { observationFailure: result.observationFailure } : {}),
+			assetOrigin: "workflow_generation",
+			...(result.status !== "failed" ? { taskReceiptReused: result.reused } : {}),
 		};
 		if (result.status === "waiting_external") {
 			const pending = output({ node: context.node, executorRef, ports: {}, evidence: { ...evidence, executorCompleted: false } });
@@ -2983,40 +4605,102 @@ async function executeRegisteredWorkflowNodeOnce(
 		});
 	}
 
-	if (executorRef === "tapcanvas.video.generate/v1") {
+	if (executorRef === "tapcanvas.video.generate/v1" || executorRef === "tapcanvas.video.prepare/v1") {
 		let prompt: string;
 		let structuredClip: Readonly<Record<string, unknown>> | null = null;
+		let openingSubmissionReceipt: Readonly<Record<string, unknown>> | null = null;
+		let firstFrameUrl: string | undefined;
 		let durationSeconds: number;
 		const productionPlan = firstInput(context.inputs, "production-plan");
+		const directPacketPrompt = isRecord(productionPlan)
+			&& productionPlan.promptSourceProtocol === "tapcanvas.clip-production-packets/v2";
+		const rawPromptItem = firstInput(context.inputs, "prompt");
+		const isOpeningPrompt = isRecord(rawPromptItem) && rawPromptItem.protocolVersion === OPENING_CLIP_PROMPT_PROTOCOL;
 		try {
-			if (isRecord(productionPlan)) {
-				if (data.workflowVideoReferencePolicy !== WORKFLOW_VIDEO_REFERENCE_POLICY) {
-					throw new Error(`Workflow video node ${context.node.id} requires video references to be explicitly forbidden`);
+			if (isOpeningPrompt) {
+				if (executorRef !== "tapcanvas.video.generate/v1") {
+					throw new Error("Opening Clip fast submit requires tapcanvas.video.generate/v1");
 				}
-				assertWorkflowVideoReferencePolicy(productionPlan, "production-plan");
+				if (productionPlan !== undefined) {
+					throw new Error("Opening Clip fast submit cannot depend on a full production-plan");
+				}
+				const verified = verifyOpeningClipPromptSubmission({
+					promptItem: rawPromptItem,
+					deliveryContract: firstInput(context.inputs, "delivery-contract"),
+				});
+				const accepted = verified.acceptedOpeningClip;
+				firstFrameUrl = openingFrameUrlFromImageOutput(firstInput(context.inputs, "first-frame"));
+				prompt = verified.promptItem.prompt;
+				durationSeconds = accepted.provider.durationSeconds;
+				openingSubmissionReceipt = {
+					protocolVersion: "tapcanvas.opening-clip-submission/v1",
+					clipId: accepted.clipId,
+					prompt,
+					promptHash: sha256Hex(prompt),
+					contentHash: accepted.contentHash,
+					firstFrameUrlSha256: sha256Hex(firstFrameUrl),
+					sourceId: accepted.sourceId,
+					sourceFingerprint: accepted.sourceFingerprint,
+					sourceRanges: accepted.sourceRanges,
+					provider: accepted.provider,
+				};
+				structuredClip = {
+					clipId: accepted.clipId,
+					clipIndex: 0,
+					durationSeconds,
+					sourceId: accepted.sourceId,
+					sourceFingerprint: accepted.sourceFingerprint,
+					sourceHash: accepted.sourceFingerprint,
+					sourceSpan: accepted.sourceRanges,
+					openingContentHash: accepted.contentHash,
+				};
+			} else {
+				const rawFirstFrame = firstInput(context.inputs, "first-frame");
+				if (rawFirstFrame !== undefined) firstFrameUrl = openingFrameUrlFromImageOutput(rawFirstFrame);
+				if (isRecord(productionPlan) && typeof productionPlan.firstFrameUrl === "string") {
+					firstFrameUrl = productionPlan.firstFrameUrl;
+				}
+				if (isRecord(productionPlan)) {
+					if (data.workflowVideoReferencePolicy !== WORKFLOW_VIDEO_REFERENCE_POLICY) {
+						throw new Error(`Workflow video node ${context.node.id} requires video references to be explicitly forbidden`);
+					}
+					assertWorkflowVideoReferencePolicy(productionPlan, "production-plan");
+				}
+				prompt = videoPrompt(context.inputs);
+				const structuredClipValue = videoGenerationParameter(context.inputs, data, "structuredClip", "workflowVideoStructuredClip");
+				if (isRecord(structuredClipValue) && Array.isArray(structuredClipValue.shots) && structuredClipValue.shots.length > 0) {
+					structuredClip = structuredClipValue;
+				} else if (isRecord(productionPlan) && productionPlan.promptSourceProtocol !== "tapcanvas.clip-production-packets/v2") {
+					throw new Error("Workflow video generation requires the compiled structured Clip source");
+				}
+				if (isRecord(productionPlan)
+					&& productionPlan.promptSourceProtocol === "tapcanvas.clip-production-packets/v2"
+					&& productionPlan.videoInputMode !== "image_to_video"
+					&& productionPlan.videoInputMode !== "reference_to_video"
+					&& productionPlan.videoInputMode !== "text_to_video") {
+					throw new Error("Clip packet video generation requires an explicit supported input mode");
+				}
+				durationSeconds = requiredPositiveInteger({
+					value: videoGenerationParameter(context.inputs, data, "durationSeconds", "workflowVideoDurationSeconds"),
+				}, "value");
 			}
-			prompt = videoPrompt(context.inputs);
-			const structuredClipValue = videoGenerationParameter(context.inputs, data, "structuredClip", "workflowVideoStructuredClip");
-			if (isRecord(structuredClipValue) && Array.isArray(structuredClipValue.shots) && structuredClipValue.shots.length > 0) {
-				structuredClip = structuredClipValue;
-			} else if (isRecord(productionPlan)) {
-				throw new Error("Workflow video generation requires the compiled structured Clip source");
-			}
-			durationSeconds = requiredPositiveInteger({
-				value: videoGenerationParameter(context.inputs, data, "durationSeconds", "workflowVideoDurationSeconds"),
-			}, "value");
 		} catch (error: unknown) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
 		}
 		const modelKeyValue = videoGenerationParameter(context.inputs, data, "modelKey", "workflowVideoModelKey");
 		const resolutionValue = videoGenerationParameter(context.inputs, data, "resolution", "workflowVideoResolution");
+		const sizeValue = videoGenerationParameter(context.inputs, data, "size", "workflowVideoSize");
 		const aspectRatioValue = videoGenerationParameter(context.inputs, data, "aspectRatio", "workflowVideoAspectRatio");
 		const referenceImageNodeIdsValue = videoGenerationParameter(context.inputs, data, "referenceImageNodeIds", "workflowVideoReferenceImageNodeIds");
 		const referenceAssetIdsValue = videoGenerationParameter(context.inputs, data, "referenceAssetIds", "workflowVideoReferenceAssetIds");
+		const videoInputModeValue = videoGenerationParameter(context.inputs, data, "videoInputMode", "workflowVideoInputMode");
 		const estimateIdentityValue = videoGenerationParameter(context.inputs, data, "estimateIdentity", "workflowVideoEstimateIdentity");
-		const generationContractValue = videoGenerationParameter(context.inputs, data, "generationContract", "workflowVideoGenerationContract");
+		const generationContractValue = isOpeningPrompt
+			? undefined
+			: videoGenerationParameter(context.inputs, data, "generationContract", "workflowVideoGenerationContract");
 		const modelKey = typeof modelKeyValue === "string" ? modelKeyValue.trim() : "";
 		const resolution = typeof resolutionValue === "string" ? resolutionValue.trim() : "";
+		const size = typeof sizeValue === "string" ? sizeValue.trim() : "";
 		const aspectRatio = typeof aspectRatioValue === "string" ? aspectRatioValue.trim() : "";
 		const referenceImageNodeIds = Array.isArray(referenceImageNodeIdsValue)
 			? [...new Set(referenceImageNodeIdsValue.flatMap((value) => typeof value === "string" && value.trim() ? [value.trim()] : []))]
@@ -3024,6 +4708,47 @@ async function executeRegisteredWorkflowNodeOnce(
 		const referenceAssetIds = Array.isArray(referenceAssetIdsValue)
 			? [...new Set(referenceAssetIdsValue.flatMap((value) => typeof value === "string" && value.trim() ? [value.trim()] : []))]
 			: [];
+		const packetReferenceBindings = directPacketPrompt && isRecord(productionPlan)
+			? parseClipProductionReferenceBindings(productionPlan.referenceBindings)
+			: undefined;
+		// Recovery can replay a frozen handoff produced before the plan carried
+		// materialized node IDs. The packet bindings already freeze those exact
+		// identities, so submit by them rather than by unrelated project asset IDs.
+		const submitReferenceImageNodeIds = packetReferenceBindings
+			? packetReferenceBindings.map((binding) => binding.nodeId)
+			: referenceImageNodeIds;
+		if (packetReferenceBindings && referenceImageNodeIds.length > 0
+			&& (referenceImageNodeIds.length !== submitReferenceImageNodeIds.length
+				|| referenceImageNodeIds.some((nodeId, index) => nodeId !== submitReferenceImageNodeIds[index]))) {
+			throw new Error("Clip packet handoff image node IDs differ from its frozen reference bindings");
+		}
+		const submitReferenceAssetIds = packetReferenceBindings ? [] : referenceAssetIds;
+		const packetReferenceHeader = directPacketPrompt && isRecord(productionPlan)
+			? productionPlan.referenceHeader
+			: undefined;
+		const packetSourcePrompt = directPacketPrompt && isRecord(productionPlan)
+			? productionPlan.sourcePrompt
+			: undefined;
+		if (directPacketPrompt && (typeof packetReferenceHeader !== "string" || typeof packetSourcePrompt !== "string" || !packetSourcePrompt.trim())) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed",
+				errorMessage: "Clip packet video handoff is missing its frozen reference header or source prompt" };
+		}
+		const videoInputMode = videoInputModeValue === "image_to_video" || videoInputModeValue === "reference_to_video" || videoInputModeValue === "text_to_video"
+			? videoInputModeValue
+			: undefined;
+		if (isRecord(productionPlan) && productionPlan.promptSourceProtocol === "tapcanvas.clip-production-packets/v2") {
+			const hasImageRefs = submitReferenceImageNodeIds.length + submitReferenceAssetIds.length > 0;
+			if (!videoInputMode) throw new Error("Clip packet handoff is missing its explicit videoInputMode");
+			if (videoInputMode === "image_to_video" && (!firstFrameUrl || !hasImageRefs)) {
+				throw new Error("Clip packet image_to_video requires a real firstFrameUrl and generated image reference");
+			}
+			if (videoInputMode === "reference_to_video" && (firstFrameUrl || !hasImageRefs)) {
+				throw new Error("Clip packet reference_to_video requires generated image references and must not declare firstFrameUrl");
+			}
+			if (videoInputMode === "text_to_video" && (firstFrameUrl || hasImageRefs)) {
+				throw new Error("Clip packet text_to_video cannot carry image references");
+			}
+		}
 		const estimateIdentity = typeof estimateIdentityValue === "string" ? estimateIdentityValue.trim() : "";
 		const generationContract = generationContractValue === undefined
 			? null
@@ -3050,8 +4775,18 @@ async function executeRegisteredWorkflowNodeOnce(
 			};
 		}
 		const previousItemRun = context.resumeOutputRefs?.itemRuns.find((run) => run.runtimeNodeId === context.node.id) ?? null;
+		const projectContext = runtimeProjectContext(context);
 		const delivery = workflowDeliveryScope(context.flowVersionData);
-		const result = await dependencies.runVideo({
+		const frozenClipIndex = directPacketPrompt && isRecord(productionPlan)
+			? productionPlan.clipIndex : context.runtimeItemIndex ?? 0;
+		if (!Number.isInteger(frozenClipIndex) || typeof frozenClipIndex !== "number" || frozenClipIndex < 0) {
+			return { ok: false, errorCode: "workflow_node_runtime_failed",
+				errorMessage: `Workflow video node ${context.node.id} requires a frozen non-negative Clip index` };
+		}
+		const videoRequest: WorkflowVideoRunRequest = {
+			mediaDeliveryPolicy: readMediaDeliveryPolicy(data),
+			authorizedRetry: workflowMediaRetryForItem(context.flowVersionData, context.node.id),
+			executionMode: workflowMediaExecutionMode(context),
 			executionId: context.executionId,
 			executionFamilyId: context.executionFamilyId,
 			ownerId: context.ownerId,
@@ -3059,24 +4794,53 @@ async function executeRegisteredWorkflowNodeOnce(
 			projectId: delivery?.projectId ?? context.projectId,
 			chapterId: delivery?.chapterId ?? null,
 			runtimeNodeId: context.node.id,
-			itemIndex: context.runtimeItemIndex ?? 0,
+			itemIndex: frozenClipIndex,
 			prompt,
+			...(directPacketPrompt && isRecord(productionPlan) && readString(productionPlan, "itemId")
+				? { clipId: readString(productionPlan, "itemId") } : {}),
+			...(directPacketPrompt ? { promptSourceProtocol: "tapcanvas.clip-production-packets/v2" as const } : {}),
+			...(packetReferenceBindings ? { workflowReferenceBindings: packetReferenceBindings } : {}),
+			...(typeof packetReferenceHeader === "string" ? { workflowReferenceHeader: packetReferenceHeader } : {}),
+			...(typeof packetSourcePrompt === "string" ? { workflowSourcePrompt: packetSourcePrompt } : {}),
+			...(directPacketPrompt && isRecord(productionPlan) && Array.isArray(productionPlan.speechEvents)
+				? { workflowSpeechEvents: productionPlan.speechEvents as ClipProductionSpeechEvent[] } : {}),
+			...(directPacketPrompt && isRecord(productionPlan) && isRecord(productionPlan.sourceSnapshot)
+				? { sourceSnapshot: productionPlan.sourceSnapshot } : {}),
+			...(videoInputMode ? { videoInputMode } : {}),
 			structuredClip,
 			modelKey,
 			durationSeconds,
-			resolution,
-			aspectRatio,
-			referenceImageNodeIds,
-			referenceAssetIds,
+				resolution,
+				size,
+				aspectRatio,
+			referenceImageNodeIds: submitReferenceImageNodeIds,
+			referenceAssetIds: submitReferenceAssetIds,
+			styleReferenceImages: projectContext?.visualStyle?.referenceImages,
+			stylePrompt: projectContext?.visualStyle?.styleLock?.stylePrompt ?? null,
+			styleFingerprint: projectContext?.visualStyle?.styleFingerprint ?? null,
 			estimateIdentity: estimateIdentity || null,
 			generationContract,
+			...(firstFrameUrl ? { firstFrameUrl } : {}),
 			previousEvidence: previousItemRun?.evidence ?? (context.resumeOutputRefs?.evidence ?? null),
 			resumeOnly: context.resumeOnly === true,
-		});
+		};
+
+    if (executorRef === "tapcanvas.video.prepare/v1") {
+      if (!dependencies.prepareVideo) throw new Error("Video node preparation executor is unavailable");
+      const prepared = preparedNodeDelivery(await dependencies.prepareVideo(videoRequest));
+      return output({ node: context.node, executorRef, ports: { "prepared-nodes": prepared }, artifacts: [{ type: "tapcanvas.video-node/v1", identity: prepared.nodeId, value: prepared }], evidence: { canvasNodeId: prepared.nodeId, promptPersisted: true, videoSubmitted: false } });
+    }
+    const result = await dependencies.runVideo(videoRequest);
 		const evidence = {
 			canvasNodeId: result.nodeId,
 			taskId: result.taskId,
-			providerStatus: result.status,
+			...(openingSubmissionReceipt ? { openingSubmissionReceipt } : {}),
+			providerStatus: result.status === "waiting_external" && result.observationFailure ? "unknown" : result.status,
+			...(result.status === "failed" && result.workflowSubmissionState
+				? { workflowSubmissionState: result.workflowSubmissionState }
+				: {}),
+			...(result.status === "waiting_external" && result.observationFailure ? { observationFailure: result.observationFailure } : {}),
+			...(result.providerAcceptedAt ? { providerAcceptedAt: result.providerAcceptedAt } : {}),
 			...(result.status !== "failed" ? { reused: result.reused } : {}),
 			...(result.status === "failed" && result.errorCode
 				? { providerErrorCode: result.errorCode }
@@ -3096,10 +4860,74 @@ async function executeRegisteredWorkflowNodeOnce(
 		if (result.status === "failed") {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: result.errorMessage, outputRefs: output({ node: context.node, executorRef, ports: {}, evidence }).outputRefs };
 		}
+		const mediaWorkerEnabled = isMediaWorkerEnabled();
+		const mediaProbe = mediaWorkerEnabled
+			? await probeMediaViaMediaWorker({ url: result.videoUrl })
+			: null;
+		const previousMediaReadinessPolls = typeof previousItemRun?.evidence.mediaReadinessPolls === "number"
+			&& Number.isInteger(previousItemRun.evidence.mediaReadinessPolls)
+			&& previousItemRun.evidence.mediaReadinessPolls >= 0
+			? previousItemRun.evidence.mediaReadinessPolls
+			: 0;
+		if (mediaWorkerEnabled && !mediaProbe) {
+			const mediaReadinessPolls = previousMediaReadinessPolls + 1;
+			if (mediaReadinessPolls >= WORKFLOW_MEDIA_READINESS_MAX_POLLS) {
+				return {
+					ok: false,
+					errorCode: "workflow_node_runtime_failed",
+					errorMessage: `Workflow video node ${context.node.id} media stayed undecodable after ${WORKFLOW_MEDIA_READINESS_MAX_POLLS} readiness polls`,
+					outputRefs: output({
+						node: context.node,
+						executorRef,
+						ports: {},
+						evidence: {
+							...evidence,
+							executorCompleted: false,
+							mediaReadiness: "failed",
+							mediaReadinessPolls,
+						},
+					}).outputRefs,
+				};
+			}
+			console.warn("[workflow-video-readiness] waiting for decodable provider media", {
+				executionId: context.executionId,
+				nodeId: context.node.id,
+				taskId: result.taskId,
+				videoUrl: result.videoUrl,
+				mediaReadinessPolls,
+			});
+			const pending = output({
+				node: context.node,
+				executorRef,
+				ports: {},
+				evidence: {
+					...evidence,
+					executorCompleted: false,
+					mediaReadiness: "waiting",
+					mediaReadinessPolls,
+				},
+			});
+			if (!pending.ok) return pending;
+			return workflowNodeWaiting(
+				pending.outputRefs,
+				workflowExternalPollAfter(WORKFLOW_PROVIDER_STATUS_POLL_MS),
+			);
+		}
 		return output({
 			node: context.node,
 			executorRef,
-			ports: { [primaryOutputPort(data, "video")]: { videoUrl: result.videoUrl, nodeId: result.nodeId, taskId: result.taskId } },
+			ports: {
+				[primaryOutputPort(data, "video")]: {
+                    durationSeconds,
+                    clipIndex: context.runtimeItemIndex ?? 0,
+					videoUrl: result.videoUrl,
+					nodeId: result.nodeId,
+					taskId: result.taskId,
+					...(projectContext?.visualStyle?.styleFingerprint
+						? { styleFingerprint: projectContext.visualStyle.styleFingerprint }
+						: {}),
+				},
+			},
 			artifacts: [{
 				type: "tapcanvas.video/v1",
 				identity: result.nodeId,
@@ -3112,7 +4940,7 @@ async function executeRegisteredWorkflowNodeOnce(
 					durationSeconds,
 				},
 			}],
-			evidence: { ...evidence, videoUrl: result.videoUrl, thumbnailUrl: result.thumbnailUrl },
+			evidence: { ...evidence, videoUrl: result.videoUrl, thumbnailUrl: result.thumbnailUrl, mediaReadiness: "ready" },
 		});
 	}
 
@@ -3179,13 +5007,13 @@ async function executeRegisteredWorkflowNodeOnce(
 		if (!cardId) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: `Workflow Knowledge Read node ${context.node.id} requires a card-id input` };
 		}
-		let candidateSet: WorkflowKnowledgeCandidateSetV1;
+		let candidateSet: WorkflowKnowledgeCandidateSetV2;
 		try {
-			candidateSet = parseWorkflowKnowledgeCandidateSetV1(firstInput(context.inputs, "knowledge-candidates"));
+			candidateSet = parseWorkflowKnowledgeCandidateSetV2(firstInput(context.inputs, "knowledge-candidates"));
 		} catch (error: unknown) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
 		}
-		const card = await dependencies.readKnowledge({ candidateSet, cardId });
+		const card = await dependencies.readKnowledge({ ownerId: context.ownerId, candidateSet, cardId });
 		return output({
 			node: context.node,
 			executorRef,
@@ -3215,12 +5043,14 @@ async function executeRegisteredWorkflowNodeOnce(
 		if (!toolName) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: `Workflow Tool Invocation node ${context.node.id} has no exact tool identity` };
 		}
-		let args: Record<string, unknown>;
+		let configuredArgs: Record<string, unknown>;
 		try {
-			args = toolInvocationArguments(context.inputs, data);
+			configuredArgs = toolInvocationArguments(context.inputs, data);
 		} catch (error: unknown) {
 			return { ok: false, errorCode: "workflow_node_runtime_failed", errorMessage: error instanceof Error ? error.message : String(error) };
 		}
+		const deliveryMetadata = workflowToolInvocationDeliveryMetadata(context.inputs);
+		const args = stripWorkflowToolInvocationDeliveryMetadata(configuredArgs);
 		const toolDelivery = workflowDeliveryScope(context.flowVersionData);
 		const result = await dependencies.invokeTool({
 			executionId: context.executionId,
@@ -3232,7 +5062,10 @@ async function executeRegisteredWorkflowNodeOnce(
 			toolName,
 			args,
 		});
-		const value = result.data ?? { content: result.content };
+		const rawValue = result.data ?? { content: result.content };
+		const value = Object.keys(deliveryMetadata).length > 0 && isRecord(rawValue)
+			? { ...rawValue, ...deliveryMetadata }
+			: rawValue;
 		return output({
 			node: context.node,
 			executorRef,
@@ -3451,19 +5284,38 @@ async function executeRegisteredWorkflowNodeOnce(
 		const promptExampleRetrievalScope = promptExampleMediaType === "image" || promptExampleMediaType === "video"
 			? {
 				version: 3 as const,
-				mediaType: promptExampleMediaType,
-				searchPolicy: outputArtifactType === "tapcanvas.clip-prompts/v2"
-					? "required_non_blocking" as const
-					: "agent_discretion" as const,
+				mediaType: promptExampleMediaType as "image" | "video",
+				// Declaring a media case source is the typed prompt-authoring
+				// contract. Its candidate-only lookup must not depend on the
+				// shape or version of the authored output artifact.
+				searchPolicy: "required_non_blocking" as const,
 			}
 			: null;
 		const modelKey = resolveWorkflowAgentModelKey({
 			flowVersionData: context.flowVersionData,
 			configuredModelKey,
 		});
+		// Clip authoring is the first consumer that needs both the frozen semantic
+		// contract and the materialized image branch. Join them before constructing
+		// the Agent request so exact asset declarations, provider mapping and audit
+		// evidence all see the same clip-scoped facts.
+		const workflowInputs: WorkflowInputPorts = (() => {
+			if (outputArtifactType !== "tapcanvas.clip-prompts/v2" || !context.inputs["asset-bindings"]?.length) {
+				return context.inputs;
+			}
+			const clipContext = firstInput(context.inputs, "clip-contexts");
+			const materializedAssets = firstInput(context.inputs, "asset-bindings");
+			if (clipContext === undefined || materializedAssets === undefined) return context.inputs;
+			const enriched = enrichVideoClipContextWithMaterializedAssets({
+				contextItem: clipContext,
+				materializedAssetCollection: materializedAssets,
+			});
+			return { ...context.inputs, "clip-contexts": [enriched] };
+		})();
+		const inputs = workflowInputs;
 		let assetPlanningAllowedRoles: readonly string[] = [];
 		let assetPlanningRequiredRoles: readonly string[] = [];
-		let assetPlanningReusableFacts: ReusableWorkflowAssetRoleFacts = {};
+		let assetPlanningReusableFacts: WorkflowReusableAssetRoleFacts = {};
 		let jsonArrayContract = applyWorkflowArtifactJsonArrayContract(
 			outputArtifactType,
 			parsedJsonArrayContract,
@@ -3471,12 +5323,12 @@ async function executeRegisteredWorkflowNodeOnce(
 		if (outputEncoding === "json_array" && outputArtifactType === "tapcanvas.asset-plans/v1" && jsonArrayContract) {
 			let clipIds: string[];
 			let allowedRoles: readonly string[];
-			let reusableAssetFacts: ReusableWorkflowAssetRoleFacts;
+			let reusableAssetFacts: WorkflowReusableAssetRoleFacts;
 			try {
-				clipIds = resolveFrozenClipIds(context.inputs);
-				allowedRoles = resolveVideoAssetRoleAllowlist(firstInput(context.inputs, "beat-sheet"));
+				clipIds = resolveFrozenClipIds(inputs);
+				allowedRoles = resolveVideoAssetRoleAllowlist(firstInput(inputs, "beat-sheet"));
 				reusableAssetFacts = reusableWorkflowAssetRoleFacts(
-					context.inputs,
+					inputs,
 					runtimeProjectContext(context),
 					allowedRoles,
 				);
@@ -3519,6 +5371,8 @@ async function executeRegisteredWorkflowNodeOnce(
 				"roleName",
 				"characterAssetRole",
 				"characterProfileVersion",
+				"identityBoardSpec",
+				"sceneCard",
 				"identityAnchors",
 				"prohibitedDrift",
 			] as const;
@@ -3554,17 +5408,104 @@ async function executeRegisteredWorkflowNodeOnce(
 					: {}),
 			};
 		}
+        if (outputArtifactType === "tapcanvas.clip-design/v2" && jsonObjectContract) {
+            const item = firstInput(inputs, "clip-design-inputs");
+            if (!isRecord(item) || !isRecord(item.beat) || !Array.isArray(item.objectRegistry) || !Array.isArray(item.backgroundPlans) || !Array.isArray(item.speechLedger)) {
+                throw new Error("Clip design requires one declared clip-design-inputs item");
+            }
+            const speechLineIds = item.speechLedger.map((entry: unknown) => isRecord(entry) ? entry.lineId : null);
+            const objectIds = item.objectRegistry.map((entry: unknown) => isRecord(entry) ? entry.objectId : null);
+            const sceneObjectIds = item.objectRegistry.flatMap((entry: unknown) => isRecord(entry) && entry.kind === "scene" ? [entry.objectId] : []);
+            const backgroundObjectIds = item.backgroundPlans.map((entry: unknown) => isRecord(entry) ? entry.objectId : null);
+            if (typeof item.clipIndex !== "number" || typeof item.beat.durationSeconds !== "number" || speechLineIds.some(id => typeof id !== "string") || objectIds.some(id => typeof id !== "string") || backgroundObjectIds.some(id => typeof id !== "string")) {
+                throw new Error("Clip design input has invalid frozen identity or duration");
+            }
+            jsonObjectContract = { ...jsonObjectContract, jsonSchema: bindClipDesignSchema({
+                clipIndex: item.clipIndex, durationSeconds: item.beat.durationSeconds, speechLineIds: speechLineIds as string[], objectIds: objectIds as string[], sceneObjectIds: sceneObjectIds as string[], backgroundObjectIds: backgroundObjectIds as string[],
+            }) };
+        }
+        // The outline contract is host-owned: flow versions frozen before 2026-10-06 still
+        // carry list caps that are now left to the provider.
+        if (outputArtifactType === CHAPTER_ASSET_OUTLINE_ARTIFACT_TYPE && jsonObjectContract) {
+            jsonObjectContract = { ...jsonObjectContract, jsonSchema: chapterAssetOutlineSchema,
+                allowedFields: Object.keys(chapterAssetOutlineSchema.properties as object) };
+        }
+        if (outputArtifactType === CHAPTER_ASSET_PART_ARTIFACT_TYPE && jsonObjectContract) {
+            jsonObjectContract = bindChapterAssetPartAuthoringContract(jsonObjectContract, firstInput(inputs, "asset-seed"));
+        }
+        if (outputArtifactType === "tapcanvas.source-unit-ledger/v1" && jsonObjectContract) {
+            jsonObjectContract = { ...jsonObjectContract, jsonSchema: bindSourceUnitLedgerSchema(
+                sourceUnitLedgerFacts(firstInput(inputs, "delivery-contract")),
+            ) };
+        }
+        if (outputArtifactType === "tapcanvas.chapter-beat-plan/v3" && jsonObjectContract?.jsonSchema) {
+            jsonObjectContract = { ...jsonObjectContract, jsonSchema: bindSourceAllocationSchema(
+                jsonObjectContract.jsonSchema, parseSourceUnitLedger(firstInput(inputs, "source-ledger")),
+            ) };
+        }
+		if (outputArtifactType === OPENING_CLIP_ARTIFACT_TYPE && jsonObjectContract) {
+			jsonObjectContract = bindOpeningClipAuthoringContract(
+				jsonObjectContract,
+				firstInput(inputs, "delivery-contract"),
+			);
+		}
+		if (outputArtifactType === OPENING_FRAME_PLAN_ARTIFACT_TYPE && jsonObjectContract) {
+			jsonObjectContract = bindOpeningFramePlanAuthoringContract(jsonObjectContract);
+		}
+		if (outputArtifactType === CHAPTER_SEQUENCE_ARTIFACT_TYPE && jsonObjectContract) {
+			jsonObjectContract = bindChapterScriptAuthoringContract(
+				jsonObjectContract,
+				firstInput(inputs, "delivery-contract"),
+			);
+		}
+		if (outputArtifactType === CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION && jsonObjectContract) {
+			const deliveryContract = firstInput(inputs, "delivery-contract");
+			const imageGeneration = isRecord(deliveryContract) && isRecord(deliveryContract.imageGenerationContract)
+				? deliveryContract.imageGenerationContract : null;
+			const frozenImageModelKey = imageGeneration ? readString(imageGeneration, "modelKey") : "";
+			jsonObjectContract = bindClipProductionPacketAuthoringContract(
+				jsonObjectContract,
+				firstInput(inputs, "clip-segment"),
+				resolveClipProductionInputModesFromDeliveryContract(deliveryContract),
+				frozenImageModelKey,
+				imageGeneration ? readString(imageGeneration, "aspectRatio") : "",
+				imageGeneration ? readString(imageGeneration, "size") : "",
+				firstInput(inputs, "chapter-assets"),
+				workflowDeliveryScope(context.flowVersionData)?.projectId ?? context.projectId ?? undefined,
+				firstInput(inputs, "clip-sequence"),
+			);
+		}
 		jsonObjectContract = applyWorkflowArtifactJsonObjectContract(
 			outputArtifactType,
 			jsonObjectContract,
 		);
+        const referenceContext = runtimeProjectContext(context);
+        if (jsonObjectContract?.jsonSchema && referenceContext) {
+            jsonObjectContract = { ...jsonObjectContract,
+                jsonSchema: bindRegisteredAssetReferenceSchema(jsonObjectContract.jsonSchema, referenceContext),
+            };
+        }
+		if (
+			outputEncoding === "json_object"
+			&& jsonObjectContract
+			&& (outputArtifactType === "tapcanvas.beat-sheet/v2"
+				|| outputArtifactType === "tapcanvas.launch-beat-sheet/v1"
+				|| (isRecord(jsonObjectContract.jsonSchema)
+					&& Object.hasOwn(jsonObjectContract.jsonSchema, "x-batchAssetReferenceConstraints")))
+			&& referenceContext
+		) {
+			const knownExistingAssetIds = frozenReadyProjectImages(referenceContext).map((asset) => asset.assetId);
+			if (knownExistingAssetIds.length > 0) {
+				jsonObjectContract = { ...jsonObjectContract, knownExistingAssetIds };
+			}
+		}
 		if (
 			outputEncoding === "json_object" &&
-			(outputArtifactType === "tapcanvas.beat-sheet/v2" || outputArtifactType === "tapcanvas.launch-beat-sheet/v1") &&
+			(outputArtifactType === "tapcanvas.beat-sheet/v2" || outputArtifactType === "tapcanvas.launch-beat-sheet/v1" || outputArtifactType === "tapcanvas.chapter-beat-plan/v3") &&
 			jsonObjectContract
 		) {
 			try {
-				const sourceLineage = resolveAuthoritativeSourceLineage(context.inputs);
+				const sourceLineage = resolveAuthoritativeSourceLineage(inputs);
 				jsonObjectContract = {
 					...jsonObjectContract,
 					requiredStringFields: [...new Set([
@@ -3572,10 +5513,18 @@ async function executeRegisteredWorkflowNodeOnce(
 						"sourceId",
 						"sourceFingerprint",
 					])],
-					exactStringFields: {
+						exactStringFields: {
 						...jsonObjectContract.exactStringFields,
 						...sourceLineage,
-					},
+						},
+                    ...(jsonObjectContract.jsonSchema ? { jsonSchema: {
+                        ...jsonObjectContract.jsonSchema,
+							properties: {
+							...(isRecord(jsonObjectContract.jsonSchema.properties) ? jsonObjectContract.jsonSchema.properties : {}),
+							sourceId: { type: "string", const: sourceLineage.sourceId },
+								sourceFingerprint: { type: "string", const: sourceLineage.sourceFingerprint },
+							},
+                    } } : {}),
 					allowedFields: [...new Set([
 						...jsonObjectContract.allowedFields,
 						"sourceId",
@@ -3596,7 +5545,7 @@ async function executeRegisteredWorkflowNodeOnce(
 			&& jsonObjectContract?.requiredArrayFields?.includes("clips")
 		) {
 			try {
-				const writerFacts = resolveFrozenSingleClipWriterFacts(context.inputs);
+					const writerFacts = resolveFrozenSingleClipWriterFacts(inputs);
 				if (writerFacts === null) {
 					throw new Error("Clip prompt Agent requires frozen single-Clip writer facts");
 				}
@@ -3624,10 +5573,39 @@ async function executeRegisteredWorkflowNodeOnce(
 			}
 		}
 		let maxOutputTokens: number;
+		let structuredOutputTokenBudget: number | undefined;
+		let projectContextPromptMode: "identity_only" | undefined;
+		let failurePolicy: "single_submission" | "repair_with_correction" | undefined;
+		let executionPolicy: "single_inference" | "multi_inference" | undefined;
+		let toolPolicy: "none" | "scoped" | undefined;
+		let promptMode: "compact_structured" | undefined;
+		let knowledgeRetrievalEnabled: boolean;
+		let executionInspectionEnabled: boolean;
+		const initiatingExecution = parseWorkflowInitiatingAgentExecution(context.flowVersionData);
 		let reasoningEffort: WorkflowAgentReasoningEffort | undefined;
+		let authorRepair: AuthorRevisionEvidenceV1 | null = null;
 		try {
+			const snapshotRepair = normalizeAuthorRevisionEvidence(isRecord(context.flowVersionData)
+				? context.flowVersionData.workflowResolvedAuthorRepair : undefined);
+			if (snapshotRepair?.targetNodeId === context.node.id) authorRepair = snapshotRepair;
 			maxOutputTokens = requiredAgentMaxOutputTokens(data);
-			reasoningEffort = optionalAgentReasoningEffort(data);
+			structuredOutputTokenBudget = optionalAgentStructuredOutputTokenBudget(data);
+			projectContextPromptMode = optionalAgentProjectContextPromptMode(data);
+			failurePolicy = optionalAgentFailurePolicy(data);
+			executionPolicy = optionalAgentExecutionPolicy(data);
+			toolPolicy = optionalAgentToolPolicy(data);
+			promptMode = optionalAgentPromptMode(data);
+			knowledgeRetrievalEnabled = agentKnowledgeRetrievalEnabled(data);
+			executionInspectionEnabled = agentExecutionInspectionEnabled(data);
+			// The user's choice (initiating chat turn, or the effort picked next to the
+			// model at launch) wins over node configuration; low only when nobody chose.
+			reasoningEffort = applyReasoningCeiling(
+				resolveWorkflowAgentReasoningEffort({
+					flowVersionData: context.flowVersionData,
+					configuredEffort: optionalAgentReasoningEffort(data),
+				}) ?? resolveWorkflowAgentDefaultReasoningEffort(),
+				resolveAuthorReasoningCeiling({ nodeCeiling: data.workflowAgentReasoningEffortCeiling }),
+			);
 		} catch (error: unknown) {
 			return {
 				ok: false,
@@ -3635,9 +5613,8 @@ async function executeRegisteredWorkflowNodeOnce(
 				errorMessage: error instanceof Error ? error.message : String(error),
 			};
 		}
-		if (outputArtifactType === "tapcanvas.clip-prompts/v2") {
-			maxOutputTokens = Math.min(maxOutputTokens, WORKFLOW_CLIP_WRITER_MAX_OUTPUT_TOKENS);
-		}
+		const submissionPolicy = failurePolicy === "single_submission"
+			? WORKFLOW_STRUCTURED_OUTPUT_SUBMISSION_POLICY : WORKFLOW_STRUCTURED_OUTPUT_REPAIRABLE_POLICY;
 		if (!instruction || !outputArtifactType || !outputEncoding || !agentDeliveryRequirement || !forcedAgentRole || !modelKey) {
 			return {
 				ok: false,
@@ -3666,8 +5643,22 @@ async function executeRegisteredWorkflowNodeOnce(
 			outputEncoding === "json_object"
 			&& jsonObjectContract
 		) {
+            if (outputArtifactType === "tapcanvas.chapter-beat-plan/v3" && jsonObjectContract.jsonSchema) {
+                const allowedDurations = allowedProviderClipDurations(inputs);
+                if (!allowedDurations) throw new Error("Chapter planning requires live provider duration options from delivery-contract");
+                const schema = jsonObjectContract.jsonSchema;
+                const properties = isRecord(schema.properties) ? schema.properties : {};
+                const beats = isRecord(properties.beats) ? properties.beats : {};
+                const items = isRecord(beats.items) ? beats.items : {};
+                jsonObjectContract = { ...jsonObjectContract, jsonSchema: { ...schema, properties: { ...properties,
+                    beats: { ...beats, items: { ...items, properties: {
+                        ...(isRecord(items.properties) ? items.properties : {}),
+                        durationSeconds: { type: "number", enum: allowedDurations },
+                    } } },
+                } } };
+            }
 			if (outputArtifactType === "tapcanvas.beat-sheet/v2" && jsonObjectContract.requiredArrayFields?.includes("beats")) {
-				const allowedDurations = allowedProviderClipDurations(context.inputs);
+					const allowedDurations = allowedProviderClipDurations(inputs);
 				if (!allowedDurations) {
 					throw new Error("BeatSheet Agent requires live provider duration options from delivery-contract");
 				}
@@ -3681,7 +5672,7 @@ async function executeRegisteredWorkflowNodeOnce(
 						},
 					},
 				};
-				const providerClipFacts = explicitProviderClipFacts(context.inputs);
+					const providerClipFacts = explicitProviderClipFacts(inputs);
 				if (providerClipFacts) {
 					jsonObjectContract = applyWorkflowAgentArrayItemExactNumberFields(
 						jsonObjectContract,
@@ -3689,7 +5680,7 @@ async function executeRegisteredWorkflowNodeOnce(
 						providerClipFacts.durations.map((durationSeconds) => ({ durationSeconds })),
 					);
 				} else {
-					const requestedClipCount = requestedProviderClipCount(context.inputs);
+						const requestedClipCount = requestedProviderClipCount(inputs);
 					if (requestedClipCount !== null) {
 						jsonObjectContract = {
 							...jsonObjectContract,
@@ -3712,7 +5703,7 @@ async function executeRegisteredWorkflowNodeOnce(
 				&& (jsonObjectContract.requiredNumberFields?.length ?? 0) === 0
 				&& (jsonObjectContract.requiredObjectFields?.length ?? 0) === 0
 			) {
-				const assetPlansPort = findAssetPlansPort(context.inputs);
+				const assetPlansPort = findAssetPlansPort(inputs);
 				if (assetPlansPort) {
 					jsonObjectContract = {
 						...jsonObjectContract,
@@ -3730,7 +5721,7 @@ async function executeRegisteredWorkflowNodeOnce(
 			if (exactConfig) {
 				let expected: string[];
 				try {
-					expected = resolvePlannedAssetIdsFromPort(context.inputs, exactConfig.expectedAssetPlansFromPort);
+					expected = resolvePlannedAssetIdsFromPort(inputs, exactConfig.expectedAssetPlansFromPort);
 				} catch (error: unknown) {
 					return {
 						ok: false,
@@ -3748,7 +5739,36 @@ async function executeRegisteredWorkflowNodeOnce(
 			}
 		}
 		const previousEvidence = previousAgentEvidence(context);
-		const hasPhysicalRetryCheckpoint = parseWorkflowAgentPhysicalFailureEvidence(previousEvidence) !== null;
+		const previousDeliveryEvidence = isRecord(previousEvidence?.deliveryEvidence)
+			? previousEvidence.deliveryEvidence : null;
+		const initialRecovery = readWorkflowAgentInitialRecovery(previousEvidence);
+		if (initialRecovery && initialRecovery.nodeId !== context.node.id) throw new Error("workflow_agent_initial_recovery_node_mismatch");
+		// Recovery reuses artifacts, not another execution's durable session.
+		// Keep the old receipt/candidate for audit and repair, but admit a fresh
+		// turn when its exact session identity belongs to the recovery source.
+		const inheritedAgentSession = context.recoveryOfExecutionId != null && (
+			(typeof previousDeliveryEvidence?.sessionKey === "string"
+				&& previousDeliveryEvidence.sessionKey !== workflowAgentSessionKey({ executionId: context.executionId,
+					nodeId: context.node.id, physicalRetryOrdinal: null }))
+			|| (initialRecovery !== null && initialRecovery.sourceExecutionId !== context.executionId
+				&& previousDeliveryEvidence?.sessionKey == null));
+		const outputRepair = readWorkflowAgentOutputRepair(previousEvidence);
+		const priorCandidateRevalidation = previousEvidence?.acceptedAuthorRecoveryRevalidated;
+		const acceptedAuthorRecovery = priorCandidateRevalidation === undefined
+			? readWorkflowAcceptedAuthorRecovery(previousEvidence) : null;
+		if (acceptedAuthorRecovery && acceptedAuthorRecovery.nodeId !== context.node.id) {
+			throw new Error("workflow_accepted_author_recovery_node_mismatch");
+		}
+		const candidateRevalidation = acceptedAuthorRecovery ? {
+			version: 1,
+			sourceExecutionId: acceptedAuthorRecovery.sourceExecutionId,
+			sourceNodeRunId: acceptedAuthorRecovery.sourceNodeRunId,
+			candidateHash: acceptedAuthorRecovery.candidateHash,
+		} : priorCandidateRevalidation;
+		const retainedRepairArtifacts = outputRepair || candidateRevalidation !== undefined
+			? context.resumeOutputRefs?.artifacts ?? [] : [];
+		const physicalRetryFailure = parseWorkflowAgentPhysicalFailureEvidence(previousEvidence);
+		const hasPhysicalRetryCheckpoint = !inheritedAgentSession && physicalRetryFailure !== null;
 		if (previousEvidence) {
 			const previousDelivery = isRecord(previousEvidence.deliveryEvidence)
 				? previousEvidence.deliveryEvidence
@@ -3758,46 +5778,81 @@ async function executeRegisteredWorkflowNodeOnce(
 				executionId: context.executionId,
 				nodeId: context.node.id,
 				contextResumeOnly: context.resumeOnly === true,
+				inheritedAgentSession,
 				hasPhysicalRetryCheckpoint,
 				physicalRetryOrdinal: previousDelivery.physicalRetryOrdinal ?? null,
+				initialRecoverySourceExecutionId: initialRecovery?.sourceExecutionId ?? null,
 			}));
 		}
-		if (isTypedOutput && (context.resumeOnly === true || hasPhysicalRetryCheckpoint)) {
-			const failed = output({
-				node: context.node,
-				executorRef,
-				ports: {},
-				evidence: {
-					executorCompleted: false,
-					structuredOutputSubmissionPolicy: WORKFLOW_STRUCTURED_OUTPUT_SUBMISSION_POLICY,
-					requestTerminal: {
-						version: 1,
-						terminal: true,
-						status: "failed",
-						reason: "structured_submission_window_closed",
-					},
-					agentExecutionFailure: {
-						code: "structured_submission_window_closed",
-						phase: "before_structured_submission",
-						retryable: false,
-					},
-				},
-			});
-			if (!failed.ok) return failed;
-			return {
-				ok: false,
-				errorCode: "workflow_node_runtime_failed",
-				errorMessage: `Workflow Agent node ${context.node.id} cannot reopen a typed submission window after its single physical run ended`,
-				outputRefs: failed.outputRefs,
-			};
-		}
-		const workflowRequiredSkills = uniqueStrings(
-			stringListFromData(data, "workflowRequiredSkills"),
-		);
-		const workflowKnowledgeTools = workflowRequiredSkills.length > 0
-			? WORKFLOW_AGENT_KNOWLEDGE_TOOLS.filter((tool) => tool !== "skill_search")
-			: WORKFLOW_AGENT_KNOWLEDGE_TOOLS;
-		const singleInferenceTypedAgent = outputArtifactType === "tapcanvas.clip-prompts/v2";
+		// A physical run ending does not terminate its logical delivery task.
+		// The durable runner consumes the checkpoint under the recovery family fence.
+		const skillRetrievalEnabled = agentSkillRetrievalEnabled(data);
+		const activeForcedAgentRole = forcedAgentRole;
+		const workflowRequiredSkills = skillRetrievalEnabled
+			? uniqueStrings(stringListFromData(data, "workflowRequiredSkills"))
+			: [];
+		// Frozen requiredSkills are preloaded dependencies, not a closed discovery
+		// scope. Keep skill_search available so every workflow can discover newly
+		// added or task-specific Skills in the same authoring chain.
+		const workflowKnowledgeTools = [
+			...(skillRetrievalEnabled ? WORKFLOW_AGENT_BASE_TOOLS : []),
+			...(knowledgeRetrievalEnabled ? WORKFLOW_AGENT_OPTIONAL_RETRIEVAL_TOOLS.slice(0, 2) : []),
+			...WORKFLOW_AGENT_EXECUTION_TOOLS,
+			...(knowledgeRetrievalEnabled ? WORKFLOW_AGENT_OPTIONAL_RETRIEVAL_TOOLS.slice(2) : []),
+		];
+		const activePromptExampleRetrievalScope = knowledgeRetrievalEnabled ? promptExampleRetrievalScope : null;
+		const toolScopeDiagnostics = [
+			...(toolPolicy === "none" ? [{
+				code: "workflow_agent_tools_disabled_by_policy",
+				source: "workflow_node_capability",
+				capability: "workflowAgentTools",
+				policy: toolPolicy,
+			}] : []),
+			...(skillRetrievalEnabled ? [] : [{
+				code: "workflow_skill_retrieval_tools_not_mounted",
+				source: "workflow_node_capability",
+				capability: "workflowSkillRetrieval",
+				tools: [...WORKFLOW_AGENT_BASE_TOOLS],
+				configuredAgentRoleId: forcedAgentRole,
+				roleSkillBundleDisabled: true,
+			}]),
+			...(knowledgeRetrievalEnabled ? [] : [{
+				code: "workflow_optional_retrieval_tools_not_mounted",
+				source: "workflow_node_capability",
+				capability: "workflowKnowledgeRetrieval",
+				tools: [...WORKFLOW_AGENT_OPTIONAL_RETRIEVAL_TOOLS, ...WORKFLOW_AGENT_PROMPT_EXAMPLE_TOOLS],
+			}]),
+			...(executionInspectionEnabled ? [] : [{
+				code: "workflow_execution_inspection_tool_not_mounted",
+				source: "workflow_node_capability",
+				capability: "workflowExecutionInspection",
+				tools: [...WORKFLOW_AGENT_EXECUTION_TOOLS],
+			}]),
+		];
+		// Output encoding is not a permission policy. Preserve the frozen IR's
+		// explicit tools for JSON and text alike. Actual media facts expose only
+		// understanding capabilities; generation still requires an explicit grant.
+		const configuredAgentTools = uniqueStrings([
+			...workflowKnowledgeTools,
+			// workflowProjectAssetInspection=false means the node never reads project
+			// assets, so neither the frozen asset inspector nor media evidence tools mount.
+			...(runtimeProjectContext(context) && data.workflowProjectAssetInspection !== false ? ["tapcanvas_workflow_execution_inspect"] : []),
+			...(data.workflowProjectAssetInspection === false ? [] : workflowAgentMediaEvidenceTools(runtimeProjectContext(context))),
+			...stringListFromData(data, "workflowAllowedTools"),
+			...stringListFromInput(inputs, "tools"),
+			...(activePromptExampleRetrievalScope ? WORKFLOW_AGENT_PROMPT_EXAMPLE_TOOLS : []),
+		]);
+		const unmountedWorkflowTools = new Set<string>([
+			...(skillRetrievalEnabled ? [] : [...WORKFLOW_AGENT_BASE_TOOLS]),
+			...(knowledgeRetrievalEnabled ? [] : [
+				...WORKFLOW_AGENT_OPTIONAL_RETRIEVAL_TOOLS,
+				...WORKFLOW_AGENT_PROMPT_EXAMPLE_TOOLS,
+			]),
+			...(executionInspectionEnabled ? [] : WORKFLOW_AGENT_EXECUTION_TOOLS),
+		]);
+		const agentAllowedTools = toolPolicy === "none"
+			? []
+			: configuredAgentTools.filter((tool) => !unmountedWorkflowTools.has(tool));
 		let agentResult: WorkflowAgentRunResult;
 		try {
 			// 系统级共享工作流（delivery 重定向到调用者项目）：agent 节点以调用者
@@ -3808,11 +5863,13 @@ async function executeRegisteredWorkflowNodeOnce(
 			const productionStartDeadline = runtimeProductionStartDeadline(context);
 			const runtimeInstruction = [
 				instruction,
-				runtimeAuthoritativeSourceInstruction(context.inputs, outputArtifactType),
+				runtimeAuthoritativeSourceInstruction(inputs, outputArtifactType),
+				runtimeBeatSheetCapacityInstruction(inputs, context.flowVersionData, outputArtifactType),
+				outputArtifactType === "tapcanvas.beat-sheet/v2" ? runtimeBeatSheetStructuralChecklist() : "",
 				outputArtifactType === "tapcanvas.asset-plans/v1"
 					? [
-						runtimeBeatSheetInstruction(context.inputs),
-						runtimeProjectAssetCandidatesInstruction(
+						runtimeBeatSheetInstruction(inputs),
+						workflowProjectImageCandidateInstruction(
 						runtimeProjectContext(context),
 						assetPlanningAllowedRoles,
 					),
@@ -3821,7 +5878,36 @@ async function executeRegisteredWorkflowNodeOnce(
 			].filter((value) => value.trim().length > 0).join("\n\n");
 			const structurallyEmptyAssetPlan = outputArtifactType === "tapcanvas.asset-plans/v1"
 				&& assetPlanningAllowedRoles.length === 0;
-			if (structurallyEmptyAssetPlan) {
+			if (acceptedAuthorRecovery) {
+				const originalPort = context.resumeOutputRefs?.ports[acceptedAuthorRecovery.portName];
+				const sourceMetadata = isRecord(originalPort) ? originalPort : {};
+				agentResult = {
+					taskId: acceptedAuthorRecovery.identity.taskId,
+					text: acceptedAuthorRecovery.candidate,
+					assets: [],
+					...(acceptedAuthorRecovery.acceptedAuthorSource
+						? { acceptedAuthorSource: acceptedAuthorRecovery.acceptedAuthorSource } : {}),
+					...projectAtomicAuthorSelfCheckMetadata(sourceMetadata, acceptedAuthorRecovery.candidateHash),
+					expectedDelivery: sourceMetadata.expectedDelivery ?? null,
+					deliveryEvidence: {
+						...(previousDeliveryEvidence ?? {}),
+						acceptedAuthorRecoveryRevalidated: candidateRevalidation,
+						acceptedAuthorRecoverySourceDiagnostics: acceptedAuthorRecovery.sourceDiagnostics,
+					},
+					deliveryVerification: null,
+					requestTerminal: { version: 1, terminal: true, status: "succeeded",
+						reason: "retained_author_candidate_revalidation" },
+				};
+				console.info(JSON.stringify({
+					message: "workflow_accepted_author_candidate_revalidation",
+					executionId: context.executionId, nodeId: context.node.id,
+					sourceExecutionId: acceptedAuthorRecovery.sourceExecutionId,
+					sourceNodeRunId: acceptedAuthorRecovery.sourceNodeRunId,
+					candidateHash: acceptedAuthorRecovery.candidateHash,
+					sourceDiagnostics: acceptedAuthorRecovery.sourceDiagnostics,
+					authorInferenceExecuted: false,
+				}));
+			} else if (structurallyEmptyAssetPlan) {
 				const taskId = `${context.executionFamilyId}:${context.node.id}:empty-asset-plan`;
 				const terminalReason = assetPlanningRequiredRoles.length === 0
 					? "frozen_asset_reference_set_empty"
@@ -3847,6 +5933,7 @@ async function executeRegisteredWorkflowNodeOnce(
 					},
 				};
 			} else agentResult = await dependencies.runAgent({
+				...(inheritedAgentSession && initialRecovery ? { initialRecovery } : {}),
 				executionId: context.executionId,
 				executionFamilyId: context.executionFamilyId,
 				nodeId: context.node.id,
@@ -3862,38 +5949,48 @@ async function executeRegisteredWorkflowNodeOnce(
 				deliveryRequirement: agentDeliveryRequirement,
 				modelKey,
 				maxOutputTokens,
+				...(structuredOutputTokenBudget === undefined ? {} : { structuredOutputTokenBudget }),
+				...(projectContextPromptMode === undefined ? {} : { projectContextPromptMode }),
+				...(failurePolicy === undefined ? {} : { failurePolicy }),
+				...(executionPolicy === undefined ? {} : { executionPolicy }),
+				reviewPolicy: "disabled",
+				...(promptMode === undefined ? {} : { promptMode }),
 				...(reasoningEffort ? { reasoningEffort } : {}),
-				inputs: context.inputs,
+				...(initiatingExecution?.serviceTier ? { serviceTier: initiatingExecution.serviceTier } : {}),
+				inputs,
+				persistedInputSource: context.persistedInputSource,
 				// A Workflow Agent's Skill dependencies are part of the frozen node
 				// definition, just like its executor, model and output contract. Do not
 				// erase them and ask the model to rediscover its own runtime dependency.
 				requiredSkills: workflowRequiredSkills,
-				mountedKnowledgeCardIds: [],
+				mountedKnowledgeCardIds: mountedKnowledgeCardsFromInputs(inputs),
+				...(outputArtifactType === CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION
+					? { performanceModes: windowPerformanceModes(firstInput(inputs, "clip-sequence")) } : {}),
 				disabledSkills: [],
 				disabledKnowledgeCardIds: [],
-				// Formal Clip writer is a one-inference typed atom. Its required
-				// Skills and autoload resources are assembled before inference; no
-				// retrieval, Skill read, correction, or other supporting tool is part
-				// of the submission window.
-				allowedTools: singleInferenceTypedAgent
-					? []
-					: uniqueStrings([
-						...workflowKnowledgeTools,
-						...stringListFromData(data, "workflowAllowedTools"),
-						...stringListFromInput(context.inputs, "tools"),
-						...(promptExampleRetrievalScope ? ["prompt_example_search", "prompt_example_read"] : []),
-					]),
-				...(!singleInferenceTypedAgent && promptExampleRetrievalScope
-					? { promptExampleRetrievalScope }
+				allowedTools: agentAllowedTools,
+				...(activePromptExampleRetrievalScope
+					? { promptExampleRetrievalScope: activePromptExampleRetrievalScope }
 					: {}),
-				forcedAgentRole,
+				forcedAgentRole: activeForcedAgentRole,
+				disableRoleSkillBundle: !skillRetrievalEnabled,
 				// Plain-text work may resume an accepted durable turn. Typed nodes are
 				// fenced above and never reach this call through a second physical window.
-				resumeOnly: context.resumeOnly === true || hasPhysicalRetryCheckpoint,
+				resumeOnly: !inheritedAgentSession && (context.resumeOnly === true || hasPhysicalRetryCheckpoint),
+				...(context.runtimeItemIndex !== undefined ? { runtimeItemIndex: context.runtimeItemIndex } : {}),
 				previousEvidence,
+				...(authorRepair ? { authorRepair } : {}),
 				...(productionStartDeadline ? { productionStartDeadline } : {}),
+				// The caller's public turn is provenance, not the execution owner.
+				// All resumed members share the durable workflow family's budget.
+				logicalTaskBudgetRootId: context.executionFamilyId,
 				...(agentDelivery ? { deliveryScope: agentDelivery } : {}),
 				projectContext: runtimeProjectContext(context),
+				// Read the immutable execution snapshot even when this node only
+				// receives a sliced collection item and has no trigger edge.
+				userIntentContract: readWorkflowUserIntent(
+					workflowSnapshotFact(context, null, WORKFLOW_USER_INTENT_FIELD), context.ownerId,
+				)?.contract,
 				// Internal workflow Agents consume the typed upstream ports plus the
 				// node-specific compact runtime instructions above. Do not serialize the
 				// entire frozen ProjectContext into every Agent prompt. The Agent runner
@@ -3901,6 +5998,21 @@ async function executeRegisteredWorkflowNodeOnce(
 				// the complete ready project-image identity registry so semantic reuse is
 				// frozen once before deterministic asset fan-out.
 				...(context.abortSignal ? { abortSignal: context.abortSignal } : {}),
+				...(context.reportAgentActivity ? {
+					onAgentActivity: context.reportAgentActivity,
+					agentActivityContext: {
+						...(readString(data, "label") || readString(data, "title")
+							? { displayName: readString(data, "label") || readString(data, "title") }
+							: {}),
+						runtimeNodeId: context.node.id,
+						...(context.runtimeItemLineage?.at(-1)
+							? { itemId: context.runtimeItemLineage.at(-1)!.itemId }
+							: {}),
+						...(context.runtimeItemIndex !== undefined
+							? { itemIndex: context.runtimeItemIndex }
+							: {}),
+					},
+				} : {}),
 			});
 		} catch (error: unknown) {
 			const outputContractFailure = workflowAgentOutputContractFailure(error);
@@ -3911,7 +6023,7 @@ async function executeRegisteredWorkflowNodeOnce(
 					ports: {},
 					evidence: {
 						executorCompleted: false,
-						structuredOutputSubmissionPolicy: WORKFLOW_STRUCTURED_OUTPUT_SUBMISSION_POLICY,
+						structuredOutputSubmissionPolicy: submissionPolicy,
 						outputContractFailure: {
 							code: "structured_output_invalid",
 							message: outputContractFailure,
@@ -3927,38 +6039,7 @@ async function executeRegisteredWorkflowNodeOnce(
 					outputRefs: recorded.outputRefs,
 				};
 			}
-			if (isWorkflowAgentRateLimitError(error)) {
-				if (isTypedOutput) {
-					const failed = output({
-						node: context.node,
-						executorRef,
-						ports: {},
-						evidence: {
-							executorCompleted: false,
-							structuredOutputSubmissionPolicy: WORKFLOW_STRUCTURED_OUTPUT_SUBMISSION_POLICY,
-							requestTerminal: {
-								version: 1,
-								terminal: true,
-								status: "failed",
-								reason: "llm_http_429",
-							},
-							agentExecutionFailure: {
-								code: "llm_http_429",
-								phase: "before_structured_submission",
-								retryable: false,
-							},
-						},
-					});
-					if (!failed.ok) return failed;
-					return {
-						ok: false,
-						errorCode: "workflow_node_runtime_failed",
-						errorMessage: `Workflow Agent node ${context.node.id} was rejected before its single structured submission: llm_http_429`,
-						outputRefs: failed.outputRefs,
-					};
-				}
-				// Plain-text Agent work may still use provider backpressure because it
-				// has no frozen one-submission data contract.
+			if (failurePolicy !== "single_submission" && isWorkflowAgentRateLimitError(error)) {
 				const pending = output({
 					node: context.node,
 					executorRef,
@@ -3981,10 +6062,165 @@ async function executeRegisteredWorkflowNodeOnce(
 					}),
 				);
 			}
-			throw error;
+				if (isWorkflowAgentSessionTurnInflightError(error)) {
+					// Our own dispatch paths can race for one session: the bridge keeps
+					// the owning turn and rejects the newcomer with a structural
+					// not_started receipt. No model or tool action ran, so wait for
+					// ownership instead of terminalising the node or spending the
+					// physical retry budget on a local scheduling conflict.
+					const busy = output({
+						node: context.node,
+						executorRef,
+						ports: {},
+						evidence: {
+							executorCompleted: false,
+							deliveryEvidence: createWorkflowAgentSessionTurnInflightEvidence(
+								previousAgentEvidence(context),
+								error,
+							),
+						},
+					});
+					if (!busy.ok) return busy;
+					return workflowNodeWaiting(
+						busy.outputRefs,
+						workflowAgentExternalCheckSchedule({
+							deliveryEvidence: busy.outputRefs.evidence.deliveryEvidence,
+							reason: "workflow_agent_session_turn_inflight",
+						}),
+					);
+				}
+				if (isAgentsChatRuntimeContractViolation(error)) {
+					// The bridge answered with a payload this host cannot parse. A thrown
+					// lookup error would be re-observed forever against the same durable
+					// turn; fail the node with the previous receipt so recovery can
+					// reconcile the turn once both sides share the contract again.
+					const errorCode = error.code;
+					const errorMessage = error instanceof Error ? error.message : String(error);
+					const violated = output({
+						node: context.node,
+						executorRef,
+						ports: {},
+						evidence: {
+							...previousAgentEvidence(context),
+							executorCompleted: false,
+							runtimeContractViolation: { code: errorCode, message: errorMessage },
+						},
+					});
+					if (!violated.ok) return violated;
+					return {
+						ok: false,
+						errorCode,
+						errorMessage: `Workflow Agent node ${context.node.id}: ${errorMessage}`,
+						outputRefs: violated.outputRefs,
+					};
+				}
+				throw error;
+			}
+		// A Workflow Agent physical window may end in a machine-issued suspended
+		// state while agents-cli is still continuing the same logical task.  The
+		// transport projection can contain the human-facing suspension notice in
+		// `text`; that text is lifecycle evidence, never the typed artifact.  Read
+		// the terminal envelope before any artifact compiler/parser so a suspended
+		// window cannot be misclassified as malformed JSON.
+		const requestTerminal = parseAgentRequestTerminal(agentResult.requestTerminal);
+		const providerReplanEvidence = isTypedOutput
+			? typedAgentProviderReplanEvidence(agentResult)
+			: null;
+		if (failurePolicy === "single_submission" && requestTerminal?.status === "suspended"
+			&& providerReplanEvidence) {
+			const rejected = output({ node: context.node, executorRef, ports: {}, evidence: {
+				executorCompleted: false,
+				structuredOutputSubmissionPolicy: submissionPolicy,
+				deliveryEvidence: agentResult.deliveryEvidence,
+				providerResponseRejection: providerReplanEvidence,
+				requestTerminal: agentResult.requestTerminal,
+			} });
+			if (!rejected.ok) return rejected;
+			return { ok: false, errorCode: "workflow_node_runtime_failed",
+				errorMessage: `Workflow Agent node ${context.node.id} provider response rejected: ${requestTerminal.reason}`,
+				outputRefs: rejected.outputRefs };
+		}
+		if (requestTerminal?.status === "suspended") {
+			const suspendedAtomicProjection = projectAtomicAuthorSelfCheckMetadata(agentResult,
+				`sha256:${createHash("sha256").update(agentResult.text, "utf8").digest("hex")}`);
+			const {
+				atomicAuthorSelfCheck: _sourceObservation,
+				atomicAuthorSelfCheckProjectionIssue: _sourceProjectionIssue,
+				...suspendedSourceResult
+			} = agentResult;
+			const providerRecoveryEvidence = providerReplanEvidence
+				? {
+					...(isRecord(agentResult.deliveryEvidence) ? agentResult.deliveryEvidence : {}),
+					recoveryMode: "agent_replan",
+					providerResponseRejection: providerReplanEvidence,
+					retryablePhysicalFailure: false,
+					physicalFailureReason: "workflow_agent_provider_replan_required",
+				}
+				: null;
+			const suspendedDeliveryEvidence = providerRecoveryEvidence ?? agentResult.deliveryEvidence;
+			const suspendedReason = providerRecoveryEvidence
+				? "workflow_agent_provider_replan_required"
+				: requestTerminal.reason;
+			const suspendedOutput = output({
+				node: context.node,
+				executorRef,
+				ports: { [primaryOutputPort(data, "result")]: { ...suspendedSourceResult, ...suspendedAtomicProjection } },
+				artifacts: retainWorkflowAgentRepairArtifacts(retainedRepairArtifacts, agentResult.assets.map((asset) => ({
+					type: `tapcanvas.${asset.type}/v1`,
+					identity: asset.assetId,
+					value: asset.url,
+				}))),
+				evidence: {
+					taskId: agentResult.taskId,
+					outputEncoding,
+					outputArtifactType,
+					structuredOutputSubmissionPolicy: submissionPolicy,
+					executorCompleted: false,
+					deliveryEvidence: suspendedDeliveryEvidence,
+					deliveryVerification: agentResult.deliveryVerification,
+					requestTerminal: agentResult.requestTerminal,
+					continuationReason: suspendedReason,
+					...(outputRepair ? { outputRepair } : {}),
+					...(candidateRevalidation === undefined ? {} : { acceptedAuthorRecoveryRevalidated: candidateRevalidation }),
+					...(agentResult.executionProvenance
+						? { executionProvenance: agentResult.executionProvenance }
+						: {}),
+					...(agentResult.executionProvenanceHistory?.length
+						? { executionProvenanceHistory: agentResult.executionProvenanceHistory }
+						: {}),
+					...(agentResult.upstreamRequestContextMetrics ? { upstreamRequestContextMetrics: agentResult.upstreamRequestContextMetrics } : {}),
+					...(agentResult.upstreamRequestContextMetricsIssue ? { upstreamRequestContextMetricsIssue: agentResult.upstreamRequestContextMetricsIssue } : {}),
+					...(agentResult.upstreamRequestContexts?.length
+						? { upstreamRequestContexts: agentResult.upstreamRequestContexts }
+						: {}),
+					...suspendedAtomicProjection,
+					...(agentResult.structuredOutputReview
+						? { structuredOutputReview: agentResult.structuredOutputReview }
+						: {}),
+					...(agentResult.structuredOutputReviewProjectionIssue
+						? { structuredOutputReviewProjectionIssue: agentResult.structuredOutputReviewProjectionIssue }
+						: {}),
+					...(agentResult.structuredOutputFailure
+						? { structuredOutputFailure: agentResult.structuredOutputFailure }
+						: {}),
+				},
+			});
+			if (!suspendedOutput.ok) return suspendedOutput;
+			return workflowNodeWaiting({
+				...suspendedOutput.outputRefs,
+				ports: {},
+				artifacts: suspendedOutput.outputRefs.artifacts,
+				evidence: {
+					...suspendedOutput.outputRefs.evidence,
+					executorCompleted: false,
+				},
+			}, workflowAgentExternalCheckSchedule({
+				deliveryEvidence: suspendedDeliveryEvidence,
+				reason: suspendedReason,
+			}));
 		}
 		const clipContext = outputArtifactType === "tapcanvas.clip-prompts/v2"
-			? firstInput(context.inputs, "clip-contexts")
+			? firstInput(inputs, "clip-contexts")
 			: null;
 		const frozenContextWriterCompilation = outputArtifactType === "tapcanvas.clip-prompts/v2"
 			? compileWorkflowClipWriterFrozenEnvelope({
@@ -4009,6 +6245,37 @@ async function executeRegisteredWorkflowNodeOnce(
 				jsonArrayContract,
 				jsonObjectContract,
 			});
+		// Author observations bind the exact returned candidate bytes, including
+		// not_performed receipts. Validation and compilation can serialize the same
+		// object differently; their projections do not change that source identity.
+		const authoredCandidateText = agentResult.text;
+		if (validatedOutput.ok && outputArtifactType === "tapcanvas.clip-design/v2") {
+			try {
+				const item = firstInput(inputs, "clip-design-inputs");
+				if (!isRecord(item) || !Array.isArray(item.objectRegistry) || !item.objectRegistry.every(isRecord)) {
+					throw new Error("Clip design requires its frozen object registry");
+				}
+				validateClipDesignReferences(parseClipDesign({ text: validatedOutput.text }), item.objectRegistry);
+			} catch (error: unknown) {
+				validatedOutput = { ok: false, errorMessage: error instanceof Error ? error.message : String(error) };
+			}
+		}
+		if (validatedOutput.ok && outputArtifactType === "tapcanvas.source-unit-ledger/v1") {
+			try {
+				const canonical = canonicalizeSourceUnitLedger(
+					{ text: validatedOutput.text },
+					sourceUnitLedgerFacts(firstInput(inputs, "delivery-contract")),
+				);
+				validatedOutput = { ok: true, text: JSON.stringify(canonical.ledger) };
+				console.warn(JSON.stringify({
+					event: "source_unit_ledger_reconstructed",
+					executionId: context.executionId, nodeId: context.node.id,
+					reconstructedUnits: canonical.reconstructedUnits,
+				}));
+			} catch (error: unknown) {
+				validatedOutput = { ok: false, errorMessage: error instanceof Error ? error.message : String(error) };
+			}
+		}
 		if (validatedOutput.ok && outputArtifactType === "tapcanvas.asset-plans/v1") {
 			const reuseError = validateWorkflowAssetPlanProjectReuse({
 				assetAgentResult: { text: validatedOutput.text },
@@ -4032,8 +6299,77 @@ async function executeRegisteredWorkflowNodeOnce(
 				};
 			}
 		}
-		if (validatedOutput.ok && outputArtifactType === "tapcanvas.beat-sheet/v2") {
-			const launchBeat = firstInput(context.inputs, "beat-sheet");
+		const isOpeningClipArtifact = outputArtifactType === OPENING_CLIP_ARTIFACT_TYPE;
+		const isBeatSheetArtifact = outputArtifactType === "tapcanvas.beat-sheet/v2"
+			|| outputArtifactType === "tapcanvas.launch-beat-sheet/v1";
+		if (validatedOutput.ok && isOpeningClipArtifact) {
+			try {
+				projectOpeningClip({
+					executionId: context.executionId,
+					nodeId: context.node.id,
+					openingClip: { text: validatedOutput.text },
+					deliveryContract: firstInput(inputs, "delivery-contract"),
+				});
+			} catch (error: unknown) {
+				validatedOutput = { ok: false, errorMessage: `Opening Clip authoring contract violated: ${error instanceof Error ? error.message : String(error)}` };
+			}
+		}
+		if (validatedOutput.ok && outputArtifactType === OPENING_FRAME_PLAN_ARTIFACT_TYPE) {
+			try {
+				const promptPackage = projectOpeningFramePlan({
+					framePlan: { text: validatedOutput.text },
+					projectContext: runtimeProjectContext(context),
+				});
+				validatedOutput = { ...validatedOutput, text: JSON.stringify(promptPackage) };
+			} catch (error: unknown) {
+				validatedOutput = { ok: false, errorMessage: `Opening frame plan contract violated: ${error instanceof Error ? error.message : String(error)}` };
+			}
+		}
+		// The outline is split into seeds by the host's deterministic step after the author
+		// is done; a count or name problem found there failed the whole run (ch1: 7
+		// backgrounds against a limit of 6) instead of going back to the author.
+		if (validatedOutput.ok && outputArtifactType === CHAPTER_ASSET_OUTLINE_ARTIFACT_TYPE) {
+			try {
+				seedsFromOutline(JSON.parse(validatedOutput.text) as unknown);
+			} catch (error: unknown) {
+				validatedOutput = { ok: false, errorMessage: `Chapter asset outline contract violated: ${error instanceof Error ? error.message : String(error)}` };
+			}
+		}
+		if (validatedOutput.ok && outputArtifactType === CHAPTER_SEQUENCE_ARTIFACT_TYPE) {
+			try {
+				const deliveryContract = firstInput(inputs, "delivery-contract");
+				// The author supplies ordered events and their provider Clip ownership.
+				// Compilation binds source facts without assigning internal event clocks.
+				const text = JSON.stringify(compileChapterScript(JSON.parse(validatedOutput.text) as unknown, deliveryContract));
+				projectChapterSequence({
+					executionId: context.executionId,
+					nodeId: context.node.id,
+					sequence: { text },
+					deliveryContract,
+				});
+				validatedOutput = { ...validatedOutput, text };
+			} catch (error: unknown) {
+				validatedOutput = { ok: false, errorMessage: `Chapter timeline contract violated: ${error instanceof Error ? error.message : String(error)}` };
+			}
+		}
+		if (validatedOutput.ok && outputArtifactType === CLIP_PRODUCTION_PACKET_PROTOCOL_VERSION) {
+			try {
+				const packet = verifyClipProductionPacketSourceBinding(
+					materializeClipProductionDraft(
+						bindFrozenClipSourceRanges(JSON.parse(validatedOutput.text) as unknown, firstInput(inputs, "clip-segment")),
+						firstInput(inputs, "chapter-assets"),
+						workflowDeliveryScope(context.flowVersionData)?.projectId ?? context.projectId ?? "",
+						firstInput(inputs, "clip-sequence"),
+					),
+					firstInput(inputs, "clip-segment"),
+				);
+				validatedOutput = { ...validatedOutput, text: JSON.stringify(packet) };
+			} catch (error: unknown) {
+				validatedOutput = { ok: false, errorMessage: `Clip production packet contract violated: ${error instanceof Error ? error.message : String(error)}` };
+			}
+		}
+		if (validatedOutput.ok && isBeatSheetArtifact) {
+			const launchBeat = firstInput(inputs, "beat-sheet");
 			if (launchBeat !== undefined) {
 				const launchPrefixError = validateAcceptedLaunchBeatPrefix({
 					launchBeat,
@@ -4058,6 +6394,60 @@ async function executeRegisteredWorkflowNodeOnce(
 					};
 				}
 			}
+			// 原文覆盖合同：BeatSheet 是整章唯一事实源，其人声台账必须逐字来自 canonical 原文、
+			// 覆盖原文人声。来源事实错误在同一逻辑任务内回灌修订，
+			// 而不是让「整章被压成几个 clip」的摘要当作合法交付流到画布。
+			if (validatedOutput.ok) {
+				const sourceCoverageError = validateBeatSheetSourceCoverage({
+					beatSheetText: validatedOutput.text,
+					deliveryContract: firstInput(inputs, "delivery-contract"),
+				});
+				if (sourceCoverageError) {
+					validatedOutput = {
+						ok: false,
+						errorMessage: `Workflow BeatSheet source-coverage contract violated: ${sourceCoverageError}`,
+					};
+				}
+			}
+		}
+		if (validatedOutput.ok && isBeatSheetArtifact) {
+			const capacityObservation = diagnoseBeatSheetSpeechCapacity({
+				beatSheetText: validatedOutput.text,
+				deliveryContract: firstInput(inputs, "delivery-contract"),
+			});
+			if (capacityObservation) {
+				validatedOutput = { ...validatedOutput, diagnostics: [
+					...(validatedOutput.diagnostics ?? []),
+					{ code: "model_authored_consistency", message: capacityObservation },
+				] };
+			}
+		}
+		if (validatedOutput.ok && isBeatSheetArtifact
+			&& jsonObjectContract?.requiredArrayFields?.includes("assetPlans")) {
+			try {
+				const beatSheet = { text: validatedOutput.text };
+				/*
+				 * 交付文本是剥掉 objectRegistry 的紧凑投影，而计划的角色必须从章级注册表编译
+				 * （现行合同要求计划用 objectId 命名对象）。这里把作者原始候选里的注册表显式
+				 * 传给投影；缺了它任何按合同写对的计划都无法编译出角色，作者永远过不了这一关。
+				 */
+				const authoringObjectRegistry = ((): readonly unknown[] => {
+					try {
+						const parsed = JSON.parse(agentResult.text) as unknown;
+						return isRecord(parsed) && Array.isArray(parsed.objectRegistry) ? parsed.objectRegistry : [];
+					} catch {
+						return [];
+					}
+				})();
+				const reuse = reusableWorkflowAssetRoleFacts(
+					{ ...inputs, "beat-sheet": [beatSheet] }, runtimeProjectContext(context), resolveVideoAssetRoleAllowlist(beatSheet),
+				);
+				const plans = projectVideoAssetPlansFromBeatSheet(beatSheet, Object.keys(reuse), authoringObjectRegistry);
+				buildVideoAssetPlanCollection({ executionId: context.executionId, nodeId: context.node.id,
+					beatSheetAgentResult: beatSheet, assetAgentResult: plans, reusableAssetFacts: reuse });
+			} catch (error: unknown) {
+				validatedOutput = { ok: false, errorMessage: `Workflow asset planning contract: ${error instanceof Error ? error.message : String(error)}` };
+			}
 		}
 		if (validatedOutput.ok && outputArtifactType === "tapcanvas.asset-plans/v1") {
 			try {
@@ -4068,7 +6458,7 @@ async function executeRegisteredWorkflowNodeOnce(
 				buildVideoAssetPlanCollection({
 					executionId: context.executionId,
 					nodeId: context.node.id,
-					beatSheetAgentResult: firstInput(context.inputs, "beat-sheet"),
+					beatSheetAgentResult: firstInput(inputs, "beat-sheet"),
 					assetAgentResult: { text: validatedOutput.text },
 					reusableAssetFacts: assetPlanningReusableFacts,
 				});
@@ -4095,7 +6485,6 @@ async function executeRegisteredWorkflowNodeOnce(
 				};
 			}
 		}
-		const requestTerminal = parseAgentRequestTerminal(agentResult.requestTerminal);
 		const hasRecordedStructuredCandidate = isTypedOutput
 			&& agentResult.text.trim().length > 0;
 		const finalizeOutputContractFailure = !validatedOutput.ok
@@ -4103,9 +6492,20 @@ async function executeRegisteredWorkflowNodeOnce(
 				hasRecordedStructuredCandidate
 				|| requestTerminal?.status === "succeeded"
 			);
+		const typedRateLimitRetryableResult = isTypedOutput
+			&& !hasRecordedStructuredCandidate
+			&& requestTerminal?.status === "failed"
+			&& isWorkflowAgentRateLimitFailureCode(requestTerminal.reason);
 		const finalizeMissingTypedSubmission = isTypedOutput
 			&& !validatedOutput.ok
-			&& !finalizeOutputContractFailure;
+			&& !finalizeOutputContractFailure
+			// An infrastructure/provider suspension may end the current physical
+			// window before a candidate exists. Keep the node waiting only when the
+			// result carries machine-issued continuation/retry evidence; an arbitrary
+			// suspended terminal still follows the typed failure path.
+			&& !typedRateLimitRetryableResult
+			&& !providerReplanEvidence
+			&& !typedAgentResultSuspensionIsContinuable(agentResult.deliveryEvidence, requestTerminal);
 		const finalizeTypedFailure = finalizeOutputContractFailure || finalizeMissingTypedSubmission;
 		if (validatedOutput.ok && validatedOutput.diagnostics?.length) {
 			console.warn(JSON.stringify({
@@ -4114,6 +6514,14 @@ async function executeRegisteredWorkflowNodeOnce(
 				nodeId: context.node.id,
 				artifactType: outputArtifactType,
 				diagnostics: validatedOutput.diagnostics,
+			}));
+		}
+		if (agentResult.structuredOutputReviewProjectionIssue) {
+			console.warn(JSON.stringify({
+				event: "workflow_agent_structured_output_review_projection_degraded",
+				executionFamilyId: context.executionFamilyId,
+				nodeId: context.node.id,
+				issue: agentResult.structuredOutputReviewProjectionIssue,
 			}));
 		}
 		const atomicDelivery = requestTerminal?.status === "succeeded"
@@ -4129,18 +6537,38 @@ async function executeRegisteredWorkflowNodeOnce(
 				terminalReason: requestTerminal.reason,
 			})
 			: null;
+		const atomicProjection = projectAtomicAuthorSelfCheckMetadata(agentResult,
+			`sha256:${createHash("sha256").update(authoredCandidateText, "utf8").digest("hex")}`);
+		if (atomicProjection.atomicAuthorSelfCheckProjectionIssue) console.warn(JSON.stringify({
+			event: "workflow_agent_atomic_author_selfcheck_projection_issue",
+			executionFamilyId: context.executionFamilyId, nodeId: context.node.id,
+			issue: atomicProjection.atomicAuthorSelfCheckProjectionIssue,
+		}));
+		const {
+			atomicAuthorSelfCheck: _sourceObservation,
+			atomicAuthorSelfCheckProjectionIssue: _sourceProjectionIssue,
+			...sourceAgentResult
+		} = agentResult;
 		const normalizedAgentResult = validatedOutput.ok
 			? {
-				...agentResult,
+				...sourceAgentResult,
 				text: validatedOutput.text,
+				...atomicProjection,
 				...(atomicDelivery ?? {}),
 			}
-			: agentResult;
+			: { ...sourceAgentResult, ...atomicProjection };
+		const authorSourceProjection = validatedOutput.ok && outputEncoding !== "plain_text"
+			? projectWorkflowAuthorSource({ identity: { ownerId: context.ownerId, flowId: context.flowId,
+				flowVersionId: context.flowVersionId, sourceExecutionId: context.executionId,
+				leafNodeId: context.node.id, taskId: agentResult.taskId }, accepted: agentResult.acceptedAuthorSource,
+				transportSteps: agentResult.authorSourceTransportSteps, hostInputText: agentResult.text,
+				deliveryText: validatedOutput.text, frozenInputs: inputs })
+			: {};
 		const agentOutput = output({
 			node: context.node,
 			executorRef,
 			ports: { [primaryOutputPort(data, "result")]: normalizedAgentResult },
-			artifacts: [
+			artifacts: retainWorkflowAgentRepairArtifacts(retainedRepairArtifacts, [
 				...(validatedOutput.ok
 					? [{ type: outputArtifactType, identity: agentResult.taskId, value: validatedOutput.text }]
 					: []),
@@ -4149,12 +6577,19 @@ async function executeRegisteredWorkflowNodeOnce(
 					identity: asset.assetId,
 					value: asset.url,
 				})),
-			],
+			]),
 			evidence: {
 				taskId: agentResult.taskId,
 				outputEncoding,
 				outputArtifactType,
-				structuredOutputSubmissionPolicy: WORKFLOW_STRUCTURED_OUTPUT_SUBMISSION_POLICY,
+				structuredOutputSubmissionPolicy: submissionPolicy,
+				...(toolPolicy === undefined ? {} : { workflowAgentToolPolicy: toolPolicy }),
+				deliveryEvidence: agentResult.deliveryEvidence,
+				...(toolScopeDiagnostics.length > 0 ? { toolScopeDiagnostics } : {}),
+				...(outputRepair ? { outputRepair } : {}),
+				...(candidateRevalidation === undefined ? {} : { acceptedAuthorRecoveryRevalidated: candidateRevalidation }),
+				...(acceptedAuthorRecovery?.sourceDiagnostics.length
+					? { acceptedAuthorRecoverySourceDiagnostics: acceptedAuthorRecovery.sourceDiagnostics } : {}),
 				...(agentResult.executionProvenance
 					? { executionProvenance: agentResult.executionProvenance }
 					: {}),
@@ -4163,6 +6598,27 @@ async function executeRegisteredWorkflowNodeOnce(
 					: {}),
 				...(agentResult.promptExampleCandidateSearch
 					? { promptExampleCandidateSearch: agentResult.promptExampleCandidateSearch }
+					: {}),
+				...(agentResult.knowledgeCandidateSearch
+					? { knowledgeCandidateSearch: agentResult.knowledgeCandidateSearch }
+					: {}),
+				...(agentResult.retrievalCandidateSets?.length
+					? { retrievalCandidateSets: agentResult.retrievalCandidateSets }
+					: {}),
+				...(agentResult.upstreamRequestContextMetrics ? { upstreamRequestContextMetrics: agentResult.upstreamRequestContextMetrics } : {}),
+				...(agentResult.upstreamRequestContextMetricsIssue ? { upstreamRequestContextMetricsIssue: agentResult.upstreamRequestContextMetricsIssue } : {}),
+				...(agentResult.upstreamRequestContexts?.length
+					? { upstreamRequestContexts: agentResult.upstreamRequestContexts }
+					: {}),
+				...atomicProjection,
+				...(agentResult.structuredOutputReview
+					? { structuredOutputReview: agentResult.structuredOutputReview }
+					: {}),
+				...(agentResult.structuredOutputReviewProjectionIssue
+					? { structuredOutputReviewProjectionIssue: agentResult.structuredOutputReviewProjectionIssue }
+					: {}),
+				...(agentResult.structuredOutputFailure
+					? { structuredOutputFailure: agentResult.structuredOutputFailure }
 					: {}),
 				...(finalizeTypedFailure
 					? {
@@ -4190,6 +6646,7 @@ async function executeRegisteredWorkflowNodeOnce(
 							code: "structured_output_invalid",
 							message: validatedOutput.errorMessage,
 							rawOutputRecorded: hasRecordedStructuredCandidate,
+							requestTerminal: agentResult.requestTerminal,
 						},
 					}
 					: {}),
@@ -4200,27 +6657,86 @@ async function executeRegisteredWorkflowNodeOnce(
 							phase: "before_structured_submission",
 							retryable: false,
 						},
+
 					}
 					: {}),
 			},
 		});
-		// A non-empty typed candidate is the model's one authorized submission.
-		// Once that candidate fails the frozen executable contract, no Agent
-		// suspension, rate-limit terminal, delivery receipt or physical retry may
-		// downgrade the node into waiting or admit another model budget window.
+		// A rejected candidate retains both its exact physical cursor and verifier
+		// evidence so the same logical node repairs it instead of replaying history.
 		if (finalizeOutputContractFailure && !validatedOutput.ok) {
-			return {
-				ok: false,
-				errorCode: "workflow_node_runtime_failed",
-				errorMessage: `Workflow Agent node ${context.node.id} violated its ${outputEncoding} output contract: ${validatedOutput.errorMessage}`,
-				outputRefs: agentOutput.outputRefs,
+			console.warn(JSON.stringify({
+				message: "workflow_agent_output_rejected",
+				executionId: context.executionId,
+				nodeId: context.node.id,
+				taskId: agentResult.taskId,
+				error: validatedOutput.errorMessage,
+			}));
+			if (!agentOutput.ok) return agentOutput;
+			return workflowNodeWaiting(
+				{
+					...agentOutput.outputRefs,
+					ports: {},
+					evidence: {
+						...agentOutput.outputRefs.evidence,
+						executorCompleted: false,
+						continuationReason: "structured_output_repair_required",
+						requestTerminal: {
+							version: 1,
+							terminal: true,
+							status: "suspended",
+							reason: "structured_output_repair_required",
+						},
+						outputRepair: {
+							version: 1,
+							sourceTurnId: agentResult.taskId,
+							candidate: agentResult.text,
+							error: validatedOutput.errorMessage,
+						},
+					},
+				},
+				workflowAgentExternalCheckSchedule({
+					deliveryEvidence: agentResult.deliveryEvidence,
+					reason: "structured_output_repair_required",
+				}),
+			);
+		}
+		if (failurePolicy !== "single_submission" && providerReplanEvidence && requestTerminal?.status === "failed") {
+			const providerRecoveryEvidence = {
+				...(isRecord(agentResult.deliveryEvidence) ? agentResult.deliveryEvidence : {}),
+				recoveryMode: "agent_replan",
+				providerResponseRejection: providerReplanEvidence,
+				retryablePhysicalFailure: false,
+				physicalFailureReason: "workflow_agent_provider_replan_required",
 			};
+			return workflowNodeWaiting(
+				{
+					...agentOutput.outputRefs,
+					ports: {},
+					evidence: {
+						...agentOutput.outputRefs.evidence,
+						executorCompleted: false,
+						continuationReason: "provider_response_replan_required",
+						deliveryEvidence: providerRecoveryEvidence,
+						requestTerminal: {
+							version: 1,
+							terminal: true,
+							status: "suspended",
+							reason: "workflow_agent_provider_replan_required",
+						},
+					},
+				},
+				workflowAgentExternalCheckSchedule({
+					deliveryEvidence: providerRecoveryEvidence,
+					reason: "provider_response_replan_required",
+				}),
+			);
 		}
 		if (finalizeMissingTypedSubmission) {
 			return {
 				ok: false,
 				errorCode: "workflow_node_runtime_failed",
-				errorMessage: `Workflow Agent node ${context.node.id} ended before its single structured submission: ${requestTerminal?.reason ?? "structured_submission_missing"}`,
+					errorMessage: `Workflow Agent node ${context.node.id} ended before its single structured submission: ${requestTerminal?.reason ?? "structured_submission_missing"}${isRecord(agentResult.structuredOutputFailure) && typeof agentResult.structuredOutputFailure.rationale === "string" ? ` (${agentResult.structuredOutputFailure.rationale})` : ""}`,
 				outputRefs: agentOutput.outputRefs,
 			};
 		}
@@ -4232,21 +6748,6 @@ async function executeRegisteredWorkflowNodeOnce(
 				outputRefs: agentOutput.outputRefs,
 			};
 		}
-		if (requestTerminal.status === "suspended") {
-			return workflowNodeWaiting({
-					...agentOutput.outputRefs,
-					ports: {},
-					artifacts: [],
-					evidence: {
-						...agentOutput.outputRefs.evidence,
-						executorCompleted: false,
-						continuationReason: requestTerminal.reason,
-					},
-				}, workflowAgentExternalCheckSchedule({
-					deliveryEvidence: normalizedAgentResult.deliveryEvidence,
-					reason: requestTerminal.reason,
-				}));
-		}
 		if (requestTerminal.status === "needs_input") {
 			return {
 				ok: false,
@@ -4256,7 +6757,7 @@ async function executeRegisteredWorkflowNodeOnce(
 			};
 		}
 		if (requestTerminal.status === "failed") {
-			if (isWorkflowAgentRateLimitFailureCode(requestTerminal.reason)) {
+			if (failurePolicy !== "single_submission" && isWorkflowAgentRateLimitFailureCode(requestTerminal.reason)) {
 				const previousDeliveryEvidence = previousEvidence && isRecord(previousEvidence.deliveryEvidence)
 					? previousEvidence.deliveryEvidence
 					: previousEvidence;
@@ -4323,6 +6824,16 @@ async function executeRegisteredWorkflowNodeOnce(
 			?? firstInput(context.inputs, "result")
 			?? firstDeclaredInput(context);
 		const expectedArtifactType = readString(data, "workflowDeliveryArtifactType");
+		const requiredFacts = data.workflowDeliveryRequiredFacts;
+		if (requiredFacts !== undefined) {
+			const values = isWorkflowCollection(result) ? result.items.map(item => item.value) : [result];
+			const failures = values.map(value => verifyDeliveryFacts(value, requiredFacts))
+				.filter(verification => verification.status !== "satisfied");
+			if (values.length === 0 || failures.length > 0) return {
+				ok: false, errorCode: "workflow_node_runtime_failed",
+				errorMessage: `Workflow delivery node ${context.node.id} has unmet persisted delivery facts: ${failures.flatMap(failure => failure.missingFacts).join(", ") || "empty delivery"}`,
+			};
+		}
 		const expectsPersistentMedia = expectedArtifactType === "tapcanvas.image/v1"
 			|| expectedArtifactType === "tapcanvas.video/v1"
 			|| expectedArtifactType === "tapcanvas.master-video/v1";
@@ -4384,6 +6895,9 @@ async function executeRegisteredWorkflowNodeOnce(
 					errorMessage: `Workflow delivery node ${context.node.id} did not receive a persistent HTTP(S) media URL`,
 				};
 			}
+			const coverageVerification = isRecord(result) && result.deliveryCoverage !== undefined
+				? verifyMediaDeliveryCoverage(MediaDeliveryCoverageSchema.parse(result.deliveryCoverage))
+				: null;
 			const promptPackage = firstInput(context.inputs, "prompt-package");
 			const promptPackageEvidence = isRecord(promptPackage) && isRecord(promptPackage.deliveryEvidence)
 				? promptPackage.deliveryEvidence
@@ -4401,6 +6915,7 @@ async function executeRegisteredWorkflowNodeOnce(
 				ports: {
 					"delivery-evidence": {
 						masterVideo: result,
+						...coverageVerification,
 						promptPackageEvidence,
 						promptPackageVerification,
 						mediaUrl,
@@ -4408,11 +6923,39 @@ async function executeRegisteredWorkflowNodeOnce(
 				},
 				artifacts: [{ type: expectedArtifactType, identity: context.node.id, value: mediaUrl }],
 				evidence: {
+					...coverageVerification,
 					verifiedItems: 1,
 					expectedArtifactType,
 					mediaUrl,
 					promptPackageEvidence,
 					promptPackageVerification,
+				},
+			});
+		}
+		const flowPatchTargetNodeId = readString(data, "workflowDeliveryTargetNodeId");
+		if (flowPatchTargetNodeId) {
+			const receipt = verifyFlowPatchDeliveryReceipt(result, flowPatchTargetNodeId);
+			if (!receipt) {
+				return {
+					ok: false,
+					errorCode: "workflow_node_runtime_failed",
+					errorMessage: `Workflow delivery node ${context.node.id} did not receive a persisted flow patch receipt for target node ${flowPatchTargetNodeId}`,
+				};
+			}
+			return output({
+				node: context.node,
+				executorRef,
+				ports: {
+					"delivery-evidence": {
+						requirement: readString(data, "workflowDeliveryRequirement"),
+						flowPatch: receipt,
+					},
+				},
+				evidence: {
+					verifiedItems: 1,
+					flowPatchTargetNodeId,
+					flowPatchContentLength: receipt.contentLength,
+					flowPatchUpdatedAt: receipt.updatedAt,
 				},
 			});
 		}
@@ -4455,7 +6998,7 @@ export async function executeRegisteredWorkflowNode(
 	dependencies: WorkflowNodeExecutorDependencies,
 ): Promise<WorkflowNodeExecutionResult> {
 	const executorRef = resolveWorkflowNodeExecutorRef(context.node);
-	if (executorRef === "tapcanvas.video.generate/v1") {
+	if (executorRef === "tapcanvas.video.generate/v1" || executorRef === "tapcanvas.video.prepare/v1") {
 		const productionPlan = firstInput(context.inputs, "production-plan");
 		if (isWorkflowCollection(productionPlan)) {
 			try {
@@ -4472,6 +7015,7 @@ export async function executeRegisteredWorkflowNode(
 			}
 		}
 	}
-	const result = await executeWorkflowNodeByMode(context, dependencies, executeRegisteredWorkflowNodeOnce);
+	const result = await executeWorkflowNodeByMode(context, dependencies, (itemContext, itemDependencies) =>
+		executeWithImmediateOutputRepair(itemContext, itemDependencies, executeRegisteredWorkflowNodeOnce));
 	return bindWorkflowNodeExecutionResultPorts(context, result);
 }

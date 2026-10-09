@@ -1,3 +1,4 @@
+
 <p align="center">
   <img src="./apps/web/public/tapcanvas-app-icon.svg" width="128" alt="TapCanvas" />
 </p>
@@ -8,6 +9,7 @@
 
 <p align="center">
   <a href="https://github.com/anymouschina/TapCanvas/stargazers"><img src="https://img.shields.io/github/stars/anymouschina/TapCanvas?style=flat-square" alt="GitHub Stars" /></a>
+  <a href="https://atomgit.com/anymouschina/TapCanvas" target="_blank" rel="noopener noreferrer"><img src="https://atomgit.com/anymouschina/TapCanvas/star/badge.svg" alt="AtomGit Star" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript strict" />
   <img src="https://img.shields.io/badge/pnpm-10.8.1-f69220?style=flat-square&logo=pnpm&logoColor=white" alt="pnpm 10.8.1" />
@@ -15,7 +17,7 @@
 
 # TapCanvas 社区版
 
-TapCanvas 把创意、脚本、角色与场景资产、分镜、图像、视频和最终成片放进同一个可追溯的画布工作流。它不是单次模型调用器：Agents 会读取真实项目与画布状态，自主选择 Skills 和工具，执行多步生产，并以节点、资产和运行记录交付结果。在线网站核心功能及样式与当前项目完全一致，截止 26.8.31。
+TapCanvas 把创意、脚本、角色与场景资产、分镜、图像、视频和最终成片放进同一个可追溯的画布工作流。它不是单次模型调用器：Agents 会读取真实项目与画布状态，自主选择 Skills 和工具，执行多步生产，并以节点、资产和运行记录交付结果。在线网站核心功能及样式与当前项目完全一致。
 
 > **版本边界：** 本仓库是 TapCanvas 社区版，在线商业版是独立产品，功能、服务与条款均不相同。社区版不提供短信验证码与在线支付；模型渠道由使用者自行配置。
 
@@ -32,6 +34,53 @@ TapCanvas 把创意、脚本、角色与场景资产、分镜、图像、视频�
 - **项目化资产**：素材库、版本、生成历史、任务状态、交付证据与项目本地元数据持续沉淀，生成成功的资产不会被后处理丢弃。
 - **工作流与协作**：支持可复用 DAG、异步 Worker、失败恢复、分享/发布、团队作用域与实时画布状态。
 
+## 作品案例
+
+以下作品基于当前 TapCanvas 项目制作，点击封面观看，后续案例将持续补充。
+
+| 预览 | 作品 | 规格 | 制作 |
+| --- | --- | --- | --- |
+| <a href="https://file.beqlee.icu/showcase/20261009/kaiju-xiangqin-nvshenbu-ch1-hyperframes-recut-720p.mp4"><img src="./assets/showcases/kaiju-xiangqin-ch1/cover.jpg" width="220" alt="开局相亲女神捕 · 第一章"></a> | **开局相亲女神捕，获独孤九剑 · 第一章**<br>原著：今日问道，第一章「独孤九剑」3,826 字 | 4 分 41 秒 · 1280×720 · 24 fps<br>80 条字幕 | 一键成片 v135 + HyperFrames 剪辑<br>创作：claude-sonnet-5-5<br>[元数据](./assets/showcases/kaiju-xiangqin-ch1/metadata.json) · 2026-10-09 |
+| <a href="./assets/showcases/full-story-subtitled/video.mp4"><img src="./assets/showcases/full-story-subtitled/cover.jpg" width="220" alt="完整剧情 · 清晰字幕版"></a> | **完整剧情 · 清晰字幕版**<br>完整剧情成片，含清晰字幕 | 1 分 0 秒 · 1280×720 · 24 fps<br>MP4 9.36 MB | 2026-10-08 |
+
+## 项目历史
+
+https://github.com/user-attachments/assets/152df957-dcf1-4984-bc8e-ebf7b5392987
+
+## 更新日志
+
+默认展示最新 10 条，较早记录展开查看。
+
+- **2026-10-07 · 一键成片 v135**：同步全章剧情与时间线规划、分项资产创作、逐 Clip 提示词与媒体生产，以及最新创作 Skills；编辑器与执行器共用工作流定义，继续使用社区版 DeepSeek Harness Bridge。新增 v135 系统工作流发布文件，保留历史执行和生成资产。
+- **2026-10-07 · 画布修复**：复制节点和分组时保留素材与提示词、隔离执行身份并重映射引用；修复分组下载遗漏视觉组内素材的问题。
+- **2026-09-23 · 导演台升级**：同步 TapCanvasPro 的独立导演台，基于 [DirectorDesk](https://github.com/mangfufu/director-desk) 提供三维场景搭建、角色走位与摄影机预演；接入 TapCanvas AI 对话、工具中继和参考视频导出回画布，替换旧内嵌实现，并补充 MIT 许可鸣谢。Web 开发和构建会自动构建导演台，本地首次使用需安装其独立依赖。
+- **2026-09-21 · Agent 配置更新**：已添加工作流支持一键“更新并覆盖”，检查通过后直接更新当前装配，无需再次逐项确认；沿用原作用范围与已确认的替换、并列关系，保留历史版本、执行记录和生成资产。
+- **2026-09-21 · 冲突判定修正**：工作流共用工具或输出格式仅展示为提示，不再直接要求二选一；职责冲突仍由 Agent 分析，阻断错误与版本竞态明确报出。
+- **2026-09-21 · 配置列表修复**：补齐工作流更新时间与首次装载时间的前后端契约，修复 Agent 配置列表因缺少时间字段而加载失败的问题；配置更新相关前后端测试共 94 项通过。
+- **2026-09-21**：整理项目说明，移除过期截止日期与能力完成度待办章节。
+- **2026-09-20**：同步 v90 视频生产工作流并适配 DeepSeek Harness 运行时；画布生成操作统一接入主 AI 对话，修复章节资产与设计操作的模型传递及本地登录会话问题。
+- **2026-09-16**：补充 AtomGit 徽章、项目鸣谢与贡献者说明。
+- **2026-09-11**：扩展 HeyRoute 渠道与模型配置，补充文本、图片和视频的渠道独立计价。
+
+<details>
+<summary>更早更新记录（6 条）</summary>
+
+- **2026-09-10**：接入 HeyRoute 渠道，新增推广注册链接与 API Key 申请入口。
+- **2026-09-08**：更新一键成片相关实现与配套技能。
+
+- **2026-09-06**：恢复 Agent 运行结果预览。
+- **2026-09-05**：接入 Agnes 图片与视频渠道，完善模型参数契约和 GPT Image 2 请求校验，修复视频时长范围计价与参考图免费额度计算。
+- **2026-09-04**：按官方接口契约修正 Agnes 视频生成请求格式。
+- **2026-09-03**：完善 Docker 部署与依赖构建，支持容器内构建 Web 和模型管理台，并自动初始化本地配置与密钥。
+
+</details>
+
+## HeyRoute 注册福利与渠道配置
+
+通过 [HeyRoute 推广链接注册](https://heyroute.ai/r/c/ch_iiq2tvtmrc)可领取 **$15 额度**，可使用 Codex、Claude、Gemini 对话及平台提供的生图能力（具体领取条件与可用模型以 HeyRoute 页面为准）。
+
+社区版内置 7 个 HeyRoute 渠道，共 31 个模型：15 个对话模型（Claude、GPT、Grok、Gemini、Kimi）、5 个图片模型和 11 个视频模型。新增视频包括 Grok、MiniMax H3 与 Seedance 系列，文本、图片和视频均支持渠道独立计价。首次部署后，在鲁班 API（new-api）管理台的渠道列表或编辑窗口点击 **申请 API Key**，通过上述链接注册，填写自己的 Key 并启用所需渠道。新增渠道默认停用且 Key 为空，不包含维护者私人凭据；升级保留已有 Key 和启用状态。初始化配置见 [`004-expand-heyroute-channels.sql`](apps/new-api/patches/2026-09-11/004-expand-heyroute-channels.sql)，详细说明见 [HeyRoute 接入说明](apps/new-api/docs/heyroute.md)。
+
 ## 当前架构
 
 <p align="center">
@@ -42,7 +91,7 @@ TapCanvas 把创意、脚本、角色与场景资产、分镜、图像、视频�
 
 主链路是 **无限画布 → Agents Bridge → 生产工作流内核 → 任务与媒体 Workers → 可验证交付**。Agents 根据真实项目状态按需调用 Skills、MCP、子代理与工作流；图片、视频和音频任务经鲁班 API 进入 AIGC 模型，再由任务账本、队列、租约、幂等、重试与 reconcile，以及真实资产 URL 和 delivery evidence，保证长链路生产可恢复、可追溯、可验收。
 
-> **一键成片边界：** 底层 AIGC、工作流编排、异步执行与交付验收能力已经具备，但固定的一键成片产品入口尚未上线，当前需要自行编排工作流。点击架构图可打开带导览与节点说明的交互版本。
+> **一键成片边界：** 社区版提供 v135 系统工作流与管理员画布模板入口，可经已装配工作流执行；运行前需自行配置可用的 Agent、图片与视频模型渠道。仅生成视频节点和完整成片共用同一份章节计划，媒体生成依赖真实上游资产。点击架构图可打开带导览与节点说明的交互版本。
 
 Monorepo 的职责边界：`apps/web` 负责交互与确定性画布执行，`apps/hono-api` 负责协议、权限、任务与事实证据，`apps/agents-cli` 是 DeepSeek Harness 的 TapCanvas Bridge，`apps/new-api` 负责模型网关，`packages/schemas` 保存前后端共享契约。AI 对话架构细节见 [apps/hono-api/README.md](./apps/hono-api/README.md)，Bridge 说明见 [apps/agents-cli/README.md](./apps/agents-cli/README.md)。
 
@@ -71,8 +120,11 @@ cd TapCanvas
 ```bash
 corepack enable
 pnpm -w install --frozen-lockfile
+npm --prefix apps/director-desk ci
 pnpm dev:web
 ```
+
+本地浏览器入口统一使用 `http://localhost:5175`。通过 `127.0.0.1` 或 `[::1]` 打开 Web 时，应用启动前会跳转到 `localhost`，保留协议、端口、路径、查询参数与 hash；源码开发、预览和 Docker 静态构建使用同一入口规则。浏览器不会在这些主机名之间共享 Cookie 或 localStorage，统一入口可避免登录态割裂和跨站 Cookie 丢失。GitHub OAuth 本地回调也应配置为 `http://localhost:5175/oauth/github`。
 
 ### 环境变量
 
@@ -98,6 +150,28 @@ docker-compose --env-file apps/hono-api/.env ps # 当前主机使用 standalone 
 
 TapCanvas 根项目及未另行声明的代码按 [MIT License](./LICENSE) 发布。`apps/new-api` 是独立上游衍生组件，继续适用其目录中的 [GNU AGPL-3.0 License](./apps/new-api/LICENSE) 与原始归属声明；其他第三方组件分别适用各自许可证。在线商业版不适用本仓库协议。
 
+## 鸣谢
+
+感谢以下平台与开源项目，TapCanvas 的托管、推广与实现都建立在它们之上。
+
+- **[AtomGit](https://atomgit.com/gcw_PzejWSbY/TapCanvas) / GitCode**：提供代码托管、开源社区推广与 Badge 数据服务，上述链接即本项目在 AtomGit 的项目入口。
+
+上游开源项目：
+
+| 项目                                                                              | 在本仓库中的职责                                          |
+| --------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| [new-api](https://github.com/QuantumNous/new-api)（上游为 [One API](https://github.com/songquanpeng/one-api)） | `apps/new-api` 模型网关的来源实现，负责渠道接入、计量与模型下发 |
+| [DirectorDesk](https://github.com/mangfufu/director-desk)                        | `apps/director-desk` 导演台的三维预演、场景搭建、走位与摄影机工具；本目录按 MIT 许可集成 |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)                | `apps/agents-cli` Bridge 的官方运行时、主代理循环与工具能力 |
+| [React Flow](https://github.com/xyflow/xyflow)（`@xyflow/react`）                    | 无限画布的节点、端口与连线内核                            |
+| [Mantine](https://github.com/mantinedev/mantine)                                   | Web 端 UI 组件与主题                                      |
+| [Hono](https://github.com/honojs/hono)                                             | `apps/hono-api` 的 Worker 路由与 OpenAPI 层               |
+| [Prisma](https://github.com/prisma/prisma)                                         | 数据模型与数据库访问                                      |
+| [Vite](https://github.com/vitejs/vite) / [Vitest](https://github.com/vitest-dev/vitest) | Web 构建与测试                                        |
+| [AI SDK](https://github.com/vercel/ai)、[Zustand](https://github.com/pmndrs/zustand)、[Tabler Icons](https://github.com/tabler/tabler-icons) | 模型调用、前端状态管理与图标 |
+
+具体依赖版本以 `apps/*/package.json` 与 `pnpm-lock.yaml` 为准；第三方组件各自适用其上游许可证，见[许可证](#许可证)。
+
 ## 感谢贡献者
 
 感谢每一位通过代码、文档、Issue、评审、测试与使用反馈帮助 TapCanvas 持续完善的贡献者。
@@ -107,8 +181,6 @@ TapCanvas 根项目及未另行声明的代码按 [MIT License](./LICENSE) 发�
     <img src="https://contrib.rocks/image?repo=anymouschina/TapCanvas&v=20260905" alt="TapCanvas Contributors" />
   </a>
 </p>
-
-贡献者头像由 [contrib.rocks](https://contrib.rocks/) 根据 GitHub 默认分支的贡献记录动态生成。GitHub 与图像服务存在缓存，合并 MR 后可能需要最多约 72 小时才会显示；提交邮箱也必须能关联到对应的 GitHub 账号，贡献才能正确归因。
 
 每一次贡献都在帮助社区版变得更统一、更稳定，也让多模态内容生产工作流能够服务更多创作者。欢迎阅读现有 Issues、提交修复或分享你的工作流实践。
 
@@ -123,46 +195,3 @@ Bug、功能建议与贡献请通过 [Issues](https://github.com/anymouschina/Ta
 ## Star 趋势
 
 [![TapCanvas Star History](https://star-history.dera.page/svg?repos=anymouschina/TapCanvas&type=Date)](https://star-history.dera.page/#anymouschina/TapCanvas&Date)
-
-## 能力完成度与待办
-
-### 已完成：剧本与分镜前置链路
-
-- [X] **小说/剧本导入与章节锚定**：支持导入长文本并保存章节原文；章节画布以只读 `chapter-info` 节点保留标题与正文真源。
-- [X] **剧本文档与资产沉淀**：`novelDoc` / `scriptDoc` 是可编辑、可保存、可进入项目素材库并可作为后续分镜与视频上游的正式节点类型。
-- [X] **Agent 创建与改写剧本**：Agents 可通过统一画布补丁创建或更新 `scriptDoc`，把小说章节提炼成可继续人工编辑和下游消费的剧本文本。
-- [X] **剧本拆解资产**：可从剧本/章节文本提取结构化角色并生成场景参考，形成带身份锚点的角色卡与场景卡。
-- [X] **分镜脚本与分镜表**：同时支持纯文本 `storyboardScript` 和结构化 `shotTable`；后者可编辑镜号、时间、景别、机位、运镜、主体、动作、场景、光线与构图。
-- [X] **对白与说话人合同**：视频 authoring 使用结构化 `speechEvents`、台词顺序与 `speakerBindings`，镜头通过事件 ID 引用对白，避免正文散落到视觉字段。
-- [X] **章节分镜连续性与持久化**：`storyboardPlans` / `storyboardChunks` 写入项目元数据；续组严格读取直接前驱的真实 `tailFrameUrl`，缺失时显式失败。
-
-<details>
-<summary><strong>待办：图片与视频节点闭环（展开查看）</strong></summary>
-
-### 图片与视频节点闭环
-
-下面只记录已经存在产品入口或中间实现、但还没有完成端到端闭环的事项。这里的“闭环”是指：用户动作产生真实任务或资产，状态准确回填到原节点或明确的结果节点，结果进入 Assets 并持久化，刷新或服务重启后可恢复，取消与重试具有幂等语义，最后有自动化测试证明。仅仅没有配置某个第三方模型，不视为代码缺陷。
-
-#### P0：图片与视频共用链路
-
-- [ ] **统一持久任务与回收链路**：把图片转 3D、全景图、视频增强、去字幕和主体消除等仍由浏览器长轮询的动作接入统一任务账本；占位节点必须持久化 `taskId`，刷新页面、关闭标签页或服务重启后仍能由后端 reconcile 回填同一节点，且不得重复提交付费任务。
-- [ ] **资产写入原子化**：图片/视频上传、编辑、合成和音视频分离只有在获得真实 HTTP(S) 资产 URL 与 `assetId` 后才允许进入成功态；禁止把 `blob:`、`data:` 或仅当前会话可见的本地预览保存成最终节点结果。上传或转存失败时应保留可诊断的失败状态与可执行重试入口。
-- [ ] **模型目录硬切换**：图片转 3D、视频增强及其他媒体动作全部从系统模型目录按能力标签、规格与价格动态选择，移除前端写死的 vendor/model key；目录未加载、无精确能力或规格不匹配时原地显式失败。
-- [ ] **取消、超时与重试闭环**：节点“停止”必须作用到真实在飞任务与轮询器；以 `taskId + runToken/幂等键` 隔离不同尝试，防止旧结果覆盖新任务。供应商已经成功产出的资产必须被回收和记录，不能因前端取消、超时或断连而丢失。
-- [ ] **统一事实与诊断字段**：所有媒体结果都记录 `assetId`、`taskId`、来源节点、实际模型、执行规格、结果 URL 和失败原因；历史结果与主结果索引在保存、重载和协作同步后保持一致，错误信息不能只剩“生成失败，请稍后重试”。
-- [ ] **能力驱动的操作入口**：图片/视频工具栏根据动态模型目录和本地执行器的真实能力展示或禁用操作，并说明缺失条件；禁止让用户进入一个最终只能提示“能力未接入”的编辑流程。
-
-#### P1：图片节点
-
-- [ ] **图片上传与批量结果一致性**：多图上传逐项落真实资产、逐项记录成功或失败，部分失败不能留下会在刷新后失效的本地 URL，也不能把失败项伪装成可供远程生成消费的图片节点。
-- [ ] **图片转 3D 结果协议**：为 3D 资产补齐明确的结果类型、`assetId`、预览、下载、复用和下游端口契约，不再只把 `model3dUrl` 挂在普通 `kind=image` 节点的临时字段上。
-- [ ] **图片派生操作统一验收**：裁剪、扩图、重绘、擦除、去噪、抠图、分层、多角度、打光、情绪、旋转与全景图统一经过“真实源图校验 → 占位状态 → 执行 → Assets 登记 → 结果节点/来源连线 → 失败可重试”验收，并补刷新恢复、上传失败和多结果主图切换测试。
-
-#### P1：视频节点
-
-- [ ] **多视频上传不覆盖历史**：连续或批量上传时必须基于节点最新状态追加 `videoResults`，为每个文件保存独立 `assetId` 与状态，并正确更新 `videoPrimaryIndex`；不能因闭包中的旧数组让后一个文件覆盖前一个结果。
-- [ ] **音视频分离任务化**：将浏览器内 demux 升级为可恢复的媒体任务，支持大文件、进度、取消、失败重试与后台回填；无声视频和独立音轨都必须进入 Assets，并与源视频保持可追溯连线。
-- [ ] **视频合成持久交付**：合成结果不能以临时 `blob:` URL 作为可交付成功态；转存失败后应由持久任务继续重试或明确失败，最终成片需有真实 URL、资产记录、来源片段/音轨清单和可验证的交付证据。
-- [ ] **视频操作端到端测试**：为视频增强、智能/框选去字幕、主体消除、片段重拍、智能续写、首尾帧生成、截帧、音视频分离与合成补真实 handler/runner 契约测试，覆盖模型不可用、供应商失败、刷新恢复、取消、重复点击和成功资产回填。
-
-</details>

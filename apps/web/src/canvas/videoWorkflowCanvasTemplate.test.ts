@@ -1,22 +1,29 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import type { Node } from '@xyflow/react'
+import { chapterSequenceSchema } from '../../../../packages/schemas/chapter-sequence/index.mjs'
 import { useRFStore } from './store'
 import {
   VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT,
   VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
+  VIDEO_WORKFLOW_DEFAULT_MAX_CLIPS,
   VIDEO_WORKFLOW_EXECUTION_CONCURRENCY,
+  VIDEO_WORKFLOW_SMALL_AUTHOR_MAX_OUTPUT_TOKENS,
+  VIDEO_WORKFLOW_CHAPTER_ASSET_PART_CONCURRENCY,
+  VIDEO_WORKFLOW_CLIP_PIPELINE_CONCURRENCY,
   VIDEO_ATOMIC_WORKFLOW_NODES,
   VIDEO_ATOMIC_WORKFLOW_EDGES,
-  VIDEO_FIRST_VIDEO_WORKFLOW_NODES,
-  VIDEO_FIRST_VIDEO_WORKFLOW_EDGES,
-  bindVideoWorkflowSourceGroup,
   buildVideoWorkflowCanvasDefinitionPatch,
   createVideoWorkflowCanvasTemplate,
-  needsVideoWorkflowCanvasDefinitionUpgrade,
   restoreVideoWorkflowDefaultConnections,
-  upgradeVideoWorkflowCanvasDefinition,
 } from './videoWorkflowCanvasTemplate'
+import {
+  parseWorkflowPipelineRunSpec,
+  resolveWorkflowExecutorPortArtifactContract,
+  WORKFLOW_PIPELINE_RUN_EXECUTOR_REF,
+} from '@tapcanvas/workflow-kernel-protocol'
 
 function canonicalDefinitionFingerprint(value: unknown): string {
   const normalize = (candidate: unknown): unknown => {
@@ -24,8 +31,8 @@ function canonicalDefinitionFingerprint(value: unknown): string {
     if (!candidate || typeof candidate !== 'object') {
       return typeof candidate === 'string'
         ? candidate
-            .replaceAll('workflow-contract-fixture', '<workflow-instance>')
-            .replaceAll('workflow-contract-group', '<workflow-group>')
+            .split('workflow-contract-fixture').join('<workflow-instance>')
+            .split('workflow-contract-group').join('<workflow-group>')
         : candidate
     }
     const record = candidate as Record<string, unknown>
@@ -47,640 +54,505 @@ const sourceGroup: Node = {
   data: { label: '来源素材' },
 }
 
-describe('one-click film workflow canvas template', () => {
+const authoredSequenceSchema = chapterSequenceSchema as Readonly<{
+  properties: Readonly<{
+    clips: Readonly<{ items: Readonly<{ properties: Readonly<Record<string, unknown>> }> }>
+  }>
+  required: readonly string[]
+}>
+
+describe('one-click film workflow v135 template', () => {
   beforeEach(() => {
     vi.stubGlobal('crypto', { randomUUID: () => 'workflow-test-id' })
-    useRFStore.getState().reset()
-    useRFStore.setState({ nodes: [sourceGroup], edges: [], nextGroupId: 1 })
+    useRFStoreReset()
   })
 
-  it('creates one admin trigger plus the atomic one-click film operations', () => {
+  it('plans every Clip and lands the whole chapter on the canvas before any media stage', () => {
+    const ids = VIDEO_ATOMIC_WORKFLOW_NODES.map((node) => node.nodeId)
+    const byId = new Map(VIDEO_ATOMIC_WORKFLOW_NODES.map((node) => [node.nodeId, node]))
+    const parents = (nodeId: string) => VIDEO_ATOMIC_WORKFLOW_EDGES
+      .filter((edge) => edge.targetNodeId === nodeId)
+      .map((edge) => edge.sourceNodeId)
+
+    expect(VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION).toBe(135)
+    expect(VIDEO_WORKFLOW_DEFAULT_MAX_CLIPS).toBe(80)
+    expect(ids).toEqual([
+      'canvas-source', 'delivery-contract', 'chapter-sequence-agent', 'chapter-sequence-project', 'chapter-assets-agent',
+      'chapter-asset-preview', 'clip-production-pipeline', 'clip-media-pipeline', 'node-only-verify', 'clip-production-aggregate',
+      'concat', 'delivery-verify',
+    ])
+    expect(VIDEO_ATOMIC_WORKFLOW_EDGES).toHaveLength(28)
+    // Canvas-first: asset cards and images start right after the chapter asset plan,
+    // in parallel with (not upstream of) per-Clip authoring.
+    expect(parents('chapter-asset-preview').sort()).toEqual(['chapter-assets-agent', 'delivery-contract'])
+    expect(parents('clip-production-pipeline')).not.toContain('chapter-asset-preview')
+    expect(byId.get('chapter-sequence-agent')).toMatchObject({
+      executionMode: 'once',
+      inputPorts: ['trigger', 'delivery-contract'],
+      outputArtifactTypes: { 'chapter-sequence': ['tapcanvas.chapter-sequence/v4'] },
+    })
+    expect(parents('chapter-sequence-agent')).toEqual(['manual-trigger', 'delivery-contract'])
+    expect(byId.get('chapter-sequence-project')).toMatchObject({
+      executorRef: 'video.chapter-sequence.project/v2',
+      executionMode: 'once',
+      inputPorts: ['chapter-sequence', 'delivery-contract'],
+      outputArtifactTypes: {
+        'chapter-sequence': ['tapcanvas.chapter-sequence-bound/v2'],
+        'clip-sequences': ['tapcanvas.chapter-sequence-clips/v2'],
+        'clip-segments': ['tapcanvas.clip-source-segments/v1'],
+      },
+    })
+    expect(parents('chapter-sequence-project')).toEqual(['chapter-sequence-agent', 'delivery-contract'])
+    expect(byId.get('chapter-assets-agent')).toMatchObject({
+      inputPorts: ['delivery-contract', 'chapter-sequence'],
+      inputArtifactTypes: { 'chapter-sequence': ['tapcanvas.chapter-sequence-bound/v2'] },
+    })
+    expect(parents('chapter-assets-agent')).toEqual(['delivery-contract', 'chapter-sequence-project'])
+    // Canvas-first barrier: one planning node authors every Clip and persists the
+    // whole chapter's nodes; it has no media authorization, so it cannot submit media.
+    expect(byId.get('clip-production-pipeline')).toMatchObject({
+      executorRef: WORKFLOW_PIPELINE_RUN_EXECUTOR_REF,
+      executionMode: 'once',
+      inputPorts: ['delivery-contract', 'source-segments', 'clip-sequences', 'chapter-assets'],
+      outputPorts: ['node-plan', 'prompt-package', 'media-items', 'prepared-nodes'],
+    })
+    expect(parents('clip-production-pipeline')).toEqual([
+      'chapter-sequence-project', 'chapter-sequence-project', 'chapter-assets-agent', 'delivery-contract',
+    ])
+    // Media starts only from the planning node's whole-chapter media items.
+    expect(byId.get('clip-media-pipeline')).toMatchObject({
+      executorRef: WORKFLOW_PIPELINE_RUN_EXECUTOR_REF,
+      executionMode: 'each',
+      inputPorts: ['authorization', 'delivery-contract', 'media-items'],
+    })
+    expect(parents('clip-media-pipeline')).toEqual(['clip-production-pipeline', 'delivery-contract', 'manual-trigger'])
+    expect(VIDEO_ATOMIC_WORKFLOW_EDGES.find((edge) => edge.targetNodeId === 'clip-media-pipeline' && edge.targetPort === 'media-items'))
+      .toEqual({ sourceNodeId: 'clip-production-pipeline', sourcePort: 'media-items', targetNodeId: 'clip-media-pipeline', targetPort: 'media-items' })
+    // 章节资产是一条「大纲 → 逐项并行作者 → 汇总」流水线；作者数据在步骤上，顶层节点不再是单个作者。
+    // 补丁把旧作者的契约显式清为 undefined，不会残留在流水线节点上。
+    expect(runtimeData('chapter-assets-agent').workflowAgentJsonObjectContract).toBeUndefined()
+    expect(runtimeData('chapter-assets-agent')).toHaveProperty('workflowPipeline')
+    expect(parents('node-only-verify')).toEqual(['clip-production-aggregate'])
+    expect(parents('clip-production-aggregate')).toEqual([
+      'clip-media-pipeline', 'clip-media-pipeline', 'clip-media-pipeline', 'clip-media-pipeline', 'chapter-sequence-project',
+    ])
+    expect(ids.some((id) => id.startsWith('opening-'))).toBe(false)
+    expect(ids).not.toContain('clip-production-agent')
+    expect(ids).not.toContain('video-submit')
+  })
+
+  it('authors the full story timeline before projecting physical windows and per-Clip media packets', () => {
+    const author = runtimeData('chapter-sequence-agent')
+    expect(author.workflowAtomicSpec).toMatchObject({ executionMode: 'once' })
+    expect(author.workflowAgentFailurePolicy).toBe('single_submission')
+    expect(author.workflowAgentExecutionPolicy).toBe('multi_inference')
+    expect(author.workflowAgentToolPolicy).toBe('scoped')
+    expect(author.workflowKnowledgeRetrieval).toBe(true)
+    expect(author.workflowRequiredSkills).toEqual(['tapcanvas-screenwriter', 'tapcanvas-video-authoring-stages'])
+    expect(author.workflowAgentOutputArtifactType).toBe('tapcanvas.chapter-sequence/v4')
+    expect(authoredSequenceSchema.required).toEqual([
+      'protocolVersion', 'wholeFilmIntent', 'totalDurationSeconds', 'storyEvents', 'speechEvents', 'boundaries', 'clips',
+    ])
+    expect(Object.keys(authoredSequenceSchema.properties.clips.items.properties)).toEqual([
+      'clipId', 'durationSeconds', 'storyEventIds', 'speechEventIds', 'startBoundaryId', 'endBoundaryId',
+    ])
+
+    const spec = planningPipelineSpec()
+    expect(spec.inputs.find((input) => input.portId === 'source-segments')?.mode).toBe('collection')
+    expect(spec.inputs.find((input) => input.portId === 'clip-sequences')?.mode).toBe('collection')
+    expect(spec.bindings.find((binding) => binding.to.stepId === 'clip-production-agent' && binding.to.portId === 'clip-segment')?.mode).toBe('collection')
+    expect(spec.bindings.find((binding) => binding.to.stepId === 'clip-production-agent' && binding.to.portId === 'clip-sequence')?.mode).toBe('collection')
+    const clipWriter = spec.steps.find((step) => step.stepId === 'clip-production-agent')?.node.data
+    expect(clipWriter?.workflowRequiredSkills).toEqual(['tapcanvas-video-prompt-writer', 'tapcanvas-video-authoring-stages'])
+    expect(clipWriter?.workflowPromptExampleMediaType).toBe('video')
+    expect(clipWriter?.workflowKnowledgeRetrieval).toBe(true)
+    expect(clipWriter?.workflowAgentFailurePolicy).toBe('single_submission')
+    expect(clipWriter?.workflowAgentExecutionPolicy).toBe('multi_inference')
+    expect(clipWriter?.workflowSkillRetrieval).not.toBe(false)
+    expect(clipWriter?.workflowAtomicSpec).toMatchObject({ executionMode: 'each', itemConcurrency: VIDEO_WORKFLOW_CLIP_PIPELINE_CONCURRENCY })
+    expect(String(clipWriter?.workflowInstruction)).toContain('clip-sequence.wholeFilmIntent')
+    expect(String(clipWriter?.workflowInstruction)).toContain('没有单镜时长')
+    expect(String(clipWriter?.workflowInstruction)).toContain('speechEventIds')
+    expect(String(clipWriter?.workflowInstruction)).toContain('sourceSlices/sourceRanges 仅用于回溯原文')
+    expect(String(clipWriter?.workflowInstruction)).toContain('内部节奏交给视频模型适配')
+    expect(String(clipWriter?.workflowInstruction)).not.toContain('下一段来源才发生的决定与动作不提前拍出')
+    const authorContract = clipWriter?.workflowAgentJsonObjectContract as Record<string, unknown>
+    const jsonSchema = authorContract.jsonSchema as { properties: { videoInputMode: { enum: string[] } } }
+    expect(authorContract.allowedFields).toEqual(Object.keys(jsonSchema.properties))
+    expect(jsonSchema.properties.videoInputMode.enum).toEqual(['image_to_video', 'reference_to_video', 'text_to_video'])
+    expect(String(clipWriter?.workflowInstruction)).toContain('依据供应商能力')
+    expect(String(clipWriter?.workflowInstruction)).toContain('imageSource')
+  })
+
+  it('declares explicit scalar and collection adapters, branch outputs, and the aggregate contract', () => {
+    const spec = planningPipelineSpec()
+    expect(spec.inputs.find((input) => input.portId === 'source-segments')?.mode).toBe('collection')
+    expect(spec.bindings.find((binding) => binding.to.stepId === 'clip-production-agent' && binding.to.portId === 'clip-segment')?.mode).toBe('collection')
+    expect(spec.bindings.find((binding) => binding.to.stepId === 'clip-production-agent' && binding.to.portId === 'chapter-assets')?.mode).toBe('value')
+    expect(spec.bindings.find((binding) => binding.to.stepId === 'clip-production-collect' && binding.to.portId === 'clip-segments')?.mode).toBe('collection')
+    expect(spec.inputs.find((input) => input.portId === 'clip-sequences')?.mode).toBe('collection')
+    // Planning ends at node materialization: no image or video step may run before
+    // every Clip node is on the canvas.
+    expect(spec.steps.map((step) => step.stepId)).toEqual([
+      'clip-production-agent', 'clip-production-collect', 'clip-production-nodes-materialize',
+    ])
+    expect(spec.outputs.map((output) => output.portId)).toEqual(['node-plan', 'prompt-package', 'media-items', 'prepared-nodes'])
+    expect(spec.bindings.find((binding) => binding.to.stepId === 'clip-production-nodes-materialize' && binding.to.portId === 'clip-production'))
+      .toMatchObject({ from: { kind: 'step', stepId: 'clip-production-collect', portId: 'clip-production' }, mode: 'collection' })
+    expect(spec.bindings.find((binding) => binding.to.stepId === 'clip-production-nodes-materialize' && binding.to.portId === 'asset-intents')?.from)
+      .toEqual({ kind: 'step', stepId: 'clip-production-collect', portId: 'asset-intents' })
+    expect(spec.bindings.find((binding) => binding.to.stepId === 'clip-production-nodes-materialize' && binding.to.portId === 'delivery-contract')?.mode)
+      .toBe('value')
+    const mediaSpec = mediaPipelineSpec()
+    expect(mediaSpec.inputs.find((input) => input.portId === 'media-items')?.itemArtifactTypes).toEqual(['tapcanvas.clip-production-media-item/v1'])
+    expect(mediaSpec.steps.map((step) => step.stepId)).toEqual([
+      'clip-production-media-project', 'clip-asset-image-generate', 'clip-production-project',
+      'voice-materialize', 'cost-estimate', 'production-handoff', 'video-execution-choice', 'video-node-prepare', 'video-submit', 'video-results',
+    ])
+    expect(mediaSpec.bindings.find((binding) => binding.to.stepId === 'clip-production-media-project')?.mode).toBe('value')
+    for (const [stepId, portId] of [
+      ['cost-estimate', 'prompt-package'],
+      ['production-handoff', 'prompt-package'],
+      ['production-handoff', 'estimate'],
+      ['production-handoff', 'voice-manifest'],
+    ]) {
+      expect(mediaSpec.bindings.find((binding) => binding.to.stepId === stepId && binding.to.portId === portId)?.mode).toBe('value')
+    }
+    expect(mediaSpec.bindings.find((binding) => binding.to.stepId === 'video-submit' && binding.to.portId === 'authorization')?.from).toEqual({ kind: 'step', stepId: 'video-execution-choice', portId: 'unmatched' })
+    expect(mediaSpec.outputs.map((output) => output.portId)).toEqual(['prompt-package', 'estimate', 'video-assets', 'prepared-nodes'])
+    expect(runtimeData('clip-production-pipeline').workflowAtomicSpec).toMatchObject({
+      executorRef: WORKFLOW_PIPELINE_RUN_EXECUTOR_REF,
+      executionMode: 'once',
+    })
+    for (const variant of ['full_video', 'first_video'] as const) {
+      expect(runtimeData('clip-media-pipeline', variant).workflowAtomicSpec).toMatchObject({
+        executorRef: WORKFLOW_PIPELINE_RUN_EXECUTOR_REF,
+        executionMode: 'each',
+        itemConcurrency: VIDEO_WORKFLOW_CLIP_PIPELINE_CONCURRENCY,
+      })
+    }
+    const previewSpec = parseWorkflowPipelineRunSpec(runtimeData('chapter-asset-preview').workflowPipeline)
+    expect(previewSpec.steps.map((step) => step.stepId)).toEqual(['chapter-asset-preview-project', 'chapter-asset-preview-generate'])
+    expect(previewSpec.steps[0]?.node.data.workflowAtomicSpec).toMatchObject({ executorRef: 'video.chapter-assets.preview/v1', executionMode: 'once' })
+    expect(previewSpec.steps[1]?.node.data.workflowAtomicSpec).toMatchObject({
+      executorRef: 'tapcanvas.image.generate/v1', executionMode: 'each', itemConcurrency: VIDEO_WORKFLOW_CLIP_PIPELINE_CONCURRENCY,
+    })
+    expect(previewSpec.bindings.find((binding) => binding.to.stepId === 'chapter-asset-preview-generate')?.mode).toBe('collection')
+
+    const aggregate = VIDEO_ATOMIC_WORKFLOW_NODES.find((node) => node.nodeId === 'clip-production-aggregate')
+    expect(aggregate).toMatchObject({
+      executorRef: 'video.clip-production.aggregate/v1',
+      executionMode: 'collect',
+      inputPorts: ['source-segments', 'prompt-packages', 'estimates', 'video-assets', 'prepared-nodes'],
+      optionalInputPorts: ['video-assets', 'prepared-nodes'],
+      selectiveOutputPorts: ['video-assets', 'prepared-nodes'],
+    })
+    expect(resolveWorkflowExecutorPortArtifactContract('video.clip-production.aggregate/v1')).toMatchObject({
+      inputArtifactTypes: {
+        'source-segments': ['tapcanvas.clip-source-segments/v1'],
+        'prompt-packages': ['tapcanvas.prompt-package/v2'],
+        estimates: ['tapcanvas.video-estimate/v1'],
+        'video-assets': ['tapcanvas.video-clips/v1'],
+        'prepared-nodes': ['tapcanvas.video-node/v1'],
+      },
+      outputArtifactTypes: {
+        'prompt-package': ['tapcanvas.prompt-package/v2'],
+        estimate: ['tapcanvas.video-estimate/v1'],
+        'video-assets': ['tapcanvas.video-clips/v1'],
+        'prepared-nodes': ['tapcanvas.video-node/v1'],
+      },
+    })
+    expect(resolveWorkflowExecutorPortArtifactContract('video.clip-production.nodes.materialize/v1')).toMatchObject({
+      inputArtifactTypes: {
+        'clip-production': ['tapcanvas.clip-production-packets/v2'],
+        'asset-intents': ['tapcanvas.clip-production-asset-intents/v1'],
+        'delivery-contract': ['tapcanvas.delivery-contract/v2'],
+      },
+      outputArtifactTypes: {
+        'node-plan': ['tapcanvas.clip-production-node-plan/v1'],
+        'media-items': ['tapcanvas.clip-production-media-items/v1'],
+        'prepared-nodes': ['tapcanvas.video-node/v1'],
+      },
+    })
+  })
+
+  it('creates all frozen node data and exports a canonical patch fingerprint', () => {
     const result = createVideoWorkflowCanvasTemplate()
-    const state = useRFStore.getState()
-    const workflowNodes = state.nodes.filter((node) => {
-      const data = node.data as Record<string, unknown>
-      return data.workflowInstanceId === result.workflowInstanceId && node.type === 'taskNode'
-    })
-
-    expect(result.nodeIds).toHaveLength(VIDEO_ATOMIC_WORKFLOW_NODES.length + 1)
-    expect(VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION).toBe(71)
-    expect(workflowNodes).toHaveLength(VIDEO_ATOMIC_WORKFLOW_NODES.length + 1)
-		expect(workflowNodes.every((node) => (
-			(node.data as Record<string, unknown>).workflowCanvasDefinitionVersion === VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION
-		))).toBe(true)
-		expect(workflowNodes.every((node) => (
-			(node.data as Record<string, unknown>).workflowCanvasDefinitionFingerprint === VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT
-		))).toBe(true)
-		expect(workflowNodes.filter((node) => (
-			(node.data as Record<string, unknown>).kind === 'workflowTrigger'
-		)).every((node) => (
-			(node.data as Record<string, unknown>).workflowExecutionRecoveryPolicy === 'fresh_only'
-		))).toBe(true)
-    expect(workflowNodes.map((node) => (node.data as Record<string, unknown>).kind)).toEqual([
-      'workflowTrigger',
-      ...VIDEO_ATOMIC_WORKFLOW_NODES.map(() => 'workflowStage'),
-    ])
-    expect(workflowNodes.every((node) => (node.data as Record<string, unknown>).adminWorkflow === true)).toBe(true)
-		const runtimeNodeData = (nodeId: string): Record<string, unknown> => {
-			const node = workflowNodes.find((candidate) => candidate.id.endsWith(`:${nodeId}`))
-			if (!node) throw new Error(`Missing workflow node ${nodeId}`)
-			return node.data as Record<string, unknown>
-		}
-		expect(runtimeNodeData('voice-materialize').workflowAtomicSpec).toMatchObject({
-			executorRef: 'video.voice-manifest.empty/v1',
-			inputPorts: ['trigger'],
-		})
-		expect(runtimeNodeData('production-handoff')).toMatchObject({ workflowReferenceAudioPolicy: 'optional' })
-		expect(runtimeNodeData('beat-sheet-format')).toMatchObject({
-			label: 'Clip 上限',
-			workflowBeatSheetTakeCount: 24,
-			workflowAtomicSpec: {
-				operation: 'max_clip',
-				executorRef: 'video.beat-sheet.take/v1',
-				executionMode: 'once',
-				inputPorts: ['beat-sheet'],
-				outputPorts: ['beat-sheet'],
-			},
-		})
-		const beatSheetData = runtimeNodeData('beat-sheet-agent')
-		const beatSheetInstruction = String(beatSheetData.workflowInstruction ?? '')
-		expect(beatSheetInstruction).toContain('只把它及其自动加载 references 作为章级改编方法真源')
-		expect(beatSheetInstruction).not.toContain('进入状态→触发→选择/起势')
-		expect(beatSheetData.workflowAgentJsonObjectContract).toMatchObject({
-			arrayItemAllowedFields: {
-				beats: expect.not.arrayContaining(['dialogueScript']),
-			},
-		})
-		const clipWriterData = runtimeNodeData('clip-writer-agent')
-		const clipWriterInstruction = String(clipWriterData.workflowInstruction ?? '')
-		expect(clipWriterInstruction).toContain('只把它们作为单 Clip 创作方法真源')
-		expect(clipWriterInstruction).toContain('宿主只编译机器身份')
-		expect(clipWriterInstruction).toContain('SpeechEvent 与时长参数必须由 writer 一次写对')
-		expect(clipWriterInstruction).toContain('runtime 不会把校验错误返回给 writer')
-		expect(clipWriterInstruction).not.toContain('shots 只用 speechEventIds')
-		expect(String(runtimeNodeData('prompt-package').workflowDeliveryRequirement ?? ''))
-			.not.toContain('每个 shot 必须有非空 visualTask 与 action')
-		expect(runtimeNodeData('asset-fan-out')).toMatchObject({
-			workflowOutputArtifactType: 'tapcanvas.asset-plan-items/v2',
-			workflowAtomicSpec: {
-				outputArtifactTypes: { 'asset-items': ['tapcanvas.asset-plan-items/v2'] },
-			},
-		})
-		expect(runtimeNodeData('asset-image-generate')).toMatchObject({
-			workflowAtomicSpec: {
-				inputArtifactTypes: { 'asset-items': ['tapcanvas.asset-plan-items/v2'] },
-			},
-		})
-    expect(state.edges).toHaveLength(VIDEO_ATOMIC_WORKFLOW_EDGES.length)
-    expect(state.edges[0]).toMatchObject({
-      source: expect.stringContaining('manual-trigger'),
-      target: expect.stringContaining('canvas-source'),
-      sourceHandle: 'out-workflow:trigger',
-      targetHandle: 'in-workflow:trigger',
-    })
-    const fanOutInputs = state.edges
-      .filter((edge) => edge.target.endsWith(':clip-fan-out'))
-      .map((edge) => edge.targetHandle)
-      .sort()
-    expect(fanOutInputs).toEqual([
-      'in-workflow:beat-sheet',
-      'in-workflow:delivery-contract',
-    ])
-    const promptPackageInputs = state.edges
-      .filter((edge) => edge.target.endsWith(':prompt-package'))
-      .map((edge) => edge.targetHandle)
-      .sort()
-    expect(promptPackageInputs).toEqual([
-      'in-workflow:asset-items',
-      'in-workflow:clip-contexts',
-      'in-workflow:clip-prompts',
-    ])
-  })
-
-  it('pins the complete executable template to one shared definition fingerprint', () => {
-    const patch = buildVideoWorkflowCanvasDefinitionPatch({
-      workflowInstanceId: 'workflow-contract-fixture',
-      workflowGroupId: 'workflow-contract-group',
-      executionScope: 'media_delivery',
-      executionVariant: 'full_video',
-      existingEdges: [],
-    })
-
-    expect(canonicalDefinitionFingerprint(patch)).toBe(VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT)
-  })
-
-  it('requires an upgrade when either the structural version or fingerprint differs', () => {
-    expect(needsVideoWorkflowCanvasDefinitionUpgrade({
-      workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
-      workflowCanvasDefinitionFingerprint: VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT,
-    })).toBe(false)
-    expect(needsVideoWorkflowCanvasDefinitionUpgrade({
-      workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
-      workflowCanvasDefinitionFingerprint: 'sha256:stale-contract',
-    })).toBe(true)
-    expect(needsVideoWorkflowCanvasDefinitionUpgrade({
-      workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION - 1,
-      workflowCanvasDefinitionFingerprint: VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT,
-    })).toBe(true)
-  })
-
-  it('starts first-video production from an immutable launch prefix with identity assets', () => {
-    const result = createVideoWorkflowCanvasTemplate({
-      executionScope: 'media_delivery',
-      executionVariant: 'first_video',
-    })
     const state = useRFStore.getState()
     const workflowNodes = state.nodes.filter((node) => (
       (node.data as Record<string, unknown>).workflowInstanceId === result.workflowInstanceId
       && node.type === 'taskNode'
     ))
-
-    expect(result.nodeIds).toHaveLength(VIDEO_FIRST_VIDEO_WORKFLOW_NODES.length + 1)
-    expect(workflowNodes).toHaveLength(VIDEO_FIRST_VIDEO_WORKFLOW_NODES.length + 1)
-    expect(state.edges).toHaveLength(VIDEO_FIRST_VIDEO_WORKFLOW_EDGES.length)
-    expect(workflowNodes.some((node) => node.id.endsWith(':concat'))).toBe(false)
-    expect(workflowNodes.some((node) => node.id.endsWith(':delivery-verify'))).toBe(true)
-    expect(workflowNodes.some((node) => node.id.endsWith(':first-video-output'))).toBe(false)
-    expect(workflowNodes.some((node) => node.id.endsWith(':beat-sheet-agent'))).toBe(false)
-    expect(workflowNodes.some((node) => node.id.endsWith(':launch-beat-agent'))).toBe(true)
-    expect(workflowNodes.some((node) => node.id.endsWith(':launch-empty-asset-bindings'))).toBe(false)
-    expect(workflowNodes.some((node) => node.id.endsWith(':launch-asset-image-generate'))).toBe(true)
-
-    const firstBeat = workflowNodes.find((node) => node.id.endsWith(':launch-beat-take'))
-    expect(firstBeat?.data).toMatchObject({
-      workflowExecutionVariant: 'first_video',
-      workflowBeatSheetTakeCount: 1,
-      workflowAtomicSpec: {
-        executorRef: 'video.beat-sheet.take/v1',
-        inputPorts: ['beat-sheet'],
-        outputPorts: ['beat-sheet'],
-      },
-    })
-    expect(state.edges).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        source: expect.stringContaining(':launch-beat-agent'),
-        target: expect.stringContaining(':launch-beat-take'),
-      }),
-      expect.objectContaining({
-        source: expect.stringContaining(':launch-beat-take'),
-        target: expect.stringContaining(':launch-clip-fan-out'),
-      }),
-      expect.objectContaining({
-        source: expect.stringContaining(':launch-asset-image-generate'),
-        target: expect.stringContaining(':launch-production-handoff'),
-      }),
-      expect.objectContaining({
-        source: expect.stringContaining(':launch-asset-fan-out'),
-        target: expect.stringContaining(':launch-asset-image-generate'),
-      }),
-      expect.objectContaining({
-        source: expect.stringContaining(':launch-video-results'),
-        target: expect.stringContaining(':delivery-verify'),
-        sourceHandle: 'out-workflow:video-assets',
-        targetHandle: 'in-workflow:video-assets',
-      }),
-    ]))
-    const deliveryVerify = workflowNodes.find((node) => node.id.endsWith(':delivery-verify'))
-    expect(deliveryVerify?.data).toMatchObject({
-      workflowDeliveryArtifactType: 'tapcanvas.video/v1',
-      workflowOutputArtifactType: 'tapcanvas.delivery-evidence/v2',
-      workflowAtomicSpec: {
-        executorRef: 'agents.delivery.verify/v2',
-        inputPorts: ['video-assets'],
-        outputPorts: ['delivery-evidence'],
-      },
-    })
-    expect(state.edges.some((edge) => (
-      edge.source.endsWith(':production-handoff')
-      && edge.target.endsWith(':first-video-take')
-    ))).toBe(false)
+    expect(result.nodeIds).toHaveLength(13)
+    expect(workflowNodes).toHaveLength(13)
+    expect(state.edges).toHaveLength(28)
+    expect(workflowNodes.every((node) => (
+      (node.data as Record<string, unknown>).workflowCanvasDefinitionVersion === 135
+      && (node.data as Record<string, unknown>).workflowCanvasDefinitionFingerprint === VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT
+      && (node.data as Record<string, unknown>).adminWorkflow === true
+    ))).toBe(true)
+    const chapterSequenceData = workflowNodes.find((node) => node.id.endsWith(':chapter-sequence-agent'))?.data as Record<string, unknown>
+    expect(chapterSequenceData.workflowAgentDeliveryRequirement).toEqual(expect.any(String))
+    const pipelineData = workflowNodes.find((node) => node.id.endsWith(':clip-production-pipeline'))?.data as Record<string, unknown>
+    expect(parseWorkflowPipelineRunSpec(pipelineData.workflowPipeline).steps).toHaveLength(3)
+    const mediaData = workflowNodes.find((node) => node.id.endsWith(':clip-media-pipeline'))?.data as Record<string, unknown>
+    expect(parseWorkflowPipelineRunSpec(mediaData.workflowPipeline).steps).toHaveLength(10)
+    const triggerData = workflowNodes.find((node) => node.id.endsWith(':manual-trigger'))?.data as Record<string, unknown>
+    expect(triggerData.workflowCapabilityDescription).toContain('单个全章作者')
+    expect(triggerData.workflowCapabilityDescription).toContain('知识案例')
+    expect(triggerData.workflowCapabilityDescription).toContain('真实图片 URL')
   })
 
-  it('fans the formal full-video production out directly without a serial first-clip branch', () => {
-    createVideoWorkflowCanvasTemplate({
+  it('hard-cuts persisted old nodes and verifies the canonical v135 fingerprint', () => {
+    const oldNodes: readonly Node[] = [
+      { id: 'workflow-contract-fixture:opening-frame-agent', type: 'taskNode', position: { x: 0, y: 0 }, parentId: 'workflow-contract-group', data: {} },
+      { id: 'workflow-contract-fixture:clip-production-agent', type: 'taskNode', position: { x: 0, y: 0 }, parentId: 'workflow-contract-group', data: {} },
+    ]
+    const patchInput = {
+      workflowInstanceId: 'workflow-contract-fixture',
+      workflowGroupId: 'workflow-contract-group',
       executionScope: 'media_delivery',
       executionVariant: 'full_video',
-    })
-    const state = useRFStore.getState()
-		expect(state.nodes.some((node) => node.id.includes(':launch-'))).toBe(false)
-		expect(state.nodes.some((node) => node.id.endsWith(':remainder-production-plan'))).toBe(false)
-		expect(state.nodes.some((node) => node.id.endsWith(':all-video-results'))).toBe(false)
-    expect(state.edges).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        source: expect.stringContaining(':asset-image-generate'),
-        target: expect.stringContaining(':production-handoff'),
-      }),
-      expect.objectContaining({
-        source: expect.stringContaining(':production-handoff'),
-			target: expect.stringContaining(':video-submit'),
-      }),
-      expect.objectContaining({
-			source: expect.stringContaining(':video-results'),
-        target: expect.stringContaining(':concat'),
-      }),
-      expect.objectContaining({
-			source: expect.stringContaining(':clip-fan-out'),
-			target: expect.stringContaining(':clip-writer-agent'),
-			targetHandle: 'in-workflow:clip-contexts',
-      }),
-    ]))
+      existingNodes: oldNodes,
+    } as const
+    const patch = buildVideoWorkflowCanvasDefinitionPatch({ ...patchInput, existingEdges: [] })
+    expect(canonicalDefinitionFingerprint(patch)).toBe(VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT)
+    expect(patch.deleteNodeIds).toEqual(expect.arrayContaining(oldNodes.map((node) => node.id)))
+    expect(patch.createEdges).toHaveLength(28)
+    expect(patch.patchNodeData.some((node) => node.id.endsWith(':clip-production-agent'))).toBe(false)
   })
 
-  it('hard-cuts a polluted persisted workflow back to the current generic definition', () => {
-    const workflowInstanceId = 'video-workflow-existing'
+  it('uses the same full chapter plan and Clip node readback before first-video media selection', () => {
     const patch = buildVideoWorkflowCanvasDefinitionPatch({
-      workflowInstanceId,
-      workflowGroupId: 'workflow-group',
-      executionScope: 'media_delivery',
-      existingNodes: [
-        { id: `${workflowInstanceId}:manual-trigger`, parentId: 'workflow-group' },
-        { id: `${workflowInstanceId}:voice-plan-agent`, parentId: 'workflow-group' },
-        { id: `${workflowInstanceId}:voice-catalog`, parentId: 'workflow-group' },
-        { id: 'other-workflow:voice-plan-agent', parentId: 'other-group' },
-      ],
-      existingEdges: [{
-        id: 'polluted-trigger-edge',
-        source: `${workflowInstanceId}:manual-trigger`,
-        target: `${workflowInstanceId}:beat-sheet-agent`,
-        sourceHandle: 'out-workflow:trigger',
-        targetHandle: 'in-workflow:trigger',
-      }],
+      workflowInstanceId: 'workflow-contract-fixture', workflowGroupId: 'workflow-contract-group',
+      executionScope: 'media_delivery', executionVariant: 'first_video', existingEdges: [],
     })
-
-    const beatSheetPatch = patch.patchNodeData.find((entry) => entry.id.endsWith(':beat-sheet-agent'))
-    const assetPatch = patch.patchNodeData.find((entry) => entry.id.endsWith(':asset-coverage'))
-    const writerPatch = patch.patchNodeData.find((entry) => entry.id.endsWith(':clip-writer-agent'))
-    const triggerPatch = patch.patchNodeData.find((entry) => entry.id.endsWith(':manual-trigger'))
-    expect(beatSheetPatch?.data).toMatchObject({
-      label: 'BeatSheet 创作 Agent',
-      workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
-      workflowNodeKind: 'beat_sheet_authoring',
-      workflowAtomicSpec: {
-        category: 'agent',
-        executorRef: 'agents.logical-task/v2',
-		inputPorts: ['trigger', 'delivery-contract'],
-      },
-      workflowAgentOutputEncoding: 'json_object',
-      workflowAgentDefinitionId: 'writer',
-      workflowAgentOutputArtifactType: 'tapcanvas.beat-sheet/v2',
-    })
-    expect(beatSheetPatch?.data.workflowAgentJsonObjectContract).toMatchObject({
-      arrayItemRequiredStringArrayFields: { objectRegistry: ['referenceImageNodeIds'] },
-    })
-    expect(String(assetPatch?.data.workflowInstruction)).not.toContain('阿乔')
-    expect(String(writerPatch?.data.workflowInstruction)).not.toContain('clip-001')
-    expect(triggerPatch?.data.workflowTriggerPayload).toBeNull()
-    expect(triggerPatch?.data.workflowExecutionConcurrency).toBe(VIDEO_WORKFLOW_EXECUTION_CONCURRENCY)
-		expect(patch.patchNodeData.some((entry) => entry.id.includes(':launch-'))).toBe(false)
-    expect(patch.deleteNodeIds).toEqual([
-      `${workflowInstanceId}:voice-plan-agent`,
-      `${workflowInstanceId}:voice-catalog`,
-    ])
-    expect(patch.deleteEdgeIds).toEqual([])
-    expect(patch.createEdges).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        source: `${workflowInstanceId}:delivery-contract`,
-        target: `${workflowInstanceId}:beat-sheet-agent`,
-        sourceHandle: 'out-workflow:delivery-contract',
-        targetHandle: 'in-workflow:delivery-contract',
-      }),
-      expect.objectContaining({
-        source: `${workflowInstanceId}:prompt-package`,
-        target: `${workflowInstanceId}:concat`,
-      }),
+    const nodeIds = patch.patchNodeData.map((node) => node.id.split(':').slice(-1)[0])
+    expect(nodeIds).toEqual(expect.arrayContaining([
+      'chapter-sequence-agent', 'chapter-sequence-project', 'clip-production-pipeline', 'first-media-take',
+      'clip-media-pipeline', 'node-only-verify', 'delivery-verify',
     ]))
+    expect(nodeIds.some((id) => id?.startsWith('launch-') || id?.startsWith('opening-'))).toBe(false)
+    const firstPlanningNode = patch.patchNodeData.find((node) => node.id.endsWith(':clip-production-pipeline'))
+    expect(firstPlanningNode?.data.workflowAtomicSpec).toMatchObject({ executionMode: 'once' })
+    const firstPlanning = parseWorkflowPipelineRunSpec(firstPlanningNode?.data.workflowPipeline)
+    expect(firstPlanning.steps.map((step) => step.stepId)).toEqual([
+      'clip-production-agent', 'clip-production-collect', 'clip-production-nodes-materialize',
+    ])
+    expect(firstPlanning.inputs.find((input) => input.portId === 'source-segments')?.mode).toBe('collection')
+    expect(firstPlanning.outputs.map((output) => output.portId)).toEqual([
+      'node-plan', 'prompt-package', 'media-items', 'prepared-nodes',
+    ])
+    expect(patch.createEdges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: 'workflow-contract-fixture:clip-production-pipeline', target: 'workflow-contract-fixture:first-media-take', targetHandle: expect.stringContaining('items') }),
+      expect.objectContaining({ source: 'workflow-contract-fixture:first-media-take', target: 'workflow-contract-fixture:clip-media-pipeline', sourceHandle: expect.stringContaining('items') }),
+    ]))
+    const take = patch.patchNodeData.find((node) => node.id.endsWith(':first-media-take'))
+    expect(take?.data.workflowInputPorts).toEqual(['items'])
+    expect(take?.data.workflowOutputPorts).toEqual(['items'])
+    expect(patch.createEdges.some((edge) => edge.source.endsWith(':clip-production-pipeline') && edge.target.endsWith(':clip-media-pipeline'))).toBe(false)
   })
 
-  it('projects the complete output identity contract for every logical Agent node', () => {
-    createVideoWorkflowCanvasTemplate()
-    const logicalAgentNodes = useRFStore.getState().nodes.filter((node) => {
-      const atomicSpec = node.data.workflowAtomicSpec
-      return atomicSpec
-        && typeof atomicSpec === 'object'
-        && !Array.isArray(atomicSpec)
-        && (atomicSpec as Record<string, unknown>).executorRef === 'agents.logical-task/v2'
-    })
+  it('requires image production before choosing node preparation or supplier submission', () => {
+    const media = mediaPipelineSpec()
+    const bindingFrom = (stepId: string, portId: string) => media.bindings.find((binding) => (
+      binding.to.stepId === stepId && binding.to.portId === portId
+    ))?.from
+    expect(bindingFrom('video-execution-choice', 'value')).toEqual({ kind: 'input', portId: 'authorization' })
+    expect(bindingFrom('video-execution-choice', 'production-plan')).toEqual({ kind: 'step', stepId: 'production-handoff', portId: 'production-plan' })
+    expect(bindingFrom('video-node-prepare', 'authorization')).toEqual({ kind: 'step', stepId: 'video-execution-choice', portId: 'matched' })
+    expect(bindingFrom('video-submit', 'authorization')).toEqual({ kind: 'step', stepId: 'video-execution-choice', portId: 'unmatched' })
+    expect(bindingFrom('production-handoff', 'asset-bindings')).toEqual({ kind: 'step', stepId: 'clip-asset-image-generate', portId: 'asset-bindings' })
+    expect(media.outputs.find((output) => output.portId === 'prepared-nodes')?.from).toEqual({ stepId: 'video-node-prepare', portId: 'prepared-nodes' })
+    expect(runtimeData('node-only-verify').workflowDeliveryRequiredFacts).toEqual(['persisted', 'promptPersisted', 'dependenciesReady'])
+    expect(VIDEO_ATOMIC_WORKFLOW_EDGES.some((edge) => edge.sourceNodeId === 'clip-production-pipeline' && edge.targetNodeId === 'node-only-verify')).toBe(false)
+  })
 
-		expect(logicalAgentNodes).toHaveLength(2)
-    for (const node of logicalAgentNodes) {
-      expect(node.data.workflowAgentDefinitionId).toEqual(expect.any(String))
-      expect(node.data.workflowInstruction).toEqual(expect.any(String))
-      expect(node.data.workflowAgentOutputArtifactType).toEqual(expect.any(String))
-      expect(node.data.workflowAgentOutputEncoding).toMatch(/^json_(?:object|array)$/)
-      expect(node.data.workflowAgentDeliveryRequirement).toEqual(expect.any(String))
+  it('verifies only selected first-Clip ready nodes and has no dangling first-video edges', () => {
+    const patch = buildVideoWorkflowCanvasDefinitionPatch({
+      workflowInstanceId: 'workflow-contract-fixture', workflowGroupId: 'workflow-contract-group',
+      executionScope: 'media_delivery', executionVariant: 'first_video', existingEdges: [],
+    })
+    const nodeIds = new Set(patch.patchNodeData.map((node) => node.id))
+    for (const edge of patch.createEdges) {
+      expect(nodeIds.has(edge.source)).toBe(true)
+      expect(nodeIds.has(edge.target)).toBe(true)
     }
+    expect(patch.createEdges.filter((edge) => edge.target.endsWith(':node-only-verify'))).toEqual([
+      expect.objectContaining({ source: 'workflow-contract-fixture:clip-media-pipeline', sourceHandle: expect.stringContaining('prepared-nodes') }),
+    ])
   })
 
-  it('upgrades an existing workflow in place while preserving explicit model selections', () => {
-    const result = createVideoWorkflowCanvasTemplate({ executionScope: 'media_delivery' })
-    const beatSheetNodeId = `${result.workflowInstanceId}:beat-sheet-agent`
-    const videoNodeId = `${result.workflowInstanceId}:video-submit`
-    const maxClipNodeId = `${result.workflowInstanceId}:beat-sheet-format`
-    useRFStore.getState().updateNodeData(beatSheetNodeId, {
-      workflowCanvasDefinitionVersion: 1,
-      workflowAtomicSpec: { executorRef: 'agents.logical-task/v2' },
-      workflowPreparedBeatSheetJsonObjectContract: { requiredObjectFields: ['filmBible'] },
+  it('gives chapter asset previews the Clip image step configuration so both submit one contract', () => {
+    const patch = buildVideoWorkflowCanvasDefinitionPatch({
+      workflowInstanceId: 'workflow-contract-fixture', workflowGroupId: 'workflow-contract-group',
+      executionScope: 'media_delivery', existingEdges: [],
+      existingNodes: [{ id: 'workflow-contract-fixture:clip-asset-image-generate', data: {
+        workflowNodeId: 'clip-asset-image-generate', workflowImageModelKey: 'user-image', workflowImageQuality: 'high',
+      } }],
     })
-    const assetCoverageNodeId = `${result.workflowInstanceId}:asset-coverage`
-    useRFStore.getState().updateNodeData(assetCoverageNodeId, {
-      workflowRequiredSkills: [],
-      workflowAllowedTools: ['skill_search', 'knowledge_search', 'knowledge_read'],
-      workflowKnowledgeQuery: 'stale query',
+    const preview = patch.patchNodeData.find((node) => node.id.endsWith(':chapter-asset-preview'))
+    const spec = parseWorkflowPipelineRunSpec(preview?.data.workflowPipeline)
+    expect(spec.steps.find((step) => step.stepId === 'chapter-asset-preview-generate')?.node.data).toMatchObject({
+      workflowImageModelKey: 'user-image', workflowImageQuality: 'high',
     })
-    useRFStore.getState().updateNodeData(videoNodeId, {
-      workflowVideoModelKey: 'doubao-seedance-2.0',
-      workflowVideoResolution: '480p',
-    })
-    useRFStore.getState().updateNodeData(maxClipNodeId, {
-      workflowBeatSheetTakeCount: 7,
-    })
+  })
 
-    const upgraded = upgradeVideoWorkflowCanvasDefinition(result.workflowInstanceId)
-    const state = useRFStore.getState()
-    const beatSheet = state.nodes.find((node) => node.id === beatSheetNodeId)
-    const assetCoverage = state.nodes.find((node) => node.id === assetCoverageNodeId)
-    const videoNode = state.nodes.find((node) => node.id === videoNodeId)
-    const maxClipNode = state.nodes.find((node) => node.id === maxClipNodeId)
+  it('preserves explicit image and video model selection inside the media pipeline', () => {
+    const priorStages: readonly Node[] = [
+      { id: 'workflow-contract-fixture:cost-estimate', type: 'taskNode', position: { x: 0, y: 0 },
+        data: { workflowNodeId: 'cost-estimate', workflowVideoModelKey: 'user-selected-video', workflowVideoResolution: '720p' } },
+      { id: 'workflow-contract-fixture:clip-asset-image-generate', type: 'taskNode', position: { x: 0, y: 0 },
+        data: { workflowNodeId: 'clip-asset-image-generate', workflowImageModelKey: 'user-selected-image' } },
+    ]
+    const patch = buildVideoWorkflowCanvasDefinitionPatch({
+      workflowInstanceId: 'workflow-contract-fixture', workflowGroupId: 'workflow-contract-group',
+      executionScope: 'media_delivery', existingNodes: priorStages, existingEdges: [],
+    })
+    const pipeline = patch.patchNodeData.find((node) => node.id.endsWith(':clip-media-pipeline'))
+    const spec = parseWorkflowPipelineRunSpec(pipeline?.data.workflowPipeline)
+    expect(spec.steps.find((step) => step.stepId === 'cost-estimate')?.node.data).toMatchObject({
+      workflowVideoModelKey: 'user-selected-video', workflowVideoResolution: '720p',
+    })
+    expect(spec.steps.find((step) => step.stepId === 'clip-asset-image-generate')?.node.data).toMatchObject({
+      workflowImageModelKey: 'user-selected-image',
+    })
+  })
 
-    expect(upgraded.upgradedNodeCount).toBe(VIDEO_ATOMIC_WORKFLOW_NODES.length + 2)
-    expect(beatSheet?.data).toMatchObject({
-      workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
-      workflowAtomicSpec: { executorRef: 'agents.logical-task/v2' },
-    })
-    expect(beatSheet?.data.workflowPreparedBeatSheetJsonObjectContract).toBeUndefined()
-    expect(assetCoverage?.data).toMatchObject({
-      workflowInputPorts: ['beat-sheet'],
-      workflowOptionalInputPorts: [],
-		workflowAtomicSpec: { executorRef: 'video.asset-plans.project/v1' },
-    })
-		expect(assetCoverage?.data.workflowRequiredSkills).toBeUndefined()
-    expect(assetCoverage?.data.workflowAllowedTools).toBeUndefined()
-    expect(assetCoverage?.data.workflowKnowledgeQuery).toBeUndefined()
-    expect(videoNode?.data).toMatchObject({
-      workflowVideoModelKey: 'doubao-seedance-2.0',
-      workflowVideoResolution: '480p',
-    })
-    expect(maxClipNode?.data).toMatchObject({
-      workflowBeatSheetTakeCount: 7,
-      workflowAtomicSpec: {
-        operation: 'max_clip',
-        executorRef: 'video.beat-sheet.take/v1',
+  it('preserves an explicitly selected inline author model when refreshing the definition', () => {
+    const prior = parseWorkflowPipelineRunSpec(runtimeData('clip-production-pipeline').workflowPipeline)
+    const priorStages: readonly Node[] = [{
+      id: 'custom-pipeline', type: 'taskNode', position: { x: 0, y: 0 },
+      data: {
+        workflowNodeId: 'custom-pipeline',
+        workflowPipeline: {
+          ...prior,
+          steps: prior.steps.map((step) => step.stepId === 'clip-production-agent' ? {
+            ...step,
+            node: { ...step.node, data: {
+              ...step.node.data,
+              workflowAgentModelKey: 'user-selected-author',
+              workflowAgentModelSelection: 'user-selected-provider',
+              workflowInstruction: 'obsolete instruction',
+            } },
+          } : step),
+        },
       },
+    }]
+    const patch = buildVideoWorkflowCanvasDefinitionPatch({
+      workflowInstanceId: 'workflow-contract-fixture', workflowGroupId: 'workflow-contract-group',
+      executionScope: 'media_delivery', existingNodes: priorStages, existingEdges: [],
     })
+    const pipeline = patch.patchNodeData.find((node) => node.id.endsWith(':clip-production-pipeline'))
+    const author = parseWorkflowPipelineRunSpec(pipeline?.data.workflowPipeline).steps
+      .find((step) => step.stepId === 'clip-production-agent')?.node.data
+    expect(author).toMatchObject({
+      workflowAgentModelKey: 'user-selected-author',
+      workflowAgentModelSelection: 'user-selected-provider',
+    })
+    expect(author?.workflowInstruction).not.toBe('obsolete instruction')
   })
 
-	it('migrates a persisted first-video topology by creating new stages and removing retired stages', () => {
-		const result = createVideoWorkflowCanvasTemplate({
-			executionScope: 'media_delivery',
-			executionVariant: 'first_video',
-		})
-		const firstBeatNodeId = `${result.workflowInstanceId}:launch-beat-take`
-		const retiredTakeNodeId = `${result.workflowInstanceId}:first-video-take`
-		useRFStore.getState().onNodesChange([{ id: firstBeatNodeId, type: 'remove' }])
-		useRFStore.getState().addNode('taskNode', '旧首视频截取', {
-			nodeId: retiredTakeNodeId,
-			autoLabel: false,
-			parentId: result.workflowGroupId,
-			position: { x: 8, y: 8 },
-			kind: 'workflowStage',
-			workflowInstanceId: result.workflowInstanceId,
-			workflowCanvasDefinitionVersion: 42,
-			workflowAtomicSpec: {
-				version: 1,
-				category: 'control',
-				operation: 'collection_take',
-				executorRef: 'workflow.collection.take/v1',
-				executionMode: 'once',
-				inputPorts: ['items'],
-				outputPorts: ['production-plan'],
-			},
-		})
-		useRFStore.getState().onConnect({
-			source: `${result.workflowInstanceId}:production-handoff`,
-			target: retiredTakeNodeId,
-			sourceHandle: 'out-workflow:production-plan',
-			targetHandle: 'in-workflow:items',
-		})
-		useRFStore.getState().onConnect({
-			source: retiredTakeNodeId,
-			target: `${result.workflowInstanceId}:video-submit`,
-			sourceHandle: 'out-workflow:production-plan',
-			targetHandle: 'in-workflow:production-plan',
-		})
-
-		upgradeVideoWorkflowCanvasDefinition(result.workflowInstanceId)
-
-		const state = useRFStore.getState()
-		expect(state.nodes.some((node) => node.id === firstBeatNodeId)).toBe(true)
-		expect(state.nodes.some((node) => node.id === retiredTakeNodeId)).toBe(false)
-		expect(state.edges).toEqual(expect.arrayContaining([
-			expect.objectContaining({
-				source: `${result.workflowInstanceId}:launch-beat-agent`,
-				target: firstBeatNodeId,
-			}),
-			expect.objectContaining({
-				source: firstBeatNodeId,
-				target: `${result.workflowInstanceId}:launch-clip-fan-out`,
-			}),
-		]))
-		expect(state.edges.some((edge) => edge.source === retiredTakeNodeId || edge.target === retiredTakeNodeId)).toBe(false)
-	})
-
-  it('uses one direct JSON object contract for every clip prompt', () => {
-    createVideoWorkflowCanvasTemplate()
-    const clipWriter = useRFStore.getState().nodes.find((node) => {
-      const data = node.data as Record<string, unknown>
-      return data.workflowNodeId === 'clip-writer-agent'
-    })
-
-    expect(clipWriter?.data).toMatchObject({
-      workflowAgentOutputEncoding: 'json_object',
-      workflowAgentJsonObjectContract: {
-        requiredArrayFields: ['clips'],
-        allowedFields: ['clips', 'selfQaNote', 'creativeReview', 'sourceFidelityAudit'],
-      },
-    })
-		expect(String(clipWriter?.data.workflowInstruction)).toContain('tapcanvas-video-prompt-writer')
-		expect(String(clipWriter?.data.workflowInstruction)).toContain('只把它们作为单 Clip 创作方法真源')
-		expect(String(clipWriter?.data.workflowInstruction)).toContain('当前节点指令只声明职责与传输协议')
-		expect(String(clipWriter?.data.workflowInstruction)).toContain('宿主只编译机器身份')
-		expect(String(clipWriter?.data.workflowInstruction)).toContain('SpeechEvent 与时长参数必须由 writer 一次写对')
-		expect(String(clipWriter?.data.workflowInstruction)).toContain('runtime 不会把校验错误返回给 writer')
-		expect(String(clipWriter?.data.workflowInstruction)).not.toContain('每个 shot 必须有非空 visualTask 与 action')
-		expect(clipWriter?.data.workflowAgentMaxOutputTokens).toBe(4096)
-  })
-
-  it('persists bounded parallelism and exact asset-consumer contracts on executable nodes', () => {
-    createVideoWorkflowCanvasTemplate()
-    const workflowNodes = useRFStore.getState().nodes
-    const data = (workflowNodeId: string): Record<string, unknown> => {
-      const node = workflowNodes.find((candidate) => candidate.data.workflowNodeId === workflowNodeId)
-      if (!node) throw new Error(`Missing workflow node ${workflowNodeId}`)
-      return node.data as Record<string, unknown>
-    }
-    const concurrency = (workflowNodeId: string): number | undefined => {
-      const spec = data(workflowNodeId).workflowAtomicSpec
-      return spec && typeof spec === 'object' && !Array.isArray(spec)
-        ? (spec as Record<string, unknown>).itemConcurrency as number | undefined
-        : undefined
-    }
-
-    expect(concurrency('asset-image-generate')).toBe(16)
-    expect(concurrency('clip-writer-agent')).toBe(16)
-    expect(concurrency('video-submit')).toBe(16)
-		expect(data('video-submit').workflowVideoReferencePolicy).toBe('forbidden')
-		for (const node of workflowNodes) {
-			const spec = node.data.workflowAtomicSpec
-			if (!spec || typeof spec !== 'object' || Array.isArray(spec)) continue
-			const itemConcurrency = (spec as Record<string, unknown>).itemConcurrency
-			if (itemConcurrency === undefined) continue
-			expect(Number.isInteger(itemConcurrency)).toBe(true)
-			expect(itemConcurrency).toBeGreaterThanOrEqual(1)
-			expect(itemConcurrency).toBeLessThanOrEqual(16)
-		}
-  expect(data('beat-sheet-agent').workflowAgentMaxOutputTokens).toBe(8192)
-		expect(data('beat-sheet-agent').workflowAgentReasoningEffort).toBeUndefined()
-		expect(data('asset-coverage').workflowAgentMaxOutputTokens).toBeUndefined()
-    expect(data('clip-writer-agent').workflowAgentJsonObjectContract).toEqual(expect.not.objectContaining({
-      itemExactAssetIds: expect.anything(),
-    }))
-		expect(data('asset-coverage').workflowAgentJsonArrayContract).toBeUndefined()
-		expect(data('asset-coverage').workflowAtomicSpec).toMatchObject({
-			executorRef: 'video.asset-plans.project/v1',
-			inputPorts: ['beat-sheet'],
-			outputPorts: ['asset-plans'],
-		})
-		expect(data('asset-coverage').workflowInputPorts).toEqual(['beat-sheet'])
-		expect(data('asset-fan-out').workflowInputPorts).toEqual(['asset-plans', 'beat-sheet'])
-		expect(String(data('beat-sheet-agent').workflowInstruction)).toContain('canvasFacts.authoritativeSources；后者是唯一故事事实源')
-		expect(String(data('beat-sheet-agent').workflowInstruction)).toContain('只把它及其自动加载 references 作为章级改编方法真源')
-		expect(String(data('beat-sheet-agent').workflowInstruction)).toContain('规划完整章级 BeatSheet')
-		expect(String(data('beat-sheet-agent').workflowInstruction)).not.toContain('进入状态→触发→选择/起势')
-		expect(String(data('beat-sheet-agent').workflowInstruction)).toContain('sourceFidelityAudit 可省略')
-		expect(String(data('beat-sheet-agent').workflowInstruction)).toContain('只作为模型自检诊断')
-		expect(String(data('beat-sheet-agent').workflowInstruction)).toContain('宿主不会生成或修订它')
-    expect(data('delivery-contract').workflowTargetDurationSeconds).toBeUndefined()
-    expect(data('beat-sheet-agent').workflowAgentJsonObjectContract).toMatchObject({
-	      requiredObjectFields: ['sourceCoveragePlan', 'chapterArc'],
-      allowedFields: expect.arrayContaining(['sourceCoveragePlan', 'sourceFidelityAudit', 'chapterArc']),
-		arrayItemRequiredStringFields: {
-			assetPlans: ['role', 'prompt', 'negativePrompt'],
-			beats: expect.arrayContaining(['dominantFunction', 'causalEntry', 'irreversibleResult', 'handoffToNext']),
-			objectRegistry: expect.any(Array),
-		},
-    })
-		expect(data('beat-sheet-agent').workflowAgentJsonObjectContract)
-			.not.toHaveProperty('arrayItemMergeKeyFields')
-    expect(data('beat-sheet-format').workflowAtomicSpec).toMatchObject({
-      operation: 'max_clip',
-      executorRef: 'video.beat-sheet.take/v1',
-      inputPorts: ['beat-sheet'],
-      outputPorts: ['beat-sheet'],
-    })
-    expect(data('beat-sheet-format').workflowBeatSheetTakeCount).toBe(24)
-  })
-
-  it('keeps full Skill and knowledge discovery implicit while preserving media example prefetch', () => {
-    createVideoWorkflowCanvasTemplate()
-    const workflowNodes = useRFStore.getState().nodes
-    const agent = (workflowNodeId: string): Record<string, unknown> => {
-      const node = workflowNodes.find((candidate) => candidate.data.workflowNodeId === workflowNodeId)
-      if (!node) throw new Error(`Missing workflow node ${workflowNodeId}`)
-      return node.data as Record<string, unknown>
-    }
-
-    expect(agent('beat-sheet-agent')).toMatchObject({
-      workflowOptionalInputPorts: [],
-      workflowAtomicSpec: {
-        category: 'agent',
-        executorRef: 'agents.logical-task/v2',
-      },
-    })
-    expect(agent('beat-sheet-agent').workflowAgentOutputEncoding).toBe('json_object')
-    expect(agent('beat-sheet-agent').workflowRequiredSkills).toEqual(['tapcanvas-dramatic-adapter'])
-    expect(agent('beat-sheet-agent').workflowAllowedTools).toBeUndefined()
-    expect(agent('beat-sheet-agent').workflowAgentJsonObjectContract).toMatchObject({
-	      requiredObjectFields: ['sourceCoveragePlan', 'chapterArc'],
-      allowedFields: expect.arrayContaining(['sourceCoveragePlan', 'sourceFidelityAudit', 'chapterArc']),
-    })
-    expect(agent('beat-sheet-format').workflowAgentOutputEncoding).toBeUndefined()
-    expect(agent('asset-coverage')).toMatchObject({
-      workflowOptionalInputPorts: [],
-		workflowAtomicSpec: { executorRef: 'video.asset-plans.project/v1' },
-    })
-		expect(agent('asset-coverage').workflowRequiredSkills).toBeUndefined()
-    expect(agent('asset-coverage').workflowAllowedTools).toBeUndefined()
-    expect(agent('clip-writer-agent')).toMatchObject({
-      workflowOptionalInputPorts: ['skills', 'tools', 'knowledge-candidates', 'knowledge-evidence'],
-      workflowPromptExampleMediaType: 'video',
-      workflowAgentJsonObjectContract: {
-        requiredArrayFields: ['clips'],
-        allowedFields: ['clips', 'selfQaNote', 'creativeReview', 'sourceFidelityAudit'],
-      },
-    })
-    expect(agent('clip-writer-agent').workflowRequiredSkills).toEqual(['tapcanvas-video-prompt-writer'])
-    expect(agent('clip-writer-agent').workflowAllowedTools).toBeUndefined()
-		expect(String(agent('clip-writer-agent').workflowInstruction)).toContain('只把它们作为单 Clip 创作方法真源')
-		expect(String(agent('clip-writer-agent').workflowInstruction)).toContain('宿主只编译机器身份')
-		expect(String(agent('clip-writer-agent').workflowInstruction)).toContain('runtime 不会把校验错误返回给 writer')
-		expect(String(agent('clip-writer-agent').workflowInstruction)).not.toContain('shots 只用 speechEventIds')
-    expect(String(agent('prompt-package').workflowDeliveryRequirement)).toContain('纯执行提示词')
-		expect(String(agent('beat-sheet-agent').workflowInstruction)).toContain('一次性规划完整章级 BeatSheet')
-		expect(String(agent('beat-sheet-agent').workflowInstruction)).not.toContain('不可改写的生产前缀')
-    expect(agent('beat-sheet-agent').workflowAgentRole).toBeUndefined()
-    expect(agent('beat-sheet-agent').workflowAgentOutputEncoding).toBe('json_object')
-  })
-
-  it('rejects a second workflow projection for the same source group', () => {
-    createVideoWorkflowCanvasTemplate()
-    useRFStore.setState((state) => ({
-      nodes: state.nodes.map((node) => ({ ...node, selected: node.id === 'source-group' })),
-    }))
-
-    expect(() => createVideoWorkflowCanvasTemplate()).toThrow(
-      '该来源组已经绑定其他一键成片工作流',
-    )
-  })
-
-  it('creates an unbound template without requiring a selected source group', () => {
-    useRFStore.getState().reset()
-
-    const result = createVideoWorkflowCanvasTemplate()
-
-    expect(result.sourceGroupId).toBeNull()
-    const sourceNode = useRFStore.getState().nodes.find((node) => {
-      const data = node.data as Record<string, unknown>
-      return data.workflowNodeId === 'canvas-source'
-    })
-    expect(sourceNode?.data).toMatchObject({
-			sourceBindingStatus: 'unbound',
-			workflowSourceMode: 'project_context',
-		})
-  })
-
-  it('binds the source from the explicit canvas-source configuration', () => {
-    useRFStore.getState().reset()
-    const result = createVideoWorkflowCanvasTemplate()
-    useRFStore.setState((state) => ({ nodes: [...state.nodes, { ...sourceGroup, selected: false }] }))
-
-    bindVideoWorkflowSourceGroup(result.workflowInstanceId, sourceGroup.id)
-
-    const workflowNodes = useRFStore.getState().nodes.filter((node) => {
-      const data = node.data as Record<string, unknown>
-      return data.workflowInstanceId === result.workflowInstanceId
-    })
-    expect(workflowNodes.every((node) => (node.data as Record<string, unknown>).sourceGroupId === sourceGroup.id)).toBe(true)
-  })
-
-  it('repairs only missing default port connections and leaves existing edges intact', () => {
+  it('repairs only missing default outer connections', () => {
     const result = createVideoWorkflowCanvasTemplate()
     const originalEdges = useRFStore.getState().edges
-    const removed = originalEdges[0]
-    if (!removed) throw new Error('test template did not create edges')
     useRFStore.setState({ edges: originalEdges.slice(1) })
-
     expect(restoreVideoWorkflowDefaultConnections(result.workflowInstanceId)).toBe(1)
-    expect(useRFStore.getState().edges).toHaveLength(VIDEO_ATOMIC_WORKFLOW_EDGES.length)
+    expect(useRFStore.getState().edges).toHaveLength(28)
     expect(restoreVideoWorkflowDefaultConnections(result.workflowInstanceId)).toBe(0)
   })
+
+  it('章节资产流水线：先大纲，再逐项并行作者，最后汇总成完整 chapter-asset-plan/v3', () => {
+    const spec = parseWorkflowPipelineRunSpec(runtimeData('chapter-assets-agent').workflowPipeline)
+    const step = (id: string) => spec.steps.find((candidate) => candidate.stepId === id)?.node.data as Record<string, unknown>
+    expect(spec.steps.map((candidate) => candidate.stepId)).toEqual([
+      'chapter-assets-outline-agent', 'chapter-assets-seeds', 'chapter-assets-part-agent', 'chapter-assets-collect',
+    ])
+    expect(spec.inputs.map((input) => input.portId)).toEqual(['delivery-contract', 'chapter-sequence'])
+    expect(spec.outputs).toEqual([
+      { portId: 'chapter-assets', from: { stepId: 'chapter-assets-collect', portId: 'chapter-assets' }, mode: 'value' },
+    ])
+    // 大纲必须看到章节序列：没有它规划器会过度规划（实测 9→14~18 个对象）。
+    expect(spec.bindings).toContainEqual({ from: { kind: 'input', portId: 'chapter-sequence' }, to: { stepId: 'chapter-assets-outline-agent', portId: 'chapter-sequence' }, mode: 'value' })
+    // 种子集合驱动逐项作者（collection 绑定），汇总同时拿到作者结果与种子。
+    expect(spec.bindings).toContainEqual({ from: { kind: 'step', stepId: 'chapter-assets-seeds', portId: 'asset-seeds' }, to: { stepId: 'chapter-assets-part-agent', portId: 'asset-seed' }, mode: 'collection' })
+    expect(spec.bindings).toContainEqual({ from: { kind: 'step', stepId: 'chapter-assets-part-agent', portId: 'asset-parts' }, to: { stepId: 'chapter-assets-collect', portId: 'asset-parts' }, mode: 'collection' })
+    expect(spec.bindings).toContainEqual({ from: { kind: 'step', stepId: 'chapter-assets-seeds', portId: 'asset-seeds' }, to: { stepId: 'chapter-assets-collect', portId: 'asset-seeds' }, mode: 'collection' })
+    expect(step('chapter-assets-part-agent')).toMatchObject({
+      workflowNodeKind: 'chapter_asset_part_authoring',
+      workflowAgentOutputArtifactType: 'tapcanvas.chapter-asset-part/v1',
+      workflowAgentFailurePolicy: 'single_submission',
+      workflowAgentExecutionPolicy: 'multi_inference',
+      workflowAgentToolPolicy: 'scoped',
+      workflowRequiredSkills: ['tapcanvas-video-authoring-stages'],
+      workflowAgentMaxOutputTokens: VIDEO_WORKFLOW_SMALL_AUTHOR_MAX_OUTPUT_TOKENS,
+      workflowAtomicSpec: expect.objectContaining({ executionMode: 'each', itemConcurrency: VIDEO_WORKFLOW_CHAPTER_ASSET_PART_CONCURRENCY }),
+    })
+    expect(step('chapter-assets-outline-agent')).toMatchObject({
+      workflowAgentOutputArtifactType: 'tapcanvas.chapter-asset-outline/v2',
+      workflowAgentMaxOutputTokens: VIDEO_WORKFLOW_SMALL_AUTHOR_MAX_OUTPUT_TOKENS,
+    })
+    expect(step('chapter-assets-seeds')).toMatchObject({ workflowNodeKind: 'chapter_asset_seeds' })
+    expect(step('chapter-assets-collect')).toMatchObject({ workflowNodeKind: 'chapter_asset_collect' })
+  })
+
 })
+
+// 防退化：作者节点的产物类型改版（如 chapter-asset-outline v1→v2）时，若 Skill 的 artifact-preload 没跟上，
+// 作者只拿到 Skill 骨架、读不到资产职责，产出会静默退化。这里要求每个作者节点的产物类型都被它所需的某个 Skill 预载。
+describe('author nodes receive their Skill guidance', () => {
+  function skillPreloadedArtifacts(skillId: string): Set<string> {
+    const text = readFileSync(resolve(process.cwd(), '../agents-cli/skills', skillId, 'SKILL.md'), 'utf8')
+    const frontmatter = text.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? ''
+    const preload = frontmatter.split('\n  artifact-preload:\n')[1] ?? ''
+    return new Set([...preload.matchAll(/^ {4}([^\s:][^:]*):\s*$/gm)].map((match) => match[1]!))
+  }
+
+  function agentSteps(data: Record<string, unknown>, path: string): Array<{ path: string; data: Record<string, unknown> }> {
+    const own = typeof data.workflowAgentOutputArtifactType === 'string' ? [{ path, data }] : []
+    if (data.workflowPipeline === undefined) return own
+    return [...own, ...parseWorkflowPipelineRunSpec(data.workflowPipeline).steps
+      .flatMap((step) => agentSteps(step.node.data as Record<string, unknown>, `${path}/${step.stepId}`))]
+  }
+
+  it('every author artifact type is declared in artifact-preload of one of its required Skills', () => {
+    const patch = buildVideoWorkflowCanvasDefinitionPatch({
+      workflowInstanceId: 'workflow-contract-fixture', workflowGroupId: 'workflow-contract-group',
+      executionScope: 'media_delivery', executionVariant: 'full_video', existingEdges: [],
+    })
+    const authors = patch.patchNodeData.flatMap((node) => agentSteps(node.data, node.id.split(':').at(-1)!))
+    expect(authors.map((author) => author.path)).toContain('chapter-assets-agent/chapter-assets-outline-agent')
+    const missing = authors.flatMap(({ path, data }) => {
+      const skills = Array.isArray(data.workflowRequiredSkills) ? data.workflowRequiredSkills as string[] : []
+      const artifactType = data.workflowAgentOutputArtifactType as string
+      return skills.some((skill) => skillPreloadedArtifacts(skill).has(artifactType)) ? [] : [`${path}: ${artifactType} (${skills.join(', ') || 'no skills'})`]
+    })
+    expect(missing).toEqual([])
+  })
+})
+
+function useRFStoreReset(): void {
+  useRFStore.getState().reset()
+  useRFStore.setState({ nodes: [sourceGroup], edges: [], nextGroupId: 1 })
+}
+
+function runtimeData(nodeId: string, executionVariant: 'full_video' | 'first_video' = 'full_video'): Record<string, unknown> {
+  const result = buildVideoWorkflowCanvasDefinitionPatch({
+    workflowInstanceId: 'workflow-contract-fixture',
+    workflowGroupId: 'workflow-contract-group',
+    executionScope: 'media_delivery',
+    executionVariant,
+    existingEdges: [],
+  })
+  const node = result.patchNodeData.find((candidate) => candidate.id.endsWith(`:${nodeId}`))
+  if (!node) throw new Error(`Missing runtime node ${nodeId}`)
+  return node.data
+}
+
+function planningPipelineSpec(): ReturnType<typeof parseWorkflowPipelineRunSpec> {
+  return parseWorkflowPipelineRunSpec(runtimeData('clip-production-pipeline').workflowPipeline)
+}
+
+function mediaPipelineSpec(): ReturnType<typeof parseWorkflowPipelineRunSpec> {
+  return parseWorkflowPipelineRunSpec(runtimeData('clip-media-pipeline').workflowPipeline)
+}

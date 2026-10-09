@@ -1,10 +1,32 @@
-import { defineConfig } from "vitest/config";
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { defineConfig } from 'vitest/config'
 
-// 默认 node 环境；需要 DOM 的测试文件用 `// @vitest-environment jsdom` 头注释显式声明。
+const webRoot = fileURLToPath(new URL('..', import.meta.url))
+const tsconfig: { compilerOptions: { paths: Record<string, string[]> } } = JSON.parse(
+  readFileSync(resolve(webRoot, 'tsconfig.json'), 'utf8'),
+)
+const aliases = Object.fromEntries(Object.entries(tsconfig.compilerOptions.paths)
+  .map(([name, paths]) => [name, resolve(webRoot, paths[0])]))
+aliases['@tapcanvas/image-prompt-spec'] = resolve(webRoot, '../../packages/schemas/image-prompt-spec/index.js')
+aliases['@tapcanvas/image-view-controls'] = resolve(webRoot, '../../packages/schemas/image-view-controls/index.mjs')
+aliases.zod = resolve(webRoot, 'node_modules/zod/index.js')
+aliases['virtual:pwa-register/react'] = resolve(webRoot, '_test/stubs/pwa-register-react.ts')
+
 export default defineConfig({
-	test: {
-		environment: "node",
-		globals: false,
-		setupFiles: ["./_test/vitest.setup.ts"],
-	},
-});
+  root: webRoot,
+  resolve: { alias: aliases },
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    // Explicit test-only storage origins allow import-time configuration validation without production hosts.
+    env: {
+      VITE_OBJECT_STORAGE_PROVIDER: 'tos',
+      VITE_TOS_PUBLIC_BASE_URL: 'https://tos.example.invalid',
+      VITE_R2_PUBLIC_BASE_URL: 'https://r2.example.invalid',
+    },
+    setupFiles: [resolve(webRoot, '_test/setup.ts')],
+    poolOptions: { threads: { minThreads: 1, maxThreads: 2 } },
+  },
+})

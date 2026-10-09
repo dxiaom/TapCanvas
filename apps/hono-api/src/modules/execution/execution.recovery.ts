@@ -1,7 +1,8 @@
+import { flattenWorkflowNodeTree } from "./execution.node-tree";
 import {
 	findWorkflowNode,
 } from "./execution.node-runtime";
-import { resolveWorkflowExecutorPortArtifactContract } from "@tapcanvas/workflow-kernel-protocol";
+import { WORKFLOW_CONCURRENCY_MAX, resolveWorkflowExecutorPortArtifactContract } from "@tapcanvas/workflow-kernel-protocol";
 import { resolveCoreWorkflowExecutorPortContract } from "./execution.core-semantics";
 import { readWorkflowNodeExecutionSemantics } from "./execution.semantics-snapshot";
 
@@ -17,6 +18,8 @@ export type WorkflowExecutionGraphState = {
 	routes: Record<string, WorkflowCompiledRoute[]>;
 	incoming: Record<string, number>;
 	activeIncoming: Record<string, number>;
+	activeInputPorts: Record<string, string[]>;
+	requiredInputPorts: Record<string, string[]>;
 	selectiveOutputPorts: Record<string, string[]>;
 	notSelected: string[];
 	ready: string[];
@@ -25,6 +28,7 @@ export type WorkflowExecutionGraphState = {
 export type WorkflowCompiledRoute = Readonly<{
 	target: string;
 	sourcePort: string | null;
+	targetPort: string | null;
 }>;
 
 export type WorkflowNodeRestartPolicy = "replay_safe" | "reconcile_effect" | "fail_explicitly";
@@ -46,6 +50,7 @@ export type CompiledWorkflowGraph = Readonly<{
 	adj: Record<string, string[]>;
 	routes: Record<string, WorkflowCompiledRoute[]>;
 	incoming: Record<string, number>;
+	requiredInputPorts: Record<string, string[]>;
 	selectiveOutputPorts: Record<string, string[]>;
 }>;
 
@@ -58,9 +63,11 @@ function declaredPorts(node: { data?: unknown }, direction: "input" | "output"):
 	const spec = isRecord(data.workflowAtomicSpec) ? data.workflowAtomicSpec : null;
 	const value = spec?.[direction === "input" ? "inputPorts" : "outputPorts"]
 		?? data[direction === "input" ? "workflowInputPorts" : "workflowOutputPorts"];
-	return Array.isArray(value)
+	const declared = Array.isArray(value)
 		? value.flatMap((port) => typeof port === "string" && port.trim() ? [port.trim()] : [])
 		: [];
+	if (direction !== "input") return declared;
+	return [...new Set([...declared, ...optionalInputPorts(node)])];
 }
 
 function declaredArtifactTypes(
@@ -109,7 +116,9 @@ function assertExecutorArtifactPortContract(
 	node: { data?: unknown },
 	executorReference: string,
 ): void {
-	const expected = resolveWorkflowExecutorPortArtifactContract(executorReference);
+	const nodeData = node.data && typeof node.data === "object" && !Array.isArray(node.data)
+		? node.data as Record<string, unknown> : {};
+	const expected = resolveWorkflowExecutorPortArtifactContract(executorReference, { workflowPipeline: nodeData.workflowPipeline });
 	if (!expected) return;
 	const declaredInputs = new Set(declaredPorts(node, "input"));
 	const declaredOutputs = new Set(declaredPorts(node, "output"));
@@ -197,7 +206,29 @@ export function resolveWorkflowNodeRetryPolicy(
 
 export function compileWorkflowGraph(input: ReactFlowLike): CompiledWorkflowGraph {
 	const nodes = Array.isArray(input.nodes) ? input.nodes : [];
+	for (const node of flattenWorkflowNodeTree(nodes)) {
+		const nodeId = typeof node.id === "string" ? node.id : "";
+		const ref = executorRef(node);
+		const inputs = declaredPorts(node, "input");
+		const contract = resolveCoreWorkflowExecutorPortContract(ref ?? "");
+		const missing = contract?.requiredInputPorts.find(port => !inputs.includes(port));
+		if (missing) throw new Error(`Workflow graph node ${nodeId} omits executor-required input port ${missing}`);
+		assertExecutorArtifactPortContract(nodeId, node, ref ?? "");
+	}
+	return compileFrozenWorkflowGraph(input);
+}
+
+/** Rebuild an already admitted immutable graph from its own port contracts.
+ * Current registry contracts apply at admission, not retroactively to settled work.
+ * Handles, artifact compatibility, required edges and graph identities remain checked.
+ */
+export function compileFrozenWorkflowGraph(input: ReactFlowLike): CompiledWorkflowGraph {
+	const nodes = Array.isArray(input.nodes) ? input.nodes : [];
 	const edges = Array.isArray(input.edges) ? input.edges : [];
+	for (const node of flattenWorkflowNodeTree(nodes)) {
+		declaredArtifactTypes(node, "input");
+		declaredArtifactTypes(node, "output");
+	}
 	const nodeIds = nodes
 		.map((node) => typeof node.id === "string" ? node.id.trim() : "")
 		.filter((nodeId) => nodeId.length > 0);
@@ -214,6 +245,7 @@ export function compileWorkflowGraph(input: ReactFlowLike): CompiledWorkflowGrap
 	const routes: Record<string, WorkflowCompiledRoute[]> = {};
 	const incoming: Record<string, number> = {};
 	const selectivePortsByNode: Record<string, string[]> = {};
+	const requiredInputPorts: Record<string, string[]> = {};
 	for (const nodeId of nodeIds) {
 		indeg[nodeId] = 0;
 		adj[nodeId] = [];
@@ -223,14 +255,7 @@ export function compileWorkflowGraph(input: ReactFlowLike): CompiledWorkflowGrap
 		const declaredSelectivePorts = node ? selectiveOutputPorts(node) : [];
 		const declaredOutputs = node ? declaredPorts(node, "output") : [];
 		const declaredInputs = node ? declaredPorts(node, "input") : [];
-		const portContract = node ? resolveCoreWorkflowExecutorPortContract(executorRef(node) ?? "") : null;
-		const missingContractPort = portContract?.requiredInputPorts.find((port) => !declaredInputs.includes(port));
-		if (missingContractPort) {
-			throw new Error(
-				`Workflow graph node ${nodeId} omits executor-required input port ${missingContractPort}`,
-			);
-		}
-		if (node) assertExecutorArtifactPortContract(nodeId, node, executorRef(node) ?? "");
+		requiredInputPorts[nodeId] = declaredInputs.filter((port) => !node || !optionalInputPorts(node).includes(port));
 		const invalidSelectivePort = declaredSelectivePorts.find((port) => !declaredOutputs.includes(port));
 		if (invalidSelectivePort) {
 			throw new Error(`Workflow graph node ${nodeId} declares unknown selective output port ${invalidSelectivePort}`);
@@ -291,7 +316,7 @@ export function compileWorkflowGraph(input: ReactFlowLike): CompiledWorkflowGrap
 		}
 		edgeIdentities.add(edgeIdentity);
 		adj[source].push(target);
-		routes[source].push({ target, sourcePort });
+		routes[source].push({ target, sourcePort, targetPort });
 		indeg[target] = (indeg[target] ?? 0) + 1;
 		incoming[target] = (incoming[target] ?? 0) + 1;
 	}
@@ -305,7 +330,7 @@ export function compileWorkflowGraph(input: ReactFlowLike): CompiledWorkflowGrap
 			if (!connected) throw new Error(`Workflow graph node ${nodeId} has no edge for required input port ${inputPort}`);
 		}
 	}
-	return { nodeIds, indeg, adj, routes, incoming, selectiveOutputPorts: selectivePortsByNode };
+	return { nodeIds, indeg, adj, routes, incoming, requiredInputPorts, selectiveOutputPorts: selectivePortsByNode };
 }
 
 function outputPortNames(outputRefs: unknown): ReadonlySet<string> {
@@ -340,9 +365,12 @@ export function resolveWorkflowGraphNode(
 				|| current.ports.has(route.sourcePort)
 			);
 			graph.indeg[route.target] = Math.max(0, (graph.indeg[route.target] ?? 0) - 1);
-			if (active) graph.activeIncoming[route.target] = (graph.activeIncoming[route.target] ?? 0) + 1;
+			if (active) {
+				graph.activeIncoming[route.target] = (graph.activeIncoming[route.target] ?? 0) + 1;
+				if (route.targetPort) graph.activeInputPorts[route.target].push(route.targetPort);
+			}
 			if (graph.indeg[route.target] !== 0) continue;
-			if ((graph.incoming[route.target] ?? 0) === 0 || (graph.activeIncoming[route.target] ?? 0) > 0) {
+			if (workflowInputsSelected(graph, route.target)) {
 				readyNodeIds.push(route.target);
 				continue;
 			}
@@ -380,7 +408,7 @@ export function rebuildWorkflowExecutionGraph(input: Readonly<{
 	latestEventSeq: number;
 	nodeRuns: readonly WorkflowNodeRunStatusSnapshot[];
 }>): WorkflowExecutionGraphState {
-	const compiled = compileWorkflowGraph(input.flowData);
+	const compiled = compileFrozenWorkflowGraph(input.flowData);
 	if (workflowGraphHasCycle(compiled)) {
 		throw new Error("Cycle detected in workflow graph");
 	}
@@ -388,7 +416,7 @@ export function rebuildWorkflowExecutionGraph(input: Readonly<{
 	const indeg = { ...compiled.indeg };
 	const graph: WorkflowExecutionGraphState = {
 		status: input.executionStatus,
-		concurrency: Math.max(1, Math.min(8, Math.floor(input.concurrency || 1))),
+		concurrency: Math.max(1, Math.min(WORKFLOW_CONCURRENCY_MAX, Math.floor(input.concurrency || 1))),
 		// queued means a dispatch intent already exists; reserve its concurrency slot
 		// until the attempt-fenced worker claims or reconciles that exact job.
 		running: input.nodeRuns.filter((run) => run.status === "queued" || run.status === "running").length,
@@ -398,6 +426,8 @@ export function rebuildWorkflowExecutionGraph(input: Readonly<{
 		routes: compiled.routes,
 		incoming: compiled.incoming,
 		activeIncoming: Object.fromEntries(compiled.nodeIds.map((nodeId) => [nodeId, 0])),
+		activeInputPorts: Object.fromEntries(compiled.nodeIds.map((nodeId) => [nodeId, []])),
+		requiredInputPorts: compiled.requiredInputPorts,
 		selectiveOutputPorts: compiled.selectiveOutputPorts,
 		notSelected: input.nodeRuns.filter((run) => run.status === "not_selected").map((run) => run.nodeId),
 		ready: [],
@@ -425,9 +455,14 @@ export function rebuildWorkflowExecutionGraph(input: Readonly<{
 			statusByNodeId.get(nodeId) === "pending"
 			&& !graph.notSelected.includes(nodeId)
 			&& (graph.indeg[nodeId] ?? 0) === 0
-			&& ((graph.incoming[nodeId] ?? 0) === 0 || (graph.activeIncoming[nodeId] ?? 0) > 0)
+			&& workflowInputsSelected(graph, nodeId)
 		))
 		: [];
 	graph.ready = ready;
 	return graph;
+}
+
+function workflowInputsSelected(graph: WorkflowExecutionGraphState, nodeId: string): boolean {
+ return ((graph.incoming[nodeId] ?? 0) === 0 || (graph.activeIncoming[nodeId] ?? 0) > 0)
+  && graph.requiredInputPorts[nodeId].every((port) => graph.activeInputPorts[nodeId].includes(port));
 }

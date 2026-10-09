@@ -7,6 +7,8 @@ import {
 	detectStructuralCapabilityConflicts,
 	inspectVideoWorkflowCanvasDefinition,
 	omitNonCompetingCapabilityConflicts,
+	resolveWorkflowCapabilitySummary,
+	workflowCapabilityNodeBreakdown,
 	workflowCapabilityDescriptorsShareInvocationRoute,
 } from "./capability-bay.descriptor";
 import {
@@ -64,12 +66,77 @@ function workflowVersion(versionId: string, outputArtifactType = "video", descri
 }
 
 describe("capability bay descriptor", () => {
+	it("derives inline text input and requires a real video stage before advertising a variant", () => {
+		const input = workflowVersion("version-text-only");
+		const data = JSON.parse(input.version.data) as { nodes: Array<{ data: Record<string, unknown> }> };
+		data.nodes[1].data.workflowAtomicSpec = {
+			operation: "text_input",
+			executorRef: "workflow.input.text/v1",
+		};
+		data.nodes[1].data.workflowExecutionVariant = "full_video";
+		data.nodes = data.nodes.filter((_node, index) => index !== 2);
+		input.version.data = JSON.stringify(data);
+
+		expect(buildWorkflowCapabilityDescriptor(input).invocation).toEqual({
+			sourceMode: "inline_text",
+			requiredTriggerPayloadFields: ["source"],
+		});
+	});
+
+	it("collects capability requirements from frozen inline workflow steps", () => {
+		const input = workflowVersion("version-inline-pipeline");
+		input.version.data = JSON.stringify({
+			nodes: [
+				{ id: "trigger", data: { kind: "workflowTrigger" } },
+				{
+					id: "pipeline",
+					data: {
+						kind: "workflowStage",
+						workflowAtomicSpec: { operation: "inline_pipeline", executorRef: "agents.logical-task/v2" },
+						workflowPipeline: {
+							protocolVersion: "workflow.pipeline.run/v1",
+							steps: [{
+								id: "image-step",
+								node: {
+									id: "image",
+									data: {
+										kind: "workflowStage",
+										workflowAtomicSpec: { operation: "image_generate", executorRef: "tapcanvas.image.generate/v1" },
+									},
+								},
+							}],
+						},
+					},
+				},
+			],
+		});
+
+		expect(buildWorkflowCapabilityDescriptor(input)).toMatchObject({
+			nodeCount: 3,
+			operations: ["image_generate", "inline_pipeline"],
+			invocation: {
+				sourceMode: "none",
+				requiredTriggerPayloadFields: ["imageModelKey", "imageAspectRatio", "imageSize"],
+			},
+		});
+		expect(workflowCapabilityNodeBreakdown(input.version.data)).toEqual({ mainNodeCount: 2, inlineStepCount: 1 });
+	});
+
+	it("derives a display summary from workflow evidence without changing authored descriptions", () => {
+		const semanticEvidence = [{ label: "文本输入", description: "", operation: "text_input" }];
+		expect(resolveWorkflowCapabilitySummary({ name: "文本工作流", summary: "已填写说明", semanticEvidence }))
+			.toBe("已填写说明");
+		expect(resolveWorkflowCapabilitySummary({ name: "文本工作流", summary: "", semanticEvidence }))
+			.toBe("文本输入");
+	});
+
 	it("detects an obsolete canonical one-click canvas from structural versions", () => {
 		const versionData = JSON.stringify({
 			nodes: [
 				{
 					id: "trigger",
 					data: {
+						kind: "workflowStage",
 						workflowKey: "one-click-production/v1",
 						workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION - 1,
 					},
@@ -77,6 +144,7 @@ describe("capability bay descriptor", () => {
 				{
 					id: "stage",
 					data: {
+						kind: "workflowStage",
 						workflowKey: "one-click-production/v1",
 						workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
 						workflowCanvasDefinitionFingerprint: VIDEO_ATOMIC_CANVAS_DEFINITION_FINGERPRINT,
@@ -104,7 +172,8 @@ describe("capability bay descriptor", () => {
 			nodes: [{
 				id: "stage",
 				data: {
-					workflowKey: "one-click-production/v1",
+					kind: "workflowStage",
+						workflowKey: "one-click-production/v1",
 					workflowCanvasDefinitionVersion: VIDEO_ATOMIC_CANVAS_DEFINITION_VERSION,
 					workflowCanvasDefinitionFingerprint: "sha256:stale-contract",
 				},
@@ -406,7 +475,7 @@ describe("capability bay descriptor", () => {
 		expect(detectStructuralCapabilityConflicts(firstVideo, [anotherFirstVideo])).toEqual([
 			expect.objectContaining({
 				withCapabilityId: "workflow:another-first-video",
-				resolutionMode: "choose_primary",
+				resolutionMode: "acknowledge",
 			}),
 		]);
 
@@ -427,7 +496,7 @@ describe("capability bay descriptor", () => {
 		)).toEqual([]);
 	});
 
-	it("reports version changes separately from functional overlap", () => {
+	it("reports shared contracts as information without inferring functional competition", () => {
 		const target = buildWorkflowCapabilityDescriptor(workflowVersion("version-2"));
 		const previous = buildWorkflowCapabilityDescriptor(workflowVersion("version-1"));
 		const other = {
@@ -442,8 +511,8 @@ describe("capability bay descriptor", () => {
 		expect(conflicts.map((conflict) => conflict.category)).toEqual(["version_change", "functional_overlap"]);
 		expect(conflicts[0]?.severity).toBe("info");
 		expect(conflicts[0]?.resolutionMode).toBe("acknowledge");
-		expect(conflicts[1]?.severity).toBe("warning");
-		expect(conflicts[1]?.resolutionMode).toBe("choose_primary");
+		expect(conflicts[1]?.severity).toBe("info");
+		expect(conflicts[1]?.resolutionMode).toBe("acknowledge");
 	});
 
 	it("detects a built-in primary-route overlap from frozen tool-family ids", () => {

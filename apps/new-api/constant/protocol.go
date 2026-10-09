@@ -61,6 +61,7 @@ const (
 	ProtocolTaskVidu      = "task.vidu"
 	ProtocolTaskDoubao    = "task.doubao"
 	ProtocolTaskSora      = "task.openai-video"
+	ProtocolTaskHeyRoute  = "task.heyroute-video"
 	ProtocolTaskGemini    = "task.gemini-video"
 	ProtocolTaskMiniMax   = "task.minimax"
 	ProtocolTaskMiniMaxV2 = "task.minimax-v2"
@@ -164,9 +165,13 @@ func nativeProtocol(
 }
 
 var protocolDefinitions = []ProtocolDefinition{
-	relayProtocol(ProtocolOpenAI, "OpenAI Compatible", "OpenAI", "OpenAI Chat Completions, Responses, Images and Embeddings compatible protocol.", APITypeOpenAI, true,
-		[]EndpointType{EndpointTypeOpenAI, EndpointTypeOpenAIResponse, EndpointTypeOpenAIResponseCompact, EndpointTypeImageGeneration, EndpointTypeEmbeddings},
-		ChannelTypeOpenAI, ChannelTypeCustom, ChannelTypeOpenAIMax, ChannelTypeOhMyGPT, ChannelTypeAILS, ChannelTypeAIProxy, ChannelTypeAPI2GPT, ChannelTypeAIGC2D, ChannelType360, ChannelTypeLingYiWanWu, ChannelTypeSiliconFlow, ChannelTypeDeepSeek, ChannelTypeXinference, ChannelTypeXai, ChannelTypeGaiscImage, ChannelTypeAIStudioToAPI, ChannelTypeLluban),
+	taskProtocol(ProtocolTaskHeyRoute, "HeyRoute Video", "HeyRoute", "JSON video generation, polling and signed video results.", TaskPlatform(ProtocolTaskHeyRoute), ChannelTypeOpenAI),
+	withProtocolOptions(
+		relayProtocol(ProtocolOpenAI, "OpenAI Compatible", "OpenAI", "OpenAI Chat Completions, Responses, Images and Embeddings compatible protocol.", APITypeOpenAI, true,
+			[]EndpointType{EndpointTypeOpenAI, EndpointTypeOpenAIResponse, EndpointTypeOpenAIResponseCompact, EndpointTypeImageGeneration, EndpointTypeEmbeddings},
+			ChannelTypeOpenAI, ChannelTypeCustom, ChannelTypeOpenAIMax, ChannelTypeOhMyGPT, ChannelTypeAILS, ChannelTypeAIProxy, ChannelTypeAPI2GPT, ChannelTypeAIGC2D, ChannelType360, ChannelTypeLingYiWanWu, ChannelTypeSiliconFlow, ChannelTypeDeepSeek, ChannelTypeXinference, ChannelTypeXai, ChannelTypeGaiscImage, ChannelTypeAIStudioToAPI, ChannelTypeLluban),
+		ProtocolOptionDefinition{Key: "image_size_transport", Label: "Image size transport", Description: "Set passthrough to preserve the upstream size contract, including aspect ratios, without GPT image pixel conversion.", Placeholder: "passthrough"},
+	),
 	relayProtocol(ProtocolAgnes, "Agnes OpenAI Images", "OpenAI", "Agnes image generation exposed through the standard OpenAI Images contract.", APITypeAgnes, false,
 		[]EndpointType{EndpointTypeImageGeneration}, ChannelTypeAgnes),
 	withProtocolOptions(

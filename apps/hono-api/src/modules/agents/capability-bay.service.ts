@@ -3,6 +3,7 @@ import type { AppContext, PrismaClient } from "../../types";
 import { getConfig } from "../../config";
 import { signJwtHS256, verifyJwtHS256 } from "../../jwt";
 import { AppError } from "../../middleware/error";
+import { mergeWorkflowRouteDecisions } from "./capability-route-update";
 import {
 	getProjectAccessSummary,
 	listProjectAccessSummaries,
@@ -35,6 +36,8 @@ import {
 	detectStructuralCapabilityConflicts,
 	inspectVideoWorkflowCanvasDefinition,
 	omitNonCompetingCapabilityConflicts,
+	resolveWorkflowCapabilitySummary,
+	workflowCapabilityNodeBreakdown,
 	workflowCapabilityDescriptorsShareInvocationRoute,
 } from "./capability-bay.descriptor";
 import { listBuiltInSmallTCapabilities } from "../task/agents-bridge-remote-tool-surface";
@@ -47,7 +50,7 @@ type CapabilityConflict = CapabilityConflictReport["conflicts"][number];
 type CapabilityRouteResolution = {
 	conflictId: string;
 	withCapabilityId: string | null;
-	action: "acknowledge" | "replace_existing";
+	action: "acknowledge" | "replace_existing" | "coexist";
 };
 
 type LatestFlowVersionRow = {
@@ -172,9 +175,11 @@ export function obsoleteWorkflowReplacementPreferences(input: Readonly<{
 	replacementTargets: readonly string[];
 	requiredSkills: readonly string[];
 	preferences: readonly CapabilityPreferenceSnapshot[];
+	coexistingTargets?: readonly string[];
 }>): CapabilityPreferenceKey[] {
 	const activeTargets = new Set(input.replacementTargets);
 	const requiredSkills = new Set(input.requiredSkills);
+	const coexistingTargets = new Set(input.coexistingTargets ?? []);
 	return input.preferences.flatMap((preference) => {
 		if (
 			preference.enabled !== 0 ||
@@ -185,8 +190,7 @@ export function obsoleteWorkflowReplacementPreferences(input: Readonly<{
 		if (
 			!targetId ||
 			activeTargets.has(targetId) ||
-			preference.capability_kind !== "skill" ||
-			!requiredSkills.has(targetId)
+			(!coexistingTargets.has(targetId) && (preference.capability_kind !== "skill" || !requiredSkills.has(targetId)))
 		) return [];
 		return [{
 			capabilityKind: preference.capability_kind as CapabilityPreferenceKey["capabilityKind"],
@@ -206,7 +210,7 @@ function builtInCapabilityStateSha256(
 	});
 }
 
-function validateCapabilityRouteResolutions(input: {
+export function validateCapabilityRouteResolutions(input: {
 	descriptor: WorkflowCapabilityDescriptor;
 	report: CapabilityConflictReport;
 	resolutions: CapabilityRouteResolution[];
@@ -259,14 +263,14 @@ function validateCapabilityRouteResolutions(input: {
 			}
 			continue;
 		}
-		if (resolution.action !== "replace_existing" || !conflict.withCapabilityId) {
-			throw new AppError("职责重叠必须明确替换原主能力；保留原能力时不能装配候选工作流", {
+		if (!["replace_existing", "coexist"].includes(resolution.action) || !conflict.withCapabilityId) {
+			throw new AppError("职责重叠必须明确替换原主能力或并列保留；保留原能力时不能装配候选工作流", {
 				status: 409,
 				code: "capability_primary_route_not_selected",
 				details: { conflictId: conflict.id, withCapabilityId: conflict.withCapabilityId },
 			});
 		}
-		if (conflict.withCapabilityId.startsWith("builtin:")) {
+		if (resolution.action === "replace_existing" && conflict.withCapabilityId.startsWith("builtin:")) {
 			const capabilityKey = conflict.withCapabilityId.slice("builtin:".length);
 			const builtIn = listBuiltInSmallTCapabilities().find((item) => item.key === capabilityKey);
 			if (builtIn?.replaceable === false) {
@@ -277,14 +281,14 @@ function validateCapabilityRouteResolutions(input: {
 				});
 			}
 		}
-		if (input.descriptor.requiredSkills.includes(conflict.withCapabilityId)) {
+		if (resolution.action === "replace_existing" && input.descriptor.requiredSkills.includes(conflict.withCapabilityId)) {
 			throw new AppError("工作流依赖的 Skill 不能同时被该工作流停用；请返回工作流编辑并修正职责合同", {
 				status: 409,
 				code: "capability_required_skill_replacement_invalid",
 				details: { conflictId: conflict.id, skillKey: conflict.withCapabilityId },
 			});
 		}
-		replacementTargets.push(conflict.withCapabilityId);
+		if (resolution.action === "replace_existing") replacementTargets.push(conflict.withCapabilityId);
 	}
 	return [...new Set(replacementTargets)];
 }
@@ -347,13 +351,17 @@ function mapAttachment(row: {
 	const routeDecisions = routingReady
 		? CapabilityRouteDecisionSchema.array().parse(parseJson(row.route_decisions_json ?? "[]", "主路径决策"))
 		: [];
+	const descriptor = WorkflowCapabilityDescriptorSchema.parse(parseJson(row.descriptor_json, "能力描述"));
 	return AgentCapabilityAttachmentSchema.parse({
 		id: row.id,
 		kind: row.capability_kind,
 		sourceId: row.source_id,
 		sourceVersionId: row.source_version_id,
 		descriptorSha256: row.descriptor_sha256,
-		descriptor: WorkflowCapabilityDescriptorSchema.parse(parseJson(row.descriptor_json, "能力描述")),
+		descriptor: {
+			...descriptor,
+			summary: resolveWorkflowCapabilitySummary(descriptor),
+		},
 		conflictReport: CapabilityConflictReportSchema.parse(parseJson(row.conflict_report_json, "冲突报告")),
 		routeDecisions,
 		routingReady,
@@ -604,7 +612,12 @@ function parseInvocationInput(value: string | null): Record<string, unknown> | n
 		: null;
 }
 
-export async function getCapabilityBay(c: AppContext, userId: string, projectId?: string) {
+export async function getCapabilityBay(
+	c: AppContext,
+	userId: string,
+	projectId?: string,
+	options: Readonly<{ includeInvocations?: boolean }> = {},
+) {
 	const db = c.env.DB;
 	const accessibleProjects = await listProjectAccessSummaries(db, userId);
 	const currentProject = projectId
@@ -617,10 +630,21 @@ export async function getCapabilityBay(c: AppContext, userId: string, projectId?
 		});
 	}
 	const managedProjects = accessibleProjects.filter((project) => project.project_kind === "ai_workflow");
+	const editableProjectIds = new Set(accessibleProjects
+		.filter((project) => project.access === "owner" || project.access === "team_edit")
+		.map((project) => project.id));
 	const sourceProjectIds = [...new Set([
 		...managedProjects.map((project) => project.id),
 		...(currentProject ? [currentProject.id] : []),
 	])];
+	const invocationRowsPromise = options.includeInvocations
+		? db.agent_capability_invocations.findMany({
+				where: { user_id: userId },
+				orderBy: { created_at: "desc" },
+				take: 100,
+				include: { workflow_executions: true },
+		  })
+		: Promise.resolve([]);
 	const [attachmentRows, skillRows, preferenceRows, invocationRows, systemSettings] = await Promise.all([
 		db.agent_capability_attachments.findMany({
 			where: {
@@ -634,12 +658,7 @@ export async function getCapabilityBay(c: AppContext, userId: string, projectId?
 			orderBy: [{ sort_order: "asc" }, { name: "asc" }],
 		}),
 		db.agent_capability_preferences.findMany({ where: { user_id: userId }, orderBy: { updated_at: "desc" } }),
-		db.agent_capability_invocations.findMany({
-			where: { user_id: userId },
-			orderBy: { created_at: "desc" },
-			take: 100,
-			include: { workflow_executions: true },
-		}),
+		invocationRowsPromise,
 		readBuiltInCapabilitySystemSettings(c),
 	]);
 	// 系统级（all_users）工作流对全体用户可见：即使其项目不在调用者可访问范围内，
@@ -647,12 +666,17 @@ export async function getCapabilityBay(c: AppContext, userId: string, projectId?
 	const systemAttachmentFlowIds = [...new Set(attachmentRows
 		.filter((attachment) => attachment.scope === "all_users")
 		.map((attachment) => attachment.source_id))];
+	const systemAttachmentFlowIdSet = new Set(systemAttachmentFlowIds);
 	const flowRows = await db.flows.findMany({
 		where: systemAttachmentFlowIds.length > 0
 			? { OR: [{ project_id: { in: sourceProjectIds } }, { id: { in: systemAttachmentFlowIds } }] }
 			: { project_id: { in: sourceProjectIds } },
 		orderBy: { updated_at: "desc" },
 	});
+	const systemProjectIds = new Set(flowRows
+		.filter((flow) => systemAttachmentFlowIdSet.has(flow.id))
+		.map((flow) => flow.project_id)
+		.filter((id): id is string => Boolean(id)));
 	const projectNameById = new Map(accessibleProjects.map((project) => [project.id, project.name]));
 	// 系统级工作流可能属于调用者不可访问的项目，补齐其项目名用于展示。
 	const missingProjectIds = [...new Set(flowRows
@@ -716,9 +740,18 @@ export async function getCapabilityBay(c: AppContext, userId: string, projectId?
 			const descriptorSha256 = capabilityDescriptorSha256(descriptor);
 			const canvasDefinition = inspectVideoWorkflowCanvasDefinition(descriptorVersion.data);
 			candidates.push({
-				descriptor,
+				// This is a display projection; keep the stored descriptor hash stable.
+				descriptor: {
+					...descriptor,
+					summary: resolveWorkflowCapabilitySummary(descriptor),
+				},
 				descriptorSha256,
+				nodeBreakdown: workflowCapabilityNodeBreakdown(descriptorVersion.data),
 				projectName: flow.project_id ? projectNameById.get(flow.project_id) ?? null : null,
+				canEdit: !(systemAttachmentFlowIdSet.has(flow.id) && !isAdminRequest(c))
+					&& (flow.project_id ? editableProjectIds.has(flow.project_id) : flow.owner_id === userId),
+				updatedAt: flow.updated_at,
+				attachedAt: attached?.createdAt ?? null,
 				attached: Boolean(attached),
 				attachedVersionId: attached?.sourceVersionId ?? null,
 				stale: !canvasDefinition.current || Boolean(attached && (
@@ -793,7 +826,10 @@ export async function getCapabilityBay(c: AppContext, userId: string, projectId?
 		projectKind: "ai_workflow" as const,
 		flowCount: flowCountByProjectId.get(project.id) ?? 0,
 		updatedAt: project.updated_at,
-		canDelete: project.access === "owner",
+		canDelete: isAdminRequest(c)
+			? project.access === "owner" || systemProjectIds.has(project.id)
+			: project.access === "owner" && !systemProjectIds.has(project.id),
+		canEdit: editableProjectIds.has(project.id),
 	}));
 	const currentProjectSummary = currentProject ? {
 		id: currentProject.id,
@@ -1418,9 +1454,19 @@ export async function equipWorkflowCapability(c: AppContext, userId: string, flo
 					code: "capability_inspection_stale",
 				});
 			}
+			const previousAttachment = attachmentRows.find((attachment) => attachment.source_id === flowId);
+			const routeDecisions = mergeWorkflowRouteDecisions({
+				previous: previousAttachment ? mapAttachment(previousAttachment).routeDecisions : [],
+				current: input.resolutions,
+				requiredSkills: descriptor.requiredSkills,
+				nonReplaceableCapabilityIds: listBuiltInSmallTCapabilities()
+					.filter((capability) => capability.replaceable === false)
+					.map((capability) => `builtin:${capability.key}`),
+			});
 			const obsoleteReplacementPreferences = obsoleteWorkflowReplacementPreferences({
 				workflowCapabilityId: descriptor.capabilityId,
 				replacementTargets,
+				coexistingTargets: input.resolutions.flatMap((decision) => decision.action === "coexist" && decision.withCapabilityId ? [decision.withCapabilityId] : []),
 				requiredSkills: descriptor.requiredSkills,
 				preferences: preferenceRows,
 			});
@@ -1538,7 +1584,7 @@ export async function equipWorkflowCapability(c: AppContext, userId: string, flo
 					id: randomUUID(), user_id: userId, capability_kind: "workflow", source_id: flowId,
 					source_version_id: descriptor.sourceVersionId,
 					descriptor_json: JSON.stringify(descriptor), descriptor_sha256: descriptorSha256,
-					conflict_report_json: JSON.stringify(report), route_decisions_json: JSON.stringify(input.resolutions),
+					conflict_report_json: JSON.stringify(report), route_decisions_json: JSON.stringify(routeDecisions),
 					scope,
 					created_at: now, updated_at: now,
 				},
@@ -1546,7 +1592,7 @@ export async function equipWorkflowCapability(c: AppContext, userId: string, flo
 					source_version_id: descriptor.sourceVersionId,
 					descriptor_json: JSON.stringify(descriptor), descriptor_sha256: descriptorSha256,
 					conflict_report_json: JSON.stringify(report),
-					route_decisions_json: JSON.stringify(input.resolutions),
+					route_decisions_json: JSON.stringify(routeDecisions),
 					scope,
 					conflict_report_revision: { increment: 1 }, updated_at: now,
 				},

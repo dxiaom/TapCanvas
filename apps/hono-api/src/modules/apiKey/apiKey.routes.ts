@@ -1889,7 +1889,7 @@ const PublicVisionOpenApiRoute = createRoute({
 	tags: [PUBLIC_TAG],
 	summary: "图像理解 /public/vision",
 	description:
-		"便捷图像理解接口：创建 image_to_prompt 任务并直接返回文本（常见用法：根据图片反推可复现的英文提示词）。服务端固定请求 new-api，外部传入 vendor/vendorCandidates 会被忽略。默认使用 gpt-5.6-luna；支持外部 prompt 透传；图片输入支持 imageUrl 或 imageData（二选一）。失败会显式返回错误，不做 draw 降级。",
+		"便捷图像理解接口：创建 image_to_prompt 任务并直接返回文本（常见用法：根据图片反推可复现的英文提示词）。服务端固定请求 new-api，外部传入 vendor/vendorCandidates 会被忽略。模型由部署配置 IMAGE_UNDERSTANDING_MODEL_KEY 决定（默认 doubao-seed-2-1-turbo-260628），调用方不可覆盖；支持外部 prompt 透传；图片输入支持 imageUrl 或 imageData（二选一）。失败会显式返回错误，不做 draw 降级。",
 	request: {
 		body: {
 			required: true,
@@ -1983,8 +1983,7 @@ publicApiRouter.openapi(PublicVisionOpenApiRoute, async (c) => {
 			details: {
 				vendor,
 				taskId: typeof result?.id === "string" ? result.id : null,
-				modelAlias:
-					typeof request.extras.modelAlias === "string" ? request.extras.modelAlias : null,
+				modelKey: request.extras.modelKey ?? null,
 			},
 		});
 	}
@@ -3279,11 +3278,32 @@ export async function runPublicTask(
 ): Promise<{ vendor: string; result: any }> {
 	const abortSignal = isAbortSignalLike(input?.abortSignal) ? input.abortSignal : null;
 	throwIfAbortSignalAborted(abortSignal);
-	const request = (await normalizeTaskAssetBackedVideoRequest(
+	const workflowTaskId = typeof input?.workflowTaskId === "string" && input.workflowTaskId.trim()
+		? input.workflowTaskId.trim()
+		: null;
+	const preUpstreamWorkflowImageError = (error: unknown, phase: string): AppError => new AppError(
+		`Workflow image request was rejected before async task registration: ${error instanceof Error ? error.message : String(error)}`,
+		{
+			status: 422,
+			code: "workflow_image_preflight_rejected",
+			details: {
+				workflowSubmissionState: "rejected_pre_upstream",
+				workflowTaskId,
+				upstreamRequestAttempted: false,
+				phase,
+			},
+		},
+	);
+	const normalizedRequest = await normalizeTaskAssetBackedVideoRequest(
 		c as AppContext,
 		userId,
 		normalizeImageEditRequestKind(input.request),
-	)) as Record<string, any>;
+	).catch((error: unknown) => {
+		if (workflowTaskId) throw preUpstreamWorkflowImageError(error, "request_normalization");
+		throw error;
+	});
+	if (!isPlainRecord(normalizedRequest)) throw new AppError("Task request must be an object", { status: 400, code: "invalid_task_request" });
+	const request = normalizedRequest;
 	const extras = (request?.extras || {}) as Record<string, any>;
 	const externalVendor =
 		typeof input?.vendor === "string" && input.vendor.trim() ? input.vendor.trim() : null;
@@ -3353,20 +3373,22 @@ export async function runPublicTask(
 		// Deterministic validation and queue readiness both finish before a task is
 		// accepted. Provider execution is owned by the durable worker, never by a
 		// detached Promise in this request process.
-		const asyncRequest = TaskRequestSchema.parse(requestForNewApi);
-		await resolveAuthorizedGenerationAssetContext(
-			c as AppContext,
-			userId,
-			asyncRequest,
-		);
-		await resolveExecutableNewApiTaskModel(
-			c as AppContext,
-			NEW_API_AUTO_VENDOR,
-			asyncRequest,
-		);
+		let asyncRequest: ReturnType<typeof TaskRequestSchema.parse>;
 		try {
+			asyncRequest = TaskRequestSchema.parse(requestForNewApi);
+			await resolveAuthorizedGenerationAssetContext(
+				c as AppContext,
+				userId,
+				asyncRequest,
+			);
+			await resolveExecutableNewApiTaskModel(
+				c as AppContext,
+				NEW_API_AUTO_VENDOR,
+				asyncRequest,
+			);
 			await ensureAsyncImageQueueReady();
 		} catch (error) {
+			if (workflowTaskId) throw preUpstreamWorkflowImageError(error, "async_image_preflight");
 			if (error instanceof AsyncImageQueueReadinessError) {
 				throw new AppError(error.message, {
 					status: 503,
@@ -3375,7 +3397,10 @@ export async function runPublicTask(
 			}
 			throw error;
 		}
-		const asyncTaskId = `task_${crypto.randomUUID()}`;
+		// Workflow attempts reserve this ID on their durable canvas claim before
+		// reaching the async task registration boundary. Ordinary manual image
+		// requests retain their random task identity.
+		const asyncTaskId = workflowTaskId ?? `task_${crypto.randomUUID()}`;
 		const asyncNowIso = new Date().toISOString();
 		const optionalContextString = (value: unknown): string | null => {
 			return typeof value === "string" && value.trim() ? value.trim() : null;

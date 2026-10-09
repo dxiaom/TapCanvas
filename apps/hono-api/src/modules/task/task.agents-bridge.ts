@@ -1,6 +1,9 @@
+import { projectAtomicAuthorSelfCheckMetadata, type AtomicAuthorSelfCheckReceiptV1, type AtomicAuthorSelfCheckProjectionIssueV1 } from "../../../../../packages/schemas/atomic-author-selfcheck/index.cjs";
+import { projectAgentRequestContextMetrics, type AgentRequestContextMetrics } from "./agent-request-context-metrics";
+import { parseWorkflowSubmissionHandoff } from "./workflow-submission-handoff";
+import { IMAGE_UNDERSTANDING_MODEL_KEY } from "./media-understanding-model";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { DIRECTOR_POSE_LABELS, DIRECTOR_PROP_LABELS } from "./director-capture.shared";
 import { resolvePositiveIntEnv, CONCURRENCY_DEFAULTS } from "./concurrency-limits";
 import {
 	AgentsBridgeAdmissionScheduler,
@@ -151,6 +154,7 @@ import {
 import { buildTrustedInternalExecutionApiKey } from "./agents-bridge-continuation-auth";
 import { buildInternalApiKey } from "../apiKey/internal-api-key";
 import { buildShotTableCriticRemoteTool } from "./agents-bridge-shot-critic-tool";
+import { buildDirectorDeskRelayTool } from "./director-desk-relay";
 import { filterRejectedSelectedReferenceMedia } from "./agents-bridge-reference-media";
 import { buildGenerationPrefsContextBlock, parseUserGenerationPrefs } from "../auth/generation-prefs";
 import { getPrismaClient } from "../../platform/node/prisma";
@@ -601,6 +605,10 @@ type FlowPatchNodeFinalState = {
 };
 
 type AgentsRuntimeTraceSummary = {
+	upstreamRequestContextMetrics?: AgentRequestContextMetrics;
+	upstreamRequestContextMetricsIssue?: "invalid_request_context_metrics";
+	atomicAuthorSelfCheck?: AtomicAuthorSelfCheckReceiptV1;
+	atomicAuthorSelfCheckProjectionIssue?: AtomicAuthorSelfCheckProjectionIssueV1;
 	profile: "general" | "code" | "unknown";
 	terminalAuthority?: "user_delivery" | "workflow_action";
 	registeredToolNames: string[];
@@ -1937,6 +1945,7 @@ export function normalizeAgentsBridgeAdmissionReceiptV1(value: unknown): AgentsB
 
 export function normalizeAgentsRuntimeTraceSummary(value: unknown): AgentsRuntimeTraceSummary | null {
 	if (!isRecord(value)) return null;
+	const requestContextMetrics = projectAgentRequestContextMetrics(value.upstreamRequestContextMetrics);
 	const profileRaw = typeof value.profile === "string" ? value.profile.trim() : "";
 	const profile =
 		profileRaw === "general" || profileRaw === "code" ? profileRaw : "unknown";
@@ -2052,6 +2061,10 @@ export function normalizeAgentsRuntimeTraceSummary(value: unknown): AgentsRuntim
 			}
 			: null;
 	return {
+		...projectAtomicAuthorSelfCheckMetadata(value),
+		...(requestContextMetrics.metrics ? { upstreamRequestContextMetrics: requestContextMetrics.metrics } : {}),
+		...(requestContextMetrics.issue || value.upstreamRequestContextMetricsIssue === "invalid_request_context_metrics"
+			? { upstreamRequestContextMetricsIssue: "invalid_request_context_metrics" as const } : {}),
 		profile,
 		...(terminalAuthority ? { terminalAuthority } : {}),
 		registeredToolNames: readTrimmedStringArray(value.registeredToolNames).slice(0, 256),
@@ -4581,6 +4594,7 @@ function equippedWorkflowRequiredTriggerFields(
 function buildEquippedWorkflowSchemaBranch(
 	workflow: NonNullable<AgentsBridgeRemoteToolsInput["equippedWorkflows"]>[number],
 	requiresAttachmentSelection: boolean,
+	triggerPayloadSchema: Record<string, unknown>,
 ): Record<string, unknown> {
 	const triggerRequired = equippedWorkflowRequiredTriggerFields(workflow);
 	return {
@@ -4589,19 +4603,17 @@ function buildEquippedWorkflowSchemaBranch(
 			...(requiresAttachmentSelection
 				? { attachmentId: { type: "string", const: workflow.attachmentId } }
 				: {}),
-			...(triggerRequired.length > 0
-				? {
-					triggerPayload: {
-						type: "object",
-						required: triggerRequired,
-					},
-				}
-				: {}),
+			idempotencyKey: { type: "string", minLength: 1 },
+			triggerPayload: {
+				...triggerPayloadSchema,
+				...(triggerRequired.length > 0 ? { required: triggerRequired } : {}),
+			},
 		},
 		required: [
 			...(requiresAttachmentSelection ? ["attachmentId"] : []),
 			...(triggerRequired.length > 0 ? ["triggerPayload"] : []),
 		],
+		additionalProperties: false,
 	};
 }
 
@@ -4716,6 +4728,37 @@ function buildEquippedWorkflowRunTool(
 		.map((modelKey) => modelKey.trim())
 		.filter(Boolean))].sort();
 	const requiresAttachmentSelection = equippedWorkflows.length > 1;
+	const triggerPayloadSchema: Record<string, unknown> = {
+		type: "object",
+		description: "按次触发参数。source 与 sourceGroupId 不可互换；必须遵守所选 attachment 的真实输入契约。",
+		properties: {
+			source: { type: "string", description: "仅供 sourceMode=inline_text 的工作流使用：本次故事事实与叙事节拍。不得在这里把剧情阶段数量写成物理视频 clip 拓扑；物理 clip 由工作流按实时模型能力冻结。" },
+			sourceGroupId: { type: "string", description: "调用者当前画布内的源组 id；绑定调用者项目已选节点（文本 + 已就绪图片/视频）作为本次源与参考资产，供工作流复用。" },
+			selectedAssetIds: { type: "array", items: { type: "string" }, description: "当前明确选中的稳定资产 ID；服务端会过滤掉无权限或跨项目 ID。" },
+			selectedNodeIds: { type: "array", items: { type: "string" }, description: "当前多选的画布节点 ID。" },
+			targetDurationSeconds: { type: "number", description: "目标成片总时长（秒）；仅声明总量，不声明 clip 分段。" },
+			requestedClipCount: { type: "number", minimum: 1, description: "用户明确指定的物理 clip 数量；未明确指定时必须省略。" },
+			requestedClipDurationsSeconds: { type: "array", minItems: 1, maxItems: 64, items: { type: "number", minimum: 1 }, description: "用户明确指定的逐物理 clip 有序时长（秒）；未逐段指定时必须省略。长度必须等于 requestedClipCount，总和必须等于 targetDurationSeconds。" },
+			videoModelKey: {
+				type: "string",
+				minLength: 1,
+				...(enabledVideoModelKeys.length > 0 ? { enum: enabledVideoModelKeys } : {}),
+				description: "必须逐字复制本字段 enum 中的当前 enabledVideoModels canonical modelKey；用户显式选择优先，账号生成偏好只有仍出现在 enum 中时才可使用。服务端据其实时 durationOptions 冻结物理 clip 拓扑；禁止猜测、展示名、过期偏好或默认模型。",
+			},
+			imageModelKey: {
+				type: "string",
+				minLength: 1,
+				...(enabledImageModelKeys.length > 0 ? { enum: enabledImageModelKeys } : {}),
+				description: "必须逐字复制本字段 enum 中的当前 enabledImageModels canonical modelKey；禁止使用展示名、过期偏好或默认模型。",
+			},
+			imageSize: { type: "string", minLength: 1, description: "图片模型实时目录支持的精确尺寸档位，例如 2K；禁止默认。" },
+			imageAspectRatio: { type: "string", minLength: 1, description: "图片模型实时目录支持的精确画幅比例；只配置图片节点，不表示用户指定了成片画幅。" },
+			videoResolution: { type: "string", minLength: 1, description: "视频模型实时目录支持的精确分辨率；若用户冻结了分辨率，必须逐字满足该约束。" },
+			videoAspectRatio: { type: "string", minLength: 1, description: "视频模型实时目录支持的精确画幅比例；若用户冻结了画幅，必须逐字满足该约束。" },
+		},
+		...(commonRequiredTriggerFields.length > 0 ? { required: commonRequiredTriggerFields } : {}),
+		additionalProperties: false,
+	};
 	return {
 		name: "tapcanvas_equipped_workflow_run",
 				description: [
@@ -4743,7 +4786,7 @@ function buildEquippedWorkflowRunTool(
 		parameters: {
 			type: "object",
 			oneOf: equippedWorkflows.map((workflow) =>
-				buildEquippedWorkflowSchemaBranch(workflow, requiresAttachmentSelection)),
+				buildEquippedWorkflowSchemaBranch(workflow, requiresAttachmentSelection, triggerPayloadSchema)),
 			properties: {
 				...(requiresAttachmentSelection
 					? {
@@ -4754,37 +4797,7 @@ function buildEquippedWorkflowRunTool(
 					}
 					: {}),
 				idempotencyKey: { type: "string", minLength: 1 },
-				triggerPayload: {
-					type: "object",
-					description: "按次触发参数。source 与 sourceGroupId 不可互换；必须遵守所选 attachment 的真实输入契约。",
-					properties: {
-						source: { type: "string", description: "仅供 sourceMode=inline_text 的工作流使用：本次故事事实与叙事节拍。不得在这里把剧情阶段数量写成物理视频 clip 拓扑；物理 clip 由工作流按实时模型能力冻结。" },
-						sourceGroupId: { type: "string", description: "调用者当前画布内的源组 id；绑定调用者项目已选节点（文本 + 已就绪图片/视频）作为本次源与参考资产，供工作流复用。" },
-						selectedAssetIds: { type: "array", items: { type: "string" }, description: "当前明确选中的稳定资产 ID；服务端会过滤掉无权限或跨项目 ID。" },
-						selectedNodeIds: { type: "array", items: { type: "string" }, description: "当前多选的画布节点 ID。" },
-						targetDurationSeconds: { type: "number", description: "目标成片总时长（秒）；仅声明总量，不声明 clip 分段。" },
-						requestedClipCount: { type: "number", minimum: 1, description: "用户明确指定的物理 clip 数量；未明确指定时必须省略。" },
-						requestedClipDurationsSeconds: { type: "array", minItems: 1, maxItems: 64, items: { type: "number", minimum: 1 }, description: "用户明确指定的逐物理 clip 有序时长（秒）；未逐段指定时必须省略。长度必须等于 requestedClipCount，总和必须等于 targetDurationSeconds。" },
-						videoModelKey: {
-							type: "string",
-							minLength: 1,
-							...(enabledVideoModelKeys.length > 0 ? { enum: enabledVideoModelKeys } : {}),
-							description: "必须逐字复制本字段 enum 中的当前 enabledVideoModels canonical modelKey；用户显式选择优先，账号生成偏好只有仍出现在 enum 中时才可使用。服务端据其实时 durationOptions 冻结物理 clip 拓扑；禁止猜测、展示名、过期偏好或默认模型。",
-						},
-						imageModelKey: {
-							type: "string",
-							minLength: 1,
-							...(enabledImageModelKeys.length > 0 ? { enum: enabledImageModelKeys } : {}),
-							description: "必须逐字复制本字段 enum 中的当前 enabledImageModels canonical modelKey；禁止使用展示名、过期偏好或默认模型。",
-						},
-						imageSize: { type: "string", minLength: 1, description: "图片模型实时目录支持的精确尺寸档位，例如 2K；禁止默认。" },
-						imageAspectRatio: { type: "string", minLength: 1, description: "图片模型实时目录支持的精确画幅比例；只配置图片节点，不表示用户指定了成片画幅。" },
-						videoResolution: { type: "string", minLength: 1, description: "视频模型实时目录支持的精确分辨率；若用户冻结了分辨率，必须逐字满足该约束。" },
-						videoAspectRatio: { type: "string", minLength: 1, description: "视频模型实时目录支持的精确画幅比例；若用户冻结了画幅，必须逐字满足该约束。" },
-					},
-					...(commonRequiredTriggerFields.length > 0 ? { required: commonRequiredTriggerFields } : {}),
-					additionalProperties: false,
-				},
+				triggerPayload: triggerPayloadSchema,
 			},
 			required: [
 				...(requiresAttachmentSelection ? ["attachmentId"] : []),
@@ -5153,7 +5166,10 @@ function buildAgentsBridgeRemoteToolCatalog(
 			...(equippedWorkflowRunTool ? [equippedWorkflowRunTool] : []),
 		].map(attachRemoteToolExecutionSemantics);
 	}
-	const tools: AgentsBridgeRemoteToolDefinition[] = [buildShotTableCriticRemoteTool()];
+	const tools: AgentsBridgeRemoteToolDefinition[] = [
+		buildShotTableCriticRemoteTool(),
+		buildDirectorDeskRelayTool(),
+	];
 	if (projectId) {
 		tools.push(
 			{
@@ -7360,7 +7376,7 @@ function buildAgentsBridgeRemoteToolCatalog(
 			name: "tapcanvas_render_blocking_diagram",
 			description:
 				"【确定性·俯视站位图(blocking diagram)渲染】把结构化站位数据与 KeyframeCompositionContract 渲染成一张**从正上方看的平面调度示意图**：角色站位/朝向/走位、场景地标、机位/视锥/轴线，以及本镜叙事焦点、环境权重、每个角色的视觉权重/景深层/居中政策/最大画高。服务端按归一化坐标 [0,1] 精确绘制并返回 { imageUrl, compositionContract, compositionContractHash }；图片对象 key 携带同一 hash，供关键帧付费前与 commit_beats 追溯。" +
-				"**它是 3D 导演台(capture_director_scene)的轻量常驻版**——不依赖浏览器在线，任何镜随时出一张准确调度图。用途三合一：①作分镜交付文档的「人物站位」列；②作该镜 generate_storyboard / 视频生成的 role=context 一致性参考(锁谁在画左/画右/面朝谁)；③作 clipPrompt 里轴线/银幕方向措辞的真源。**为什么不用 gpt-image-2 画：站位图的价值是空间真值，生成式脑补会把位置画乱、轴线画反，等于把防漂锚画成噪声。**" +
+				"**它与独立 DirectorDesk 的三维预演能力互补**——本工具是不依赖浏览器的轻量常驻版，随时输出确定性的俯视调度图。用途三合一：①作分镜交付文档的「人物站位」列；②作该镜 generate_storyboard / 视频生成的 role=context 一致性参考(锁谁在画左/画右/面朝谁)；③作 clipPrompt 里轴线/银幕方向措辞的真源。**为什么不用 gpt-image-2 画：站位图的价值是空间真值，生成式脑补会把位置画乱、轴线画反，等于把防漂锚画成噪声。**" +
 				"坐标系：原点左上、x 向右(=银幕左右)、y 向下(=纵深/上下)。先由 agents 判断当前 clip 是否真实依赖精确空间调度，并为该镜给出完整 compositionContract；Hono 不从 prompt 推断焦点。拿到结果后用 flow_patch 新建 image 节点，写 data.productionLayer='blocking_diagram'、data.sceneName、data.productionMetadata.lockedAnchors.character，并把返回的 compositionContract/compositionContractHash 逐字持久化到 data.productionMetadata。关键帧 productionMetadata 必须携带同一合同/hash，并与 beat 共用精确 blockingFrameNodeId。旧站位图、后补字段、只有节点连线或 prompt 声称已使用都不能作为新合同证据。" +
 				"**⭐户型底图两步法(2026-07-06 用户拍板·默认必走)**：①本场景若还没有「俯视底图」节点——先用场景卡图生图转一张俯视平面示意图(prompt 如「根据此场景图绘制俯视平面示意图/top-down floor plan，简洁线稿+色块，标注主要地物名称，无人物」，label「俯视底图｜<场景名>」+ data.sceneName='<场景名>' 出生申报，每场景一张全章复用)；②本工具带 backgroundImageUrl=该底图 URL——符号层(站位/走位/机位/轴线)会叠画在户型底图上，landmarks 坐标与底图地物对齐。这样调度图不再是抽象白纸，模型能把站位映射进真实场景几何。",
 			parameters: {
@@ -7508,7 +7524,7 @@ function buildAgentsBridgeRemoteToolCatalog(
 			{
 				name: "tapcanvas_analyze_image",
 				description:
-					"图片理解(vision)：固定使用 gpt-5.6-luna 看懂一张真实图片资产并返回文字描述与无 URL 引用描述。只接受当前 flow 的 nodeId，或当前用户/项目的 assetId（含素材具体版本 ID）；服务端在受控执行边界解析真实 URL，主模型不得读取、复制或回显存储 URL。公开 /public/vision 接口另行支持直接传入 http(s) imageUrl。模型不可用或 ID 无法解析时显式失败，不自动降级。",
+					`图片理解(vision)：固定使用部署配置的 ${IMAGE_UNDERSTANDING_MODEL_KEY} 看懂一张真实图片资产并返回文字描述与无 URL 引用描述。只接受当前 flow 的 nodeId，或当前用户/项目的 assetId（含素材具体版本 ID）；服务端在受控执行边界解析真实 URL，主模型不得读取、复制或回显存储 URL。公开 /public/vision 接口另行支持直接传入 http(s) imageUrl。模型不可用或 ID 无法解析时显式失败，不自动降级。`,
 				parameters: {
 					type: "object",
 					properties: {
@@ -7547,6 +7563,12 @@ function buildAgentsBridgeRemoteToolCatalog(
 					prompt: {
 						type: "string",
 						description: "可选：评估问题/侧重点。省略用默认 QA 问法(真实感/动态/一致/失真/口播)。",
+					},
+					fps: {
+						type: "number",
+						minimum: 1,
+						maximum: 5,
+						description: "可选：视频理解取样帧率（1–5 FPS，上游硬上限为 5）。快速剪辑/蒙太奇请显式提高；仅影响理解取样，不会把原视频作为生成输入。",
 					},
 					dramaticCoverage: {
 						type: "array",
@@ -7660,251 +7682,6 @@ function buildAgentsBridgeRemoteToolCatalog(
 				},
 				required: ["pageUrl"],
 				additionalProperties: false,
-			},
-		},
-		{
-			name: "tapcanvas_capture_director_scene",
-			description:
-				"组装一个导演台 3D 场景并直接渲染出一张机位占位图（参考图）。在空 3D 空间按三维坐标摆放素体角色、家具道具与单个机位，浏览器离屏渲染后返回 TOS 图 URL，可直接作为出图/故事板的空间构图参考。强烈建议为每个角色设 posePresetId 指定贴合剧情的姿势——缺省是无表演信息的 T-pose 素体。" +
-				`可用姿势预设（id中文名）——${DIRECTOR_POSE_LABELS}。` +
-				`可用道具（id中文名）——${DIRECTOR_PROP_LABELS}。` +
-				"【摆位规范】家具道具为真实米制尺寸、底面落地，禁止放大成墙（uniformScale≤3）、禁止摆在镜头与人物之间；机位 lookAt 指向角色群中点、确保每个具名角色都在画面内——服务端会做视锥+遮挡构图校验，角色出画或被道具完全遮挡会直接拒绝并告知修法。" +
-				"【先建空间再拍镜头】若该场景已有 720° 全景图（isPanoramic 节点），把其 imageUrl 传 scene.skybox 作天空盒——人物/机位摆进真实环境，blocking 帧自带空间方位；无全景图才用 prop-* 空舞台摆场。" +
-				"仅在用户浏览器在线的交互会话可用。重试用同一 requestId（幂等命中），同场景再出一张须换新 requestId。",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					id: { type: "string", description: "导演台节点稳定 ID（create-if-absent）。格式 agent-<intent>-<batchUlid>-director" },
-					requestId: { type: "string", description: "本次出图的确定性 ID，作幂等域；重试沿用、重出换新" },
-					scene: {
-						type: "object",
-						additionalProperties: false,
-						properties: {
-							characters: {
-								type: "array",
-								items: {
-									type: "object",
-									additionalProperties: false,
-									properties: {
-										id: { type: "string" },
-										name: { type: "string" },
-										modelId: { type: "string", description: "素体：male|female|broad|muscular|slim|teen|child|chibi（或 prop-* 道具、或 http(s) GLB URL）" },
-										position: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-										rotation: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-										uniformScale: { type: "number" },
-										colorHex: { type: "string" },
-										// 注意：枚举/详细说明放工具 description（schema 体积超 defer 阈值会被剥成
-										// 无结构占位，实证导致模型把参数序列化成字符串）。合法 id 由服务端 zod
-										// enum(DIRECTOR_POSE_IDS) 严校验，传错会回吐全表。
-										posePresetId: { type: "string", description: "姿势预设 id（强烈建议设定，缺省=T-pose；完整 id 列表见本工具 description）" },
-										pose: {
-											type: "object",
-											additionalProperties: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-											description: "进阶：逐关节欧拉弧度 {spine|neck|shoulderL|elbowL|shoulderR|elbowR|hipL|kneeL|hipR|kneeR:[x,y,z]}，优先于 posePresetId",
-										},
-									},
-									required: ["id", "name", "modelId", "position"],
-								},
-							},
-							camera: {
-								type: "object",
-								additionalProperties: false,
-								properties: {
-									position: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-									lookAtMode: { type: "string", description: "'manual' 或某个 character.id" },
-									lookAt: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-									fovDeg: { type: "number" },
-								},
-								required: ["position"],
-							},
-							aspect: { type: "string", enum: ["auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"] },
-							// 详细用法见本工具 description「先建空间再拍镜头」段（inline 说明会撑爆 defer 阈值，故精简）。
-							skybox: {
-								type: "string",
-								description: "可选：全景背景图 URL。2:1 等距全景直接作天空盒；非 2:1 普通图前端自适应转环幕穹顶（接缝/极点已优化），也可用",
-							},
-							skyboxYaw: { type: "number", description: "可选：全景背景水平旋转(度 0..360)，转背景取景不动机位" },
-							skyboxPitch: { type: "number", description: "可选：全景地平线俯仰校准(度 -45..45)，用于让背景地面与导演网格对齐" },
-						},
-						required: ["characters", "camera"],
-					},
-				},
-				required: ["id", "requestId", "scene"],
-			},
-		},
-		{
-			name: "tapcanvas_render_director_clip",
-			description:
-				"组装一个导演台 3D 场景 + 关键帧动画，浏览器离屏渲一段 clay 灰模 mp4 样片，产出一个 video 节点（data.sourceVideoUrl 已就绪，可直接作 seedance 视频参考 v2v 重构成电影级成片）。用于需精确控制运镜/物体运动时机的镜头（推轨/环绕/直升机视角/复杂走位）——3D 灰模确定性钉死运动轨迹，真实感全交 seedance，勿对灰模本身做画质要求。" +
-				"【animation 格式】cameras 为 {相机id: {position:[{t,value:[x,y,z]}], lookAt:[{t,value:[x,y,z]}], fovDeg:[{t,value:[度]}]}}（相机 id 用 capture-cam）；characters 为 {角色id: {position:[{t,value:[x,y,z]}], rotation:[{t,value:[x,y,z]}]}}（角色 id 须与 scene.characters[].id 一致）。每条轨道是 [{t,value}] 关键帧数组，t 为秒、value 为数字数组；单关键帧=全程常量，区间内线性插值。durationSeconds 建议 3~5、fps 建议 24。" +
-				"【护栏】animation 及其内部轨道必须是真 JSON 对象/数组，禁止序列化成字符串传入。" +
-				"【骨骼动画 motionClip】animation.characters 每个角色可加 motionClip 让其做连续骨骼动作(优先于静态 posePresetId、自动循环填满时长)：idle/walk/run/agree(点头)/headShake(摇头)/sad_pose/sneak_pose/wave(挥手)；另可加 motionSpeed(默认1)。要让人物在样片里真动起来务必设 motionClip,否则只是定格姿势。**库里没有的动作(跳舞/挥拳/坐下/任意编排)先调 tapcanvas_director_define_motion 编出来(PoseClip 关键帧)再用其 id 当 motionClip;严禁传不存在的名(如凭空 dance)——会静默失败、人不动。**" +
-				"【混合分层动作 motion】(覆盖 motionClip，优先级更高)animation.characters[id].motion={durationSeconds:秒,poseTrack?:[{t:秒,pose:{关节:[x,y,z]弧度}}],poseMask?:关节数组(缺省:有locomotion=上半身spine/neck/shoulderL/elbowL/shoulderR/elbowR,否则全身),locomotion?:{clip:'walk'|'run'|'idle',path?:{waypoints:[[x,z]地面坐标(米),...],mode:'linear'|'curve',closed?:bool},speed?:腿部循环速率倍率(默认1,只调腿动作快慢,不改行进距离;行进距离由path长度÷durationSeconds决定)}}。上半身poseTrack叠在baked腿动作之上；根节点沿path匀速行进、朝向自动跟切线。关节名:spine neck shoulderL elbowL shoulderR elbowR hipL kneeL hipR kneeR。" +
-				"【相机环绕 cameraOrbit】想要镜头运动(对 v2v 是最强运动线索)就设 animation.cameraOrbit:{center:[x,y,z]默认[0,0,0], radius默认6, height默认1.6, degrees默认360(整圈,180=半弧), startDeg默认0, fovDeg默认40, lookAtHeight默认1.3}。每帧算精确圆周比手摆 cameras 关键帧更平滑;设了 cameraOrbit 就不必再写 cameras 轨道。角色可同时保持 motionClip 动作。" +
-				`角色姿势预设 posePresetId 取值同 tapcanvas_capture_director_scene（${DIRECTOR_POSE_LABELS}）。camera.lookAtMode='manual' 或某 character.id；scene.skybox 可传 720° 等距全景图 URL 作天空盒（同 capture 工具）。仅在用户浏览器在线的交互会话可用；重试用同一 requestId（幂等），重渲换新 requestId。`,
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					id: { type: "string", description: "导演台节点稳定 ID（create-if-absent）" },
-					requestId: { type: "string", description: "幂等域 ID；重试沿用、重渲换新" },
-					scene: {
-						type: "object",
-						additionalProperties: false,
-						properties: {
-							characters: {
-								type: "array",
-								items: {
-									type: "object",
-									additionalProperties: false,
-									properties: {
-										id: { type: "string" },
-										name: { type: "string" },
-										modelId: { type: "string", description: "素体 male|female|broad|muscular|slim|teen|child|chibi 或 prop-* 或 GLB URL" },
-										position: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-										rotation: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-										uniformScale: { type: "number" },
-										colorHex: { type: "string" },
-										posePresetId: { type: "string" },
-									},
-									required: ["id", "name", "modelId", "position"],
-								},
-							},
-							camera: {
-								type: "object",
-								additionalProperties: false,
-								properties: {
-									position: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-									lookAtMode: { type: "string" },
-									lookAt: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-									fovDeg: { type: "number" },
-								},
-								required: ["position"],
-							},
-							aspect: { type: "string", enum: ["auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"] },
-							skybox: { type: "string" },
-							skyboxYaw: { type: "number" },
-							skyboxPitch: { type: "number" },
-						},
-						required: ["characters", "camera"],
-					},
-					animation: {
-						type: "object",
-						additionalProperties: false,
-						properties: {
-							durationSeconds: { type: "number" },
-							fps: { type: "number" },
-							cameras: { type: "object", additionalProperties: true },
-							characters: { type: "object", additionalProperties: true },
-							cameraOrbit: { type: "object", additionalProperties: true },
-						},
-						required: ["durationSeconds", "fps"],
-					},
-				},
-				required: ["id", "requestId", "scene", "animation"],
-			},
-		},
-		{
-			name: "tapcanvas_director_define_motion",
-			description:
-				"定义一段可复用的自定义骨骼动画（PoseClip），存入导演台节点 data.scene.customMotions（同 id 替换、否则追加）。" +
-				"后续在 tapcanvas_render_director_clip 的 animation.characters.<角色id>.motionClip 填该 motion.id，角色就会在样片里做这段自定义动作（优先于 posePresetId、自动循环填满时长）；若传 characterId 则同步把该角色的 motionClip 设为该 id。" +
-				"【关节空间·规范·弧度】joints = spine|neck|shoulderL|elbowL|shoulderR|elbowR|hipL|kneeL|hipR|kneeR；" +
-				"pose 值为 [x,y,z] 欧拉弧度(XYZ顺序，与 capture 工具逐关节 pose 字段完全相同)：spine/neck x+前倾 y+左转 z+右倾；shoulderL z+抬 x-前摆；shoulderR z-抬；elbowL y-弯；elbowR y+弯；hipL/R x-前抬腿；kneeL/R x+弯曲。" +
-				"【例·招手2帧 durationSeconds:1,loop:true】keyframes:[{t:0,pose:{shoulderR:[0,0,-1.22],elbowR:[0,0.79,0]}},{t:0.5,pose:{shoulderR:[0,0,-1.22],elbowR:[0,1.40,0]}}]",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					id: { type: "string", description: "导演台节点 id" },
-					characterId: { type: "string", description: "可选:把动作直接挂到该角色(设其 motionClip)" },
-					motion: {
-						type: "object",
-						additionalProperties: false,
-						properties: {
-							id: { type: "string" },
-							name: { type: "string" },
-							durationSeconds: { type: "number" },
-							loop: { type: "boolean" },
-							keyframes: { type: "array", items: { type: "object", additionalProperties: true } },
-						},
-						required: ["id", "name", "durationSeconds", "keyframes"],
-					},
-				},
-				required: ["id", "motion"],
-			},
-		},
-		{
-			name: "tapcanvas_director_set_character_motion",
-			description:
-				"把混合分层动作（CharacterMotion）直接写入导演台场景中指定角色的 motion 字段（覆盖原值，优先级高于 motionClip/posePresetId）。" +
-				"适用于 AI 实时编排角色行走路径、骨骼 pose 轨迹等，写入后用户可在动画 tab 直接看到并调整。" +
-				"【motion 字段说明】durationSeconds(必填,秒,>0)；" +
-				"poseTrack?:[{t:秒,pose:{关节:[x,y,z]弧度}}] 关节名同 tapcanvas_director_define_motion；" +
-				"poseMask?:关节名数组(缺省:有locomotion=上半身,否则全身)；" +
-				"locomotion?:{clip:'walk'|'run'|'idle',path?:{waypoints:[[x,z]地面坐标(米),...],mode:'linear'|'curve',closed?:bool},speed?:腿部循环速率倍率(默认1)}。" +
-				"上半身 poseTrack 叠在 baked 腿动作之上；根节点沿 path 匀速行进、朝向自动跟切线。",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					id: { type: "string", description: "导演台节点 id" },
-					characterId: { type: "string", description: "要设置动作的角色 id（scene.characters[].id）" },
-					motion: {
-						type: "object",
-						additionalProperties: false,
-						description: "CharacterMotion：混合分层动作描述",
-						properties: {
-							durationSeconds: { type: "number", description: "动作总时长（秒），必须 > 0" },
-							poseTrack: {
-								type: "array",
-								description: "骨骼关键帧序列",
-								items: {
-									type: "object",
-									additionalProperties: true,
-									properties: {
-										t: { type: "number", description: "时间点（秒）" },
-										pose: { type: "object", additionalProperties: true, description: "关节 → [x,y,z] 弧度映射" },
-									},
-									required: ["t", "pose"],
-								},
-							},
-							poseMask: {
-								type: "array",
-								items: { type: "string" },
-								description: "只更新哪些关节；缺省：有 locomotion 时=上半身，否则=全身",
-							},
-							locomotion: {
-								type: "object",
-								additionalProperties: false,
-								description: "腿部位移动作",
-								properties: {
-									clip: { type: "string", enum: ["walk", "run", "idle"], description: "基础步态循环" },
-									path: {
-										type: "object",
-										additionalProperties: false,
-										description: "行走路径",
-										properties: {
-											waypoints: {
-												type: "array",
-												items: { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 },
-												description: "地面坐标序列 [[x,z],...]（米）",
-											},
-											mode: { type: "string", enum: ["linear", "curve"], description: "路径插值方式" },
-											closed: { type: "boolean", description: "是否闭合成循环路径" },
-										},
-										required: ["waypoints", "mode"],
-									},
-									speed: { type: "number", description: "腿部动画循环速率倍率（默认 1）" },
-								},
-								required: ["clip"],
-							},
-						},
-						required: ["durationSeconds"],
-					},
-				},
-				required: ["id", "characterId", "motion"],
 			},
 		},
 		{
@@ -8838,10 +8615,8 @@ export async function runAgentsBridgeChatTask(
 			code: "agents_max_output_tokens_invalid",
 		});
 	}
-	const reasoningEffortRaw = options?.directForcedAgentExecution === true
-		? (extras as Record<string, unknown>).reasoningEffort
-			?? continuationExecutionContractRecord?.reasoningEffort
-		: undefined;
+	const reasoningEffortRaw = (extras as Record<string, unknown>).reasoningEffort
+		?? continuationExecutionContractRecord?.reasoningEffort;
 	const reasoningEffort = reasoningEffortRaw === "none"
 		|| reasoningEffortRaw === "minimal"
 		|| reasoningEffortRaw === "low"
@@ -8852,8 +8627,7 @@ export async function runAgentsBridgeChatTask(
 		? reasoningEffortRaw
 		: undefined;
 	if (
-		options?.directForcedAgentExecution === true
-		&& reasoningEffortRaw !== undefined
+		reasoningEffortRaw !== undefined
 		&& reasoningEffort === undefined
 	) {
 		throw new AppError("reasoningEffort 必须是 none/minimal/low/medium/high/xhigh/max 之一", {
@@ -9719,6 +9493,14 @@ export async function runAgentsBridgeChatTask(
 					...(typeof outputContract !== "undefined"
 						? { outputContract }
 						: {}),
+					...(options?.directForcedAgentExecution === true ? {
+						...(typeof extras.outputArtifactType === "string" && extras.outputArtifactType.trim()
+							? { outputArtifactType: extras.outputArtifactType.trim() } : {}),
+						...(typeof extras.structuredOutputSourceContext === "string" ? { structuredOutputSourceContext: extras.structuredOutputSourceContext } : {}),
+						...(extras.resumeStructuredOutput === true ? { resumeStructuredOutput: true } : {}),
+						...(isRecord(extras.structuredOutputRepair) ? { structuredOutputRepair: extras.structuredOutputRepair } : {}),
+						...(typeof extras.structuredOutputSubmissionPolicy === "string" ? { structuredOutputSubmissionPolicy: extras.structuredOutputSubmissionPolicy } : {}),
+					} : {}),
 					...(typeof maxOutputTokens === "number"
 						? { maxOutputTokens }
 						: {}),
@@ -10130,6 +9912,7 @@ export async function runAgentsBridgeChatTask(
 	const llmTermination = summarizeAgentsBridgeLlmTermination(traceTurns);
 	const rawTraceRuntime = isRecord(data?.trace?.runtime) ? data.trace.runtime : null;
 	const traceRuntime = normalizeAgentsRuntimeTraceSummary(rawTraceRuntime);
+	const submissionHandoff = parseWorkflowSubmissionHandoff(rawTraceRuntime?.submissionHandoff);
 	const traceTodoList = normalizeAgentsTodoListTraceSummary(data?.trace?.todoList);
 	const traceTodoEvents = normalizeAgentsTodoEventTraceSummaries(data?.trace?.todoEvents);
 	const tracePlanning =
@@ -10376,6 +10159,7 @@ export async function runAgentsBridgeChatTask(
 							exit: traceRuntime.physicalRunExit,
 							expectedLogicalTaskId: publicTurnId || requestId,
 							deliveryVerified: durableTerminalDelivery !== null,
+							submissionHandoff,
 					  });
 			} catch (error: unknown) {
 				throw new AppError("Agents bridge 的逻辑任务状态无法提交", {
@@ -10471,6 +10255,7 @@ export async function runAgentsBridgeChatTask(
 			...(traceCompletion ? { completionTrace: traceCompletion } : {}),
 			runOutcome: traceRunOutcome,
 			logicalTaskState,
+			...(submissionHandoff ? { submissionHandoff } : {}),
 			...(semanticExecutionIntent.detected ? { semanticExecutionIntent } : {}),
 			...(tracePlanning ? { planningTrace: tracePlanning } : {}),
 			...(traceTodoList ? { todoList: traceTodoList } : {}),

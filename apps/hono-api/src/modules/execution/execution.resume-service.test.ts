@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import type { AppContext, WorkerEnv } from "../../types";
+import { createWorkflowProjectContext } from "./execution.project-context";
 import {
 	createWorkflowArtifactContract,
 	createWorkflowInputContractRejection,
@@ -89,6 +90,8 @@ const mocks = vi.hoisted(() => ({
 	applyWorkflowAgentModelCutover: vi.fn((root: unknown) => root),
 	cancelActiveWorkflowNodeJobs: vi.fn(),
 	startWorkflowExecution: vi.fn(),
+	startDurableExecution: vi.fn(),
+	requeueUnstartedExecution: vi.fn(),
 }));
 
 vi.mock("../flow/flow.repo", () => ({
@@ -97,6 +100,8 @@ vi.mock("../flow/flow.repo", () => ({
 
 vi.mock("./execution.repo", () => ({
 	getExecutionForOwner: mocks.getExecutionForOwner,
+	requeueUnstartedExecution: mocks.requeueUnstartedExecution,
+	mapExecutionRow: (row: unknown) => row,
 	getExecutionSnapshotForOwner: mocks.getExecutionSnapshotForOwner,
 	listNodeRunsForExecutionOwner: mocks.listNodeRunsForExecutionOwner,
 	mapExecutionSnapshotRow: (row: Readonly<{
@@ -139,15 +144,16 @@ vi.mock("./execution.queue", () => ({
 vi.mock("./execution.start-service", () => ({
 	WorkflowStartError: class WorkflowStartError extends Error {},
 	startWorkflowExecution: mocks.startWorkflowExecution,
+	startDurableExecution: mocks.startDurableExecution,
 }));
 
 import { resumeWorkflowExecution } from "./execution.resume-service";
 
 function runtime(): Readonly<{
 	env: WorkerEnv;
-	cancelFetch: ReturnType<typeof vi.fn>;
+	cancelFetch: Mock<[url: string, init: RequestInit], Promise<Response>>;
 }> {
-	const cancelFetch = vi.fn(async () => new Response(null, { status: 202 }));
+	const cancelFetch = vi.fn(async (_url: string, _init: RequestInit) => new Response(null, { status: 202 }));
 	const env = {
 		DB: {},
 		JWT_SECRET: "test",
@@ -196,6 +202,45 @@ describe("workflow resume service", () => {
 		});
 	});
 
+	it("redispatches an unstarted failure without creating a second execution", async () => {
+		const { env } = runtime();
+		mocks.getExecutionForOwner.mockResolvedValueOnce({
+			...sourceExecution, status: "failed", started_at: null,
+		}).mockResolvedValue({ ...sourceExecution, status: "running" });
+		mocks.listNodeRunsForExecutionOwner.mockResolvedValue([]);
+		mocks.getWorkflowExecutionFamilyPageForOwner.mockResolvedValue({
+			executionFamilyId: sourceExecution.execution_family_id,
+			latestExecutionId: sourceExecution.id, latestExecutionStatus: "failed",
+			activeExecutionCount: 0, activeExecutionIds: [],
+		});
+		mocks.requeueUnstartedExecution.mockResolvedValue(true);
+		const result = await resumeWorkflowExecution({
+			context: {} as AppContext, env, ownerId: sourceExecution.owner_id,
+			sourceExecutionId: sourceExecution.id, trigger: "manual",
+		});
+		expect(result.id).toBe(sourceExecution.id);
+		expect(mocks.startDurableExecution).toHaveBeenCalledWith(env, sourceExecution.id);
+		expect(mocks.startWorkflowExecution).not.toHaveBeenCalled();
+	});
+
+	it("recognizes a provider suspension inside a partially completed collection for model cutover", async () => {
+		const output = JSON.parse(BALANCE_OUTPUT_REFS) as Record<string, unknown>;
+		output.executionMode = "each";
+		const suspendedEvidence = output.evidence;
+		output.evidence = { completedItems: 1, waitingItems: 1, totalItems: 2 };
+		output.itemRuns = [
+			{ itemId: "done", index: 0, runtimeNodeId: "agent-beat-sheet::item::done", lineage: [], status: "success", attempt: 1, ports: {}, artifacts: [], evidence: {} },
+			{ itemId: "pending", index: 1, runtimeNodeId: "agent-beat-sheet::item::pending", lineage: [], status: "waiting_external", attempt: 1, ports: {}, artifacts: [], evidence: suspendedEvidence },
+		];
+		mocks.listNodeRunsForExecutionOwner.mockResolvedValue([{ ...nodeRuns[0], output_refs: JSON.stringify(output) }]);
+		const { env } = runtime();
+		await expect(resumeWorkflowExecution({ context: {} as AppContext, env,
+			ownerId: sourceExecution.owner_id, sourceExecutionId: sourceExecution.id, trigger: "manual",
+			agentModelCutover: { targetModelKey: "chosen-model", apiStyle: "chat", authorizationSource: "admin" },
+		})).resolves.toMatchObject({ id: "execution-recovery" });
+		expect(mocks.applyWorkflowAgentModelCutover).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ targetModelKey: "chosen-model" }));
+	});
+
 	it("continues the same frozen provider model from the persisted balance node", async () => {
 		const { env, cancelFetch } = runtime();
 		const execution = await resumeWorkflowExecution({
@@ -232,6 +277,10 @@ describe("workflow resume service", () => {
 			},
 			idempotencyKey: `workflow-provider-balance-restored:${sourceExecution.id}`,
 			recoveryOfExecutionId: sourceExecution.id,
+			// The recovery fences its own source before admission, so the child must
+			// declare the balance-recovery admission or the source's own cancellation
+			// reads back as an unexpected status change.
+			recoveryAdmission: "provider_balance_recovery",
 		});
 		const startFlow = startInput.flow as Readonly<Record<string, unknown>>;
 		const replayedRoot = JSON.parse(String(startFlow.data)) as typeof frozenRoot;
@@ -241,7 +290,228 @@ describe("workflow resume service", () => {
 		});
 	});
 
-	it("refuses an old recoverable snapshot after the current flow switches to fresh-only", async () => {
+	it("keeps generated media as replay receipts instead of adopting it into frozen inputs", async () => {
+		const { env } = runtime();
+		const imageOutput = { protocolVersion: "1", executorRef: "tapcanvas.image.generate/v1", nodeId: "images", executionMode: "each",
+			ports: { "asset-bindings": { protocolVersion: "workflow.collection/v1", collectionId: "images", items: [{
+				itemId: "done", index: 0, lineage: [], value: { generatedAssetId: "new-output-not-in-inputs", imageUrl: "https://assets.test/result.png" },
+			}] } }, artifacts: [], evidence: {}, itemRuns: [{ itemId: "done", index: 0, runtimeNodeId: "images::item::done", lineage: [],
+				status: "success", ports: {}, artifacts: [], evidence: { taskId: "accepted-image" } }] };
+		mocks.listNodeRunsForExecutionOwner.mockResolvedValue([...nodeRuns, { ...nodeRuns[0], id: "image-run", node_id: "images", status: "success", output_refs: JSON.stringify(imageOutput) }]);
+		await resumeWorkflowExecution({ context: {} as AppContext, env, ownerId: sourceExecution.owner_id,
+			sourceExecutionId: sourceExecution.id, trigger: "manual", providerBalanceRestored: true });
+		const root = JSON.parse(mocks.startWorkflowExecution.mock.calls[0][1].flow.data);
+		expect(root).not.toHaveProperty("workflowMediaAdoptions");
+	});
+
+	it("uses the exact media retry parent as recovery frontier instead of the first failed node", async () => {
+		const { env } = runtime();
+		const mediaNode = {
+			id: "images",
+			type: "taskNode",
+			data: { kind: "workflowStage", workflowAtomicSpec: {
+				executorRef: "tapcanvas.image.generate/v1", executionMode: "each",
+			} },
+		};
+		mocks.getExecutionForOwner.mockResolvedValue({ ...sourceExecution, status: "failed" });
+		mocks.getExecutionSnapshotForOwner.mockResolvedValue({
+			id: sourceExecution.id,
+			flow_id: sourceExecution.flow_id,
+			flow_version_id: sourceExecution.flow_version_id,
+			flow_versions: {
+				name: "Video workflow",
+				data: JSON.stringify({ ...frozenRoot, nodes: [...frozenRoot.nodes, mediaNode] }),
+				created_at: sourceExecution.created_at,
+			},
+		});
+		const mediaOutput = {
+			protocolVersion: "1",
+			executorRef: "tapcanvas.image.generate/v1",
+			nodeId: "images",
+			executionMode: "each",
+			ports: {}, artifacts: [], evidence: {},
+			itemRuns: [{ itemId: "background", index: 0, runtimeNodeId: "images::item::background",
+				lineage: [], status: "failed", ports: {}, artifacts: [],
+				evidence: { taskId: "failed-image-task", canvasNodeId: "failed-image-node", providerStatus: "failed" } }],
+		};
+		const firstFailedRun = { ...nodeRuns[0], id: "node-run-first-failure", node_id: "unrelated-failure", status: "failed", output_refs: null };
+		const targetFailedRun = { ...nodeRuns[0], id: "node-run-image-failure", node_id: "images", status: "failed", output_refs: JSON.stringify(mediaOutput) };
+		mocks.listNodeRunsForExecutionOwner.mockResolvedValue([firstFailedRun, targetFailedRun]);
+		mocks.getWorkflowExecutionFamilyPageForOwner.mockResolvedValue({
+			executionFamilyId: sourceExecution.execution_family_id,
+			latestExecutionId: sourceExecution.id,
+			latestExecutionStatus: "failed",
+			activeExecutionCount: 0,
+			activeExecutionIds: [],
+		});
+		mocks.getLatestFailedWorkflowExecutionIdForOwner.mockResolvedValue(sourceExecution.id);
+
+		await resumeWorkflowExecution({
+			context: {} as AppContext,
+			env,
+			ownerId: sourceExecution.owner_id,
+			sourceExecutionId: sourceExecution.id,
+			trigger: "manual",
+			mediaRetries: [{ nodeId: "images", itemId: "background", taskId: "failed-image-task" }],
+		});
+
+		const startInput = mocks.startWorkflowExecution.mock.calls[0]?.[1] as { replay?: { startFromNodeId?: string } };
+		expect(startInput.replay?.startFromNodeId).toBe("images");
+	});
+
+	it("appends an exact item retry from a terminal success parent run", async () => {
+		const { env } = runtime();
+		const mediaNode = {
+			id: "images", type: "taskNode",
+			data: { kind: "workflowStage", workflowAtomicSpec: {
+				executorRef: "tapcanvas.image.generate/v1", executionMode: "each",
+			} },
+		};
+		const mediaOutput = {
+			protocolVersion: "1", executorRef: "tapcanvas.image.generate/v1", nodeId: "images", executionMode: "each",
+			ports: {}, artifacts: [], evidence: {},
+			itemRuns: [{ itemId: "background", index: 0, runtimeNodeId: "images::item::background",
+				lineage: [], status: "failed", ports: {}, artifacts: [],
+				evidence: { taskId: "failed-image-task", canvasNodeId: "failed-image-node", providerStatus: "failed" } }],
+		};
+		mocks.getExecutionForOwner.mockResolvedValue({ ...sourceExecution, status: "success", finished_at: "2026-08-23T00:01:00.000Z" });
+		mocks.getExecutionSnapshotForOwner.mockResolvedValue({
+			id: sourceExecution.id, flow_id: sourceExecution.flow_id, flow_version_id: sourceExecution.flow_version_id,
+			flow_versions: { name: "Video workflow", data: JSON.stringify({ ...frozenRoot, nodes: [...frozenRoot.nodes, mediaNode] }), created_at: sourceExecution.created_at },
+		});
+		mocks.listNodeRunsForExecutionOwner.mockResolvedValue([{
+			...nodeRuns[0], id: "node-run-image-success-with-failed-item", node_id: "images", status: "success",
+			output_refs: JSON.stringify(mediaOutput),
+		}]);
+		mocks.getWorkflowExecutionFamilyPageForOwner.mockResolvedValue({
+			executionFamilyId: sourceExecution.execution_family_id, latestExecutionId: sourceExecution.id,
+			latestExecutionStatus: "success", activeExecutionCount: 0, activeExecutionIds: [],
+		});
+
+		await resumeWorkflowExecution({ context: {} as AppContext, env, ownerId: sourceExecution.owner_id,
+			sourceExecutionId: sourceExecution.id, trigger: "manual",
+			mediaRetries: [{ nodeId: "images", itemId: "background", taskId: "failed-image-task" }] });
+
+		const startInput = mocks.startWorkflowExecution.mock.calls[0]?.[1] as Readonly<Record<string, unknown>>;
+		expect(startInput).toMatchObject({
+			recoveryOfExecutionId: sourceExecution.id,
+			recoveryAdmission: "media_retry",
+			replay: { startFromNodeId: "images", invalidatedNodeIds: ["images"] },
+		});
+		expect(startInput.idempotencyKey).toMatch(/^workflow-media-retry:/u);
+	});
+
+	it("appends one exact failed media retry from the latest canceled execution", async () => {
+		const { env } = runtime();
+		const mediaNode = {
+			id: "images", type: "taskNode",
+			data: { kind: "workflowStage", workflowAtomicSpec: {
+				executorRef: "tapcanvas.image.generate/v1", executionMode: "each",
+			} },
+		};
+		const mediaOutput = {
+			protocolVersion: "1", executorRef: "tapcanvas.image.generate/v1", nodeId: "images", executionMode: "each",
+			ports: {}, artifacts: [], evidence: {},
+			itemRuns: [{ itemId: "cover", index: 0, runtimeNodeId: "images::item::cover", lineage: [],
+				status: "failed", ports: {}, artifacts: [],
+				evidence: { taskId: "failed-image-task", canvasNodeId: "failed-image-node", providerStatus: "failed" } }],
+		};
+		const canceledMediaRun = {
+			...nodeRuns[0], id: "node-run-image-canceled", node_id: "images", node_type: "tapcanvas.image.generate/v1",
+			status: "canceled", output_refs: JSON.stringify(mediaOutput),
+		};
+		mocks.getExecutionForOwner.mockResolvedValue({ ...sourceExecution, status: "canceled" });
+		mocks.getExecutionSnapshotForOwner.mockResolvedValue({
+			id: sourceExecution.id, flow_id: sourceExecution.flow_id, flow_version_id: sourceExecution.flow_version_id,
+			flow_versions: { name: "Video workflow", data: JSON.stringify({ ...frozenRoot, nodes: [...frozenRoot.nodes, mediaNode] }), created_at: sourceExecution.created_at },
+		});
+		mocks.listNodeRunsForExecutionOwner.mockResolvedValue([canceledMediaRun]);
+		mocks.getWorkflowExecutionFamilyPageForOwner.mockResolvedValue({
+			executionFamilyId: sourceExecution.execution_family_id,
+			latestExecutionId: sourceExecution.id,
+			latestExecutionStatus: "canceled",
+			activeExecutionCount: 0,
+			activeExecutionIds: [],
+		});
+		mocks.getLatestFailedWorkflowExecutionIdForOwner.mockResolvedValue(null);
+
+		await resumeWorkflowExecution({
+			context: {} as AppContext,
+			env,
+			ownerId: sourceExecution.owner_id,
+			sourceExecutionId: sourceExecution.id,
+			trigger: "manual",
+			mediaRetries: [{ nodeId: "images", itemId: "cover", taskId: "failed-image-task" }],
+		});
+
+		const startInput = mocks.startWorkflowExecution.mock.calls[0]?.[1] as Readonly<Record<string, unknown>>;
+		expect(startInput).toMatchObject({
+			recoveryOfExecutionId: sourceExecution.id,
+			recoveryAdmission: "media_retry",
+			replay: { startFromNodeId: "images", invalidatedNodeIds: ["images"] },
+		});
+		expect(startInput.idempotencyKey).toMatch(/^workflow-media-retry:/u);
+		expect(mocks.startWorkflowExecution).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not turn a canceled execution into a node-level workflow resume", async () => {
+		const { env } = runtime();
+		mocks.getExecutionForOwner.mockResolvedValue({ ...sourceExecution, status: "canceled" });
+
+		await expect(resumeWorkflowExecution({
+			context: {} as AppContext,
+			env,
+			ownerId: sourceExecution.owner_id,
+			sourceExecutionId: sourceExecution.id,
+			trigger: "manual",
+			nodeId: "images",
+		})).rejects.toMatchObject({ code: "workflow_resume_source_not_failed", status: 409 });
+		expect(mocks.startWorkflowExecution).not.toHaveBeenCalled();
+	});
+
+	it("does not admit exact media retry while any family member is active", async () => {
+		const { env } = runtime();
+		const validOutput = {
+			protocolVersion: "1", executorRef: "tapcanvas.image.generate/v1", nodeId: "images", executionMode: "each",
+			ports: {}, artifacts: [], evidence: {}, itemRuns: [{ itemId: "background", index: 0,
+				runtimeNodeId: "images::item::background", lineage: [], status: "failed", ports: {}, artifacts: [],
+				evidence: { taskId: "failed-image-task", canvasNodeId: "failed-image-node", providerStatus: "failed" } }],
+		};
+		mocks.getExecutionForOwner.mockResolvedValue({ ...sourceExecution, status: "success" });
+		mocks.getExecutionSnapshotForOwner.mockResolvedValue({
+			id: sourceExecution.id, flow_id: sourceExecution.flow_id, flow_version_id: sourceExecution.flow_version_id,
+			flow_versions: { name: "Video workflow", data: JSON.stringify({ ...frozenRoot, nodes: [...frozenRoot.nodes,
+				{ id: "images", type: "taskNode", data: { kind: "workflowStage", workflowAtomicSpec: {
+					executorRef: "tapcanvas.image.generate/v1", executionMode: "each",
+				} } }] }), created_at: sourceExecution.created_at },
+		});
+		mocks.listNodeRunsForExecutionOwner.mockResolvedValue([{ ...nodeRuns[0], node_id: "images", status: "success", output_refs: JSON.stringify(validOutput) }]);
+		mocks.getWorkflowExecutionFamilyPageForOwner.mockResolvedValue({
+			executionFamilyId: sourceExecution.execution_family_id, latestExecutionId: sourceExecution.id,
+			latestExecutionStatus: "running", activeExecutionCount: 1, activeExecutionIds: ["execution-active"],
+		});
+
+		await expect(resumeWorkflowExecution({ context: {} as AppContext, env, ownerId: sourceExecution.owner_id,
+			sourceExecutionId: sourceExecution.id, trigger: "manual",
+			mediaRetries: [{ nodeId: "images", itemId: "background", taskId: "failed-image-task" }] }))
+			.rejects.toMatchObject({ code: "workflow_resume_family_active" });
+		expect(mocks.startWorkflowExecution).not.toHaveBeenCalled();
+	});
+
+	it.each(["current", "frozen"])("uses replay evidence when the %s definition retains a retired fresh-only flag", async (location) => {
+		if (location === "frozen") {
+			mocks.getExecutionSnapshotForOwner.mockResolvedValueOnce({
+				id: sourceExecution.id,
+				flow_id: sourceExecution.flow_id,
+				flow_version_id: sourceExecution.flow_version_id,
+				flow_versions: {
+					name: "Video workflow",
+					data: JSON.stringify({ ...frozenRoot, nodes: frozenRoot.nodes.map((node) => node.id === "trigger"
+						? { ...node, data: { ...node.data, workflowExecutionRecoveryPolicy: "fresh_only" } } : node) }),
+					created_at: sourceExecution.created_at,
+				},
+			});
+		}
 		mocks.getFlowForOwner.mockResolvedValue({
 			id: sourceExecution.flow_id,
 			name: "Video workflow",
@@ -268,16 +538,13 @@ describe("workflow resume service", () => {
 			sourceExecutionId: sourceExecution.id,
 			trigger: "agent",
 			providerBalanceRestored: true,
-		})).rejects.toMatchObject({
-			code: "workflow_resume_fresh_only",
-			status: 409,
-			details: {
-				policyAuthority: "current_flow",
-				sourceExecutionId: sourceExecution.id,
-			},
+		})).resolves.toBeDefined();
+		expect(cancelFetch).toHaveBeenCalledTimes(1);
+		expect(mocks.startWorkflowExecution).toHaveBeenCalledTimes(1);
+		expect(mocks.startWorkflowExecution.mock.calls[0]?.[1]).toMatchObject({
+			recoveryOfExecutionId: sourceExecution.id,
+			replay: { sourceExecutionId: sourceExecution.id, scope: "recovery_snapshot" },
 		});
-		expect(cancelFetch).not.toHaveBeenCalled();
-		expect(mocks.startWorkflowExecution).not.toHaveBeenCalled();
 	});
 
 	it("invalidates the exact rejected input author and not a parallel launch Agent", async () => {
@@ -426,7 +693,8 @@ describe("workflow resume service", () => {
 			},
 		});
 		const edge = { source: "trigger", target: "voice" };
-		const immutableContext = { version: 3, projectId: "project-1", canvasId: "chapter-1", assetSnapshot: [] };
+		const immutableContext = createWorkflowProjectContext({ projectId: "project-1", canvasId: "chapter-1",
+			principalId: sourceExecution.owner_id, canvasData: { nodes: [], edges: [] }, assets: [], now: new Date("2026-01-01T00:00:00.000Z") });
 		mocks.getExecutionForOwner.mockResolvedValue({
 			...sourceExecution,
 			status: "failed",

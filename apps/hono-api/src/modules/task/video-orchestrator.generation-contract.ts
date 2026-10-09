@@ -1,17 +1,10 @@
 import type { AppContext } from "../../types";
-import { resolveModelDurationOptions } from "./video-orchestrator.model-duration";
-import { listModelCatalogModels } from "../model-catalog/model-catalog.service";
+import { ExternalDependencyError } from "../../platform/external-dependency-error";
 import {
   isSelectableNewApiModel,
   listNewApiModels,
 } from "../new-api-models/new-api-models.service";
 import { matchesNewApiRuntimeModelIdentity } from "../new-api-models/new-api-model-identity";
-
-export type VideoReferenceImagePolicy = {
-  countUnit: "unique_url";
-  maximumTotalImages: number;
-  maximumBusinessImages: number;
-};
 
 export type VideoReferenceAudioPolicy = {
   /** Zero/zero is the explicit frozen fact that this runtime model exposes no reference-audio input. */
@@ -24,13 +17,13 @@ export type VideoGenerationContract = {
   videoModel: string;
   durationOptions: number[];
   maxDurationSeconds: number;
-  referenceImagePolicy: VideoReferenceImagePolicy;
+  maxShotDurationSeconds?: number;
   referenceAudioPolicy: VideoReferenceAudioPolicy;
+  supportsTextToVideo?: boolean | null;
+  supportsReferenceImages?: boolean | null;
+  supportsFirstLastFrame?: boolean | null;
+  maxReferenceImages?: number | null;
 };
-
-function normalizeCatalogModelKey(value: unknown): string {
-  return String(value ?? "").trim().toLowerCase().replace(/-apimart$/, "");
-}
 
 async function resolveEnabledRuntimeVideoOptions(input: {
   c: AppContext;
@@ -38,59 +31,40 @@ async function resolveEnabledRuntimeVideoOptions(input: {
 }): Promise<Record<string, unknown>> {
   const videoModel = input.videoModel.trim();
   if (!videoModel) throw new Error("video_generation_model_required");
-  const wanted = normalizeCatalogModelKey(videoModel);
-  const [catalogModels, runtimeModels] = await Promise.all([
-    listModelCatalogModels(input.c, { kind: "video", enabled: true }),
-    listNewApiModels(input.c.env, { kind: "video", enabled: true, fresh: true }),
-  ]);
-  const catalogModel = catalogModels.find((model) =>
-    normalizeCatalogModelKey(model.modelKey) === wanted ||
-    normalizeCatalogModelKey(model.modelAlias) === wanted,
-  );
-  if (!catalogModel) throw new Error(`video_model_not_enabled:${videoModel}`);
+  // The new-api runtime directory is the only source of truth for whether a
+  // model can actually be submitted. The local catalog may enrich passive UI
+  // metadata, but requiring a second catalog row here can reject a newly
+  // enabled runtime-only model before the provider request is even built.
+  const runtimeModels = await listNewApiModels(input.c.env, {
+    kind: "video",
+    enabled: true,
+    fresh: true,
+  });
   const runtimeModel = runtimeModels
     .filter(isSelectableNewApiModel)
     .find((model) => matchesNewApiRuntimeModelIdentity(model, videoModel));
-  if (!runtimeModel) throw new Error(`video_model_runtime_contract_missing:${videoModel}`);
+  if (!runtimeModel) throw new Error(`video_model_not_enabled:${videoModel}`);
   const videoOptions = runtimeModel.meta &&
       typeof runtimeModel.meta === "object" &&
       !Array.isArray(runtimeModel.meta)
     ? (runtimeModel.meta as Record<string, unknown>).videoOptions
     : null;
   if (!videoOptions || typeof videoOptions !== "object" || Array.isArray(videoOptions)) {
-    throw new Error(`video_model_runtime_contract_missing:${videoModel}`);
+    throw new ExternalDependencyError({ kind: "model_catalog", identity: videoModel,
+      field: "videoOptions", code: "video_model_runtime_contract_missing", observed: videoOptions });
   }
   return videoOptions as Record<string, unknown>;
 }
 
-export async function resolveVideoModelMaximumReferenceImages(input: {
-  c: AppContext;
-  videoModel: string;
-}): Promise<number> {
-  const videoOptions = await resolveEnabledRuntimeVideoOptions(input);
-  const declaredMaximum = videoOptions.maxReferenceImages;
-  const maximumTotalImages = Number(declaredMaximum);
-  if (Number.isInteger(maximumTotalImages) && maximumTotalImages > 0) {
-    return maximumTotalImages;
-  }
-  if (
-    declaredMaximum === undefined &&
-    videoOptions.supportsReferenceImages !== true
-  ) {
-    return 0;
-  }
-  if (videoOptions.supportsReferenceImages === false) return 0;
-  if (!Number.isInteger(maximumTotalImages) || maximumTotalImages <= 0) {
-    throw new Error(`video_model_reference_image_policy_missing:${input.videoModel.trim()}`);
-  }
-  return maximumTotalImages;
-}
 
 export async function resolveVideoModelReferenceAudioPolicy(input: {
   c: AppContext;
   videoModel: string;
 }): Promise<VideoReferenceAudioPolicy> {
-  const videoOptions = await resolveEnabledRuntimeVideoOptions(input);
+  return readReferenceAudioPolicy(await resolveEnabledRuntimeVideoOptions(input));
+}
+
+function readReferenceAudioPolicy(videoOptions: Record<string, unknown>): VideoReferenceAudioPolicy {
   const declaredMaximum = videoOptions.maxReferenceAudioDurationSeconds;
   const maximumDurationSeconds = Number(declaredMaximum);
   if (Number.isFinite(maximumDurationSeconds) && maximumDurationSeconds > 0) {
@@ -223,32 +197,6 @@ export async function resolveVideoModelAudioOnlyReferenceSupport(input: {
   return videoOptions.supportsAudioOnlyReference === true;
 }
 
-export async function resolveVideoModelReferenceImagePolicy(input: {
-  c: AppContext;
-  videoModel: string;
-}): Promise<VideoReferenceImagePolicy> {
-  const maximumTotalImages = await resolveVideoModelMaximumReferenceImages(input);
-  return {
-    countUnit: "unique_url",
-    maximumTotalImages,
-    maximumBusinessImages: maximumTotalImages,
-  };
-}
-
-function parseReferenceImagePolicy(value: unknown): VideoReferenceImagePolicy | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const maximumTotalImages = Number(record.maximumTotalImages);
-  const maximumBusinessImages = Number(record.maximumBusinessImages);
-  if (
-    record.countUnit !== "unique_url" ||
-    !Number.isInteger(maximumTotalImages) || maximumTotalImages < 0 ||
-    !Number.isInteger(maximumBusinessImages) || maximumBusinessImages < 0 ||
-    maximumBusinessImages !== maximumTotalImages
-  ) return null;
-  return { countUnit: "unique_url", maximumTotalImages, maximumBusinessImages };
-}
-
 function parseReferenceAudioPolicy(value: unknown): VideoReferenceAudioPolicy | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
@@ -282,16 +230,42 @@ export function parseVideoGenerationContract(value: unknown): VideoGenerationCon
   const videoModel = typeof record.videoModel === "string" ? record.videoModel.trim() : "";
   const durationOptions = normalizeDurationOptions(record.durationOptions);
   const maxDurationSeconds = Number(record.maxDurationSeconds);
-  const referenceImagePolicy = parseReferenceImagePolicy(record.referenceImagePolicy);
+  const maxShotDurationRaw = record.maxShotDurationSeconds;
+  const maxShotDurationSeconds = maxShotDurationRaw === undefined ? undefined : Number(maxShotDurationRaw);
   const referenceAudioPolicy = parseReferenceAudioPolicy(record.referenceAudioPolicy);
+  const supportsTextToVideo = record.supportsTextToVideo === undefined
+    ? undefined
+    : record.supportsTextToVideo === null || typeof record.supportsTextToVideo === "boolean"
+      ? record.supportsTextToVideo
+      : Number.NaN;
+  const supportsReferenceImages = record.supportsReferenceImages === undefined
+    ? undefined
+    : record.supportsReferenceImages === null || typeof record.supportsReferenceImages === "boolean"
+      ? record.supportsReferenceImages
+      : Number.NaN;
+  const supportsFirstLastFrame = record.supportsFirstLastFrame === undefined
+    ? undefined
+    : record.supportsFirstLastFrame === null || typeof record.supportsFirstLastFrame === "boolean"
+      ? record.supportsFirstLastFrame
+      : Number.NaN;
+  const maxReferenceImages = record.maxReferenceImages === undefined
+    ? undefined
+    : record.maxReferenceImages === null || (typeof record.maxReferenceImages === "number"
+      && Number.isSafeInteger(record.maxReferenceImages) && record.maxReferenceImages >= 0)
+      ? record.maxReferenceImages
+      : Number.NaN;
   if (
     !videoModel ||
     durationOptions.length === 0 ||
     !Number.isInteger(maxDurationSeconds) ||
     maxDurationSeconds <= 0 ||
     maxDurationSeconds !== durationOptions[durationOptions.length - 1] ||
-    !referenceImagePolicy ||
-    !referenceAudioPolicy
+    !referenceAudioPolicy ||
+    (typeof supportsTextToVideo === "number" && Number.isNaN(supportsTextToVideo)) ||
+    (typeof supportsReferenceImages === "number" && Number.isNaN(supportsReferenceImages)) ||
+    (typeof supportsFirstLastFrame === "number" && Number.isNaN(supportsFirstLastFrame)) ||
+    (typeof maxReferenceImages === "number" && Number.isNaN(maxReferenceImages)) ||
+    (maxShotDurationSeconds !== undefined && (!Number.isFinite(maxShotDurationSeconds) || maxShotDurationSeconds <= 0))
   ) {
     return null;
   }
@@ -299,8 +273,12 @@ export function parseVideoGenerationContract(value: unknown): VideoGenerationCon
     videoModel,
     durationOptions,
     maxDurationSeconds,
-    referenceImagePolicy,
+    ...(maxShotDurationSeconds !== undefined ? { maxShotDurationSeconds } : {}),
     referenceAudioPolicy,
+    ...(supportsTextToVideo !== undefined ? { supportsTextToVideo: supportsTextToVideo as boolean | null } : {}),
+    ...(supportsReferenceImages !== undefined ? { supportsReferenceImages: supportsReferenceImages as boolean | null } : {}),
+    ...(supportsFirstLastFrame !== undefined ? { supportsFirstLastFrame: supportsFirstLastFrame as boolean | null } : {}),
+    ...(maxReferenceImages !== undefined ? { maxReferenceImages } : {}),
   };
 }
 
@@ -325,8 +303,11 @@ export function videoGenerationContractsEqual(
   return (
     left.videoModel === right.videoModel &&
     left.maxDurationSeconds === right.maxDurationSeconds &&
-    JSON.stringify(left.referenceImagePolicy) === JSON.stringify(right.referenceImagePolicy) &&
     JSON.stringify(left.referenceAudioPolicy) === JSON.stringify(right.referenceAudioPolicy) &&
+    (left.supportsTextToVideo ?? null) === (right.supportsTextToVideo ?? null) &&
+    (left.supportsReferenceImages ?? null) === (right.supportsReferenceImages ?? null) &&
+    (left.supportsFirstLastFrame ?? null) === (right.supportsFirstLastFrame ?? null) &&
+    (left.maxReferenceImages ?? null) === (right.maxReferenceImages ?? null) &&
     left.durationOptions.length === right.durationOptions.length &&
     left.durationOptions.every((value, index) => value === right.durationOptions[index])
   );
@@ -370,30 +351,64 @@ export async function resolveStoryPlanGenerationContract(input: {
 export async function resolveVideoGenerationContract(input: {
   c: AppContext;
   videoModel: string;
+  videoInputModes?: readonly ("image_to_video" | "reference_to_video" | "text_to_video")[];
 }): Promise<VideoGenerationContract> {
   const videoModel = input.videoModel.trim();
   if (!videoModel) throw new Error("video_generation_model_required");
-  const durationOptions = await resolveModelDurationOptions({
-    c: input.c,
-    modelKey: videoModel,
-  });
-  if (durationOptions.length === 0) {
-    throw new Error(`video_generation_duration_options_missing:${videoModel}`);
+  // Freeze one fresh directory observation. Independently fetching duration,
+  // image and audio policies can combine incompatible catalog revisions.
+  const videoOptions = await resolveEnabledRuntimeVideoOptions(input);
+  const rawDurations = videoOptions.durationOptions;
+  const durationValues = Array.isArray(rawDurations) ? rawDurations.map((option: unknown) => (
+    option && typeof option === "object" && !Array.isArray(option)
+      ? (option as Record<string, unknown>).value : option
+  )) : [];
+  const normalizedDurations = durationValues.map((value) => (
+    typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN
+  ));
+  if (normalizedDurations.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+    throw new ExternalDependencyError({ kind: "model_catalog", identity: videoModel,
+      field: "durationOptions", code: "video_generation_duration_options_invalid", observed: rawDurations ?? null });
   }
-  const referenceImagePolicy = await resolveVideoModelReferenceImagePolicy({
-    c: input.c,
-    videoModel,
-  });
-  const referenceAudioPolicy = await resolveVideoModelReferenceAudioPolicy({
-    c: input.c,
-    videoModel,
-  });
+  const durationOptions = [...new Set(normalizedDurations)].sort((left, right) => left - right);
+  if (durationOptions.length === 0) {
+    throw new ExternalDependencyError({ kind: "model_catalog", identity: videoModel,
+      field: "durationOptions", code: "video_generation_duration_options_missing", observed: rawDurations ?? null });
+  }
+  const referenceAudioPolicy = readReferenceAudioPolicy(videoOptions);
+  const supportsTextToVideo = typeof videoOptions.supportsTextToVideo === "boolean"
+    ? videoOptions.supportsTextToVideo
+    : null;
+  const supportsReferenceImages = typeof videoOptions.supportsReferenceImages === "boolean"
+    ? videoOptions.supportsReferenceImages
+    : null;
+  const supportsFirstLastFrame = typeof videoOptions.supportsFirstLastFrame === "boolean"
+    ? videoOptions.supportsFirstLastFrame
+    : null;
+  const rawMaxReferenceImages = videoOptions.maxReferenceImages;
+  const maxReferenceImages = typeof rawMaxReferenceImages === "number"
+    && Number.isSafeInteger(rawMaxReferenceImages)
+    && rawMaxReferenceImages >= 0
+    ? rawMaxReferenceImages
+    : null;
+  const videoInputModes = [...new Set(input.videoInputModes ?? [])];
+  if (videoInputModes.includes("reference_to_video") && supportsReferenceImages !== true) {
+    throw new ExternalDependencyError({ kind: "model_catalog", identity: videoModel,
+      field: "supportsReferenceImages", code: "video_model_reference_images_not_supported", observed: supportsReferenceImages });
+  }
+  if (videoInputModes.includes("image_to_video") && supportsFirstLastFrame !== true) {
+    throw new ExternalDependencyError({ kind: "model_catalog", identity: videoModel,
+      field: "supportsFirstLastFrame", code: "video_model_first_frame_not_supported", observed: supportsFirstLastFrame });
+  }
   return {
     videoModel,
     durationOptions,
     maxDurationSeconds: durationOptions[durationOptions.length - 1],
-    referenceImagePolicy,
     referenceAudioPolicy,
+    supportsTextToVideo,
+    supportsReferenceImages,
+    supportsFirstLastFrame,
+    maxReferenceImages,
   };
 }
 

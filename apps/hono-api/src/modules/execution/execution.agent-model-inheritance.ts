@@ -1,7 +1,12 @@
+import { AgentExecutionPreferencesSchema } from "../task/agent-execution-provenance";
+import type { z } from "zod";
+
+export type WorkflowAgentPreferences = z.infer<typeof AgentExecutionPreferencesSchema>;
+
 export type WorkflowInitiatingAgentExecution = Readonly<{
 	model: string;
 	apiStyle: "chat" | "responses";
-}>;
+} & WorkflowAgentPreferences>;
 
 export type WorkflowAgentModelCutover = Readonly<{
 	targetModelKey: string;
@@ -29,7 +34,7 @@ export function parseWorkflowInitiatingAgentExecution(
 	const model = typeof raw.model === "string" ? raw.model.trim() : "";
 	const apiStyle = raw.apiStyle;
 	if (!model || (apiStyle !== "chat" && apiStyle !== "responses")) return null;
-	return { model, apiStyle };
+	return { model, apiStyle, ...AgentExecutionPreferencesSchema.parse(raw) };
 }
 
 export function resolveWorkflowAgentModelKey(input: Readonly<{
@@ -37,8 +42,34 @@ export function resolveWorkflowAgentModelKey(input: Readonly<{
 	configuredModelKey?: string | null;
 }>): string {
 	return parseWorkflowInitiatingAgentExecution(input.flowVersionData)?.model
+		?? (isRecord(input.flowVersionData)
+			&& isRecord(input.flowVersionData.workflowDirectAgentModelSelection)
+			&& typeof input.flowVersionData.workflowDirectAgentModelSelection.model === "string"
+			? input.flowVersionData.workflowDirectAgentModelSelection.model.trim()
+			: null)
 		?? input.configuredModelKey?.trim()
 		?? "";
+}
+
+/**
+ * The reasoning effort the user chose for this run, in precedence order: the
+ * initiating AI-chat turn, then the effort selected next to the model when the
+ * workflow was launched directly, then the node's own configuration. Returns
+ * undefined when nobody chose one, so the caller applies the workflow default.
+ */
+export function resolveWorkflowAgentReasoningEffort(input: Readonly<{
+	flowVersionData: unknown;
+	configuredEffort?: WorkflowAgentPreferences["reasoningEffort"];
+}>): WorkflowAgentPreferences["reasoningEffort"] {
+	const initiating = parseWorkflowInitiatingAgentExecution(input.flowVersionData)?.reasoningEffort;
+	if (initiating) return initiating;
+	const direct = isRecord(input.flowVersionData) && isRecord(input.flowVersionData.workflowDirectAgentModelSelection)
+		? AgentExecutionPreferencesSchema.safeParse({
+			reasoningEffort: input.flowVersionData.workflowDirectAgentModelSelection.reasoningEffort,
+		})
+		: null;
+	if (direct?.success && direct.data.reasoningEffort) return direct.data.reasoningEffort;
+	return input.configuredEffort;
 }
 
 /**
@@ -71,6 +102,7 @@ export function applyWorkflowAgentModelCutover(
 	return {
 		...flowVersionData,
 		workflowInitiatingAgentExecution: {
+			...source,
 			model: targetModelKey,
 			apiStyle: cutover.apiStyle,
 		},
@@ -79,7 +111,7 @@ export function applyWorkflowAgentModelCutover(
 			{
 				protocolVersion: "tapcanvas.workflow-agent-model-cutover/v1",
 				from: source,
-				to: { model: targetModelKey, apiStyle: cutover.apiStyle },
+				to: { ...source, model: targetModelKey, apiStyle: cutover.apiStyle },
 				authorizedBy,
 				authorizationSource: cutover.authorizationSource,
 				requestedAt: cutover.requestedAt,

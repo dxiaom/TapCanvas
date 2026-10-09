@@ -1,7 +1,12 @@
+import { workflowRequiresPluginSemantics } from "./execution.semantics-snapshot";
+import { decodeWorkflowOutput, type StoredWorkflowOutput } from "./execution.output-storage";
+import { createWorkflowOutputCheckpointSender, readStoredWorkflowOutputStrict,
+	WorkflowOutputCheckpointWriterError } from "./execution.output-checkpoint-packet";
+import { recoverWorkflowCheckpointObservation, WorkflowCheckpointRecoveryConflict } from "./execution.checkpoint-observation-recovery";
 import type { WorkerEnv } from "../../types";
+import { WorkflowPersistenceError } from "./execution.persistence-error";
 import crypto from "node:crypto";
 import {
-	hasWorkflowPluginExecutorRefPrefix,
 	type WorkflowArtifactIdentityV1,
 	type WorkflowInputBindingProvenanceV1,
 } from "@tapcanvas/workflow-kernel-protocol";
@@ -15,20 +20,23 @@ import {
 } from "./execution.node-runtime";
 import { executeRegisteredWorkflowNode } from "./execution.node-executors";
 import { runWorkflowAgentNode } from "./execution.agent-runner";
+import type { WorkflowAgentActivitySnapshot } from "./execution.agent-progress";
 import { runLocalWorkflowJavascript } from "./execution.javascript-runner";
 import { runWorkflowImageNode } from "./execution.image-runner";
+import { materializeWorkflowBlockingDiagrams } from "./execution.blocking-diagram-runner";
+import { materializeWorkflowClipStagingDiagrams } from "./execution.clip-staging-diagram";
+import { hydrateWorkflowClipReusedImageNode, materializeWorkflowClipProductionNodes } from "./execution.clip-production-node-runner";
 import {
 	createWorkflowInternalContext,
 	prepareWorkflowVideoProductionAssets,
 	readWorkflowVoicePlanningFacts,
-	runWorkflowVideoNode,
+	runWorkflowVideoNode, prepareWorkflowVideoNode,
 } from "./execution.video-runner";
 import {
 	readWorkflowCanvasGroup,
 	readWorkflowCanvasGroupFromFlowData,
-	readWorkflowCanvasProjectContextFromFlowData,
+	readWorkflowCanvasProjectContextFromSnapshot,
 } from "./execution.canvas-source-runner";
-import { stripWorkflowFanoutNodes } from "./execution.flow-cleanup";
 import { estimateWorkflowVideo } from "./execution.video-estimate-runner";
 import { concatWorkflowVideos } from "./execution.video-concat-runner";
 import { projectWorkflowFilmToCanvas } from "./execution.video-delivery-projection";
@@ -61,10 +69,18 @@ import { createRuntimeWorkflowAssetResolver } from "./execution.project-context-
 import { freshReadFlowRow } from "../task/video-orchestrator.flow-io";
 import { insertExecutionEvent, updateNodeRun } from "./execution.repo";
 import { resolveWorkflowNodeExecutionModelKey } from "./execution.node-model-attribution";
-import { workflowExternalCheckDelaySeconds } from "./execution.external-check";
-import { decideWorkflowFamilyAutomaticRecovery } from "./execution.auto-recovery";
+import {
+	workflowAgentNoProgressRecoveryPollSchedule,
+	workflowExternalCheckDelaySeconds,
+} from "./execution.external-check";
 import { refreshEquippedWorkflowExecutionFamilyProjection } from "../task/equipped-workflow-execution-projection";
 import { parseWorkflowProjectContext, type WorkflowProjectContext } from "./execution.project-context";
+import { matchWorkflowProjectImage, scopeMatchedProjectImage } from "./execution.project-asset-match";
+import { recallProjectEvidence } from "../agents/semantic-recall.client";
+import { resolveWorkflowAgentModelKey, resolveWorkflowAgentReasoningEffort } from "./execution.agent-model-inheritance";
+import { AgentExecutionPreferencesSchema } from "../task/agent-execution-provenance";
+import { projectAssetSnapshot } from "./execution.project-context";
+import { loadVisibleWorkflowProjectAssets } from "./execution.project-context-runtime";
 
 export type { WorkflowNodeJob } from "./execution.node-attempt";
 
@@ -95,121 +111,6 @@ async function refreshWorkflowFamilyCanvasProjection(input: Readonly<{
 		ownerId: execution.owner_id,
 		executionId: input.executionId,
 	});
-}
-
-async function appendAutomaticRecoveryEvent(input: Readonly<{
-	env: WorkerEnv;
-	executionId: string;
-	nodeId: string;
-	eventType: string;
-	level: "info" | "warn" | "error";
-	message: string;
-	data: Readonly<Record<string, unknown>>;
-}>): Promise<void> {
-	await insertExecutionEvent(input.env.DB, {
-		id: crypto.randomUUID(),
-		executionId: input.executionId,
-		eventType: input.eventType,
-		level: input.level,
-		nodeId: input.nodeId,
-		message: input.message,
-		data: input.data,
-		nowIso: new Date().toISOString(),
-	});
-}
-
-async function continueRepairableWorkflowFamily(input: Readonly<{
-	env: WorkerEnv;
-	executionId: string;
-	nodeId: string;
-}>): Promise<void> {
-	const execution = await input.env.DB.workflow_executions.findUnique({
-		where: { id: input.executionId },
-		select: {
-			id: true,
-			owner_id: true,
-			status: true,
-			failure_stage: true,
-			execution_family_id: true,
-		},
-	});
-	if (!execution) return;
-	const [familyExecutionCount, activeExecutionCount] = await Promise.all([
-		input.env.DB.workflow_executions.count({
-			where: { execution_family_id: execution.execution_family_id, owner_id: execution.owner_id },
-		}),
-		input.env.DB.workflow_executions.count({
-			where: {
-				execution_family_id: execution.execution_family_id,
-				owner_id: execution.owner_id,
-				status: { in: ["queued", "running"] },
-			},
-		}),
-	]);
-	const decision = decideWorkflowFamilyAutomaticRecovery({
-		executionStatus: execution.status,
-		failureStage: execution.failure_stage,
-		familyExecutionCount,
-		activeExecutionCount,
-	});
-	if (!decision.eligible) {
-		await appendAutomaticRecoveryEvent({
-			env: input.env,
-			executionId: input.executionId,
-			nodeId: input.nodeId,
-			eventType: "execution_automatic_recovery_not_started",
-			level: "warn",
-			message: "Automatic same-family continuation was not admissible",
-			data: { ...decision, familyExecutionCount, activeExecutionCount },
-		});
-		return;
-	}
-	try {
-		const { resumeWorkflowExecution } = await import("./execution.resume-service");
-		const recovery = await resumeWorkflowExecution({
-			context: createWorkflowInternalContext(input.env, {
-				executionId: input.executionId,
-				runtimeNodeId: input.nodeId,
-				ownerId: execution.owner_id,
-			}),
-			env: input.env,
-			ownerId: execution.owner_id,
-			sourceExecutionId: input.executionId,
-			trigger: "agent",
-		});
-		await appendAutomaticRecoveryEvent({
-			env: input.env,
-			executionId: input.executionId,
-			nodeId: input.nodeId,
-			eventType: "execution_automatic_recovery_started",
-			level: "info",
-			message: "Repairable pre-submit failure continued in the same execution family",
-			data: { recoveryExecutionId: recovery.id, executionFamilyId: recovery.executionFamilyId },
-		});
-		await refreshWorkflowFamilyCanvasProjection({
-			env: input.env,
-			executionId: recovery.id,
-			runtimeNodeId: input.nodeId,
-		}).catch((error: unknown) => {
-			console.error(JSON.stringify({
-				message: "workflow_recovery_family_projection_refresh_failed",
-				executionId: recovery.id,
-				nodeId: input.nodeId,
-				error: error instanceof Error ? error.message : String(error),
-			}));
-		});
-	} catch (error: unknown) {
-		const message = error instanceof Error ? error.message : String(error);
-		await appendAutomaticRecoveryEvent({
-			env: input.env,
-			executionId: input.executionId,
-			nodeId: input.nodeId,
-			eventType: "execution_automatic_recovery_failed",
-			level: "error",
-			message: "Automatic same-family continuation failed",
-			data: { error: message },
-		});
-	}
 }
 
 function abortActiveWorkflowNodeJobs(executionId: string, reason: Error): number {
@@ -277,6 +178,7 @@ type WorkflowNodeJobContext = {
 	flowVersionData: Record<string, unknown>;
 	projectContext: WorkflowProjectContext | null;
 	resumeOutputRefs?: WorkflowNodeOutputV1;
+	storedCheckpointOutput: StoredWorkflowOutput | null;
 	resumeOnly: boolean;
 	nodeRunId: string | null;
 	nodeRunAttempt: number | null;
@@ -315,13 +217,7 @@ function portFromHandle(value: unknown, prefix: string): string | null {
 }
 
 function parseNodeOutput(value: unknown): Record<string, unknown> | null {
-	const parsed = typeof value === "string" ? (() => {
-		try {
-			return JSON.parse(value) as unknown;
-		} catch {
-			return null;
-		}
-	})() : value;
+	const parsed = decodeWorkflowOutput(value);
 	return isRecord(parsed) ? parsed : null;
 }
 
@@ -439,10 +335,15 @@ async function loadWorkflowNodeJobContext(
 	)) {
 		throw new Error(`Workflow node ${nodeId} attempt changed before executor context was loaded`);
 	}
-	const currentOutput = parseWorkflowNodeOutputV1(currentRun?.output_refs);
+	const persistedCheckpointOutput = currentRun.output_refs === null
+		? null : readStoredWorkflowOutputStrict(currentRun.output_refs);
+	const recoveredCheckpoint = await recoverWorkflowCheckpointObservation(env.DB,
+		{ executionId, nodeId, nodeRunId: currentRun.id, attempt: currentRun.attempt }, persistedCheckpointOutput);
+	const storedCheckpointOutput = recoveredCheckpoint.output;
+	const currentOutput = parseWorkflowNodeOutputV1(storedCheckpointOutput);
 	const isSamePhysicalExecutionRecovery = phase === "recover"
 		&& execution.recovery_of_execution_id === null;
-	const resumeOnly = phase === "await_external"
+	const resumeOnly = recoveredCheckpoint.resumeOnly || phase === "await_external"
 		|| (execution.recovery_of_execution_id !== null && currentOutput !== null)
 		|| (executorRef === "agents.logical-task/v2" && (
 			currentOutput !== null || isSamePhysicalExecutionRecovery
@@ -465,6 +366,7 @@ async function loadWorkflowNodeJobContext(
 		inputs,
 		flowVersionData: flowData,
 		projectContext,
+		storedCheckpointOutput,
 		resumeOnly,
 		nodeRunId: currentRun?.id ?? null,
 		nodeRunAttempt: currentRun?.attempt ?? null,
@@ -568,6 +470,24 @@ export async function handleWorkflowNodeJob(
 	stopHeartbeat = () => clearInterval(heartbeatTimer);
 
 	let result: WorkflowNodeExecutionResult;
+	let checkpointSender: ReturnType<typeof createWorkflowOutputCheckpointSender> | null = null;
+	const preserveCheckpointFailure = async (failure: WorkflowOutputCheckpointWriterError): Promise<never> => {
+		try {
+			const response = await stub.fetch("https://do/nodeCheckpointObservation", {
+				method: "POST", headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ nodeId, nodeRunId, attempt,
+					baseRootHash: checkpointSender?.acknowledgedRootHash() ?? null,
+					snapshots: checkpointSender?.unacknowledgedSnapshots() ?? [], failureReason: failure.message }),
+			});
+			await requireSuccessfulDurableResponse(response, `Retaining workflow node ${nodeId} unacknowledged checkpoints`);
+		} catch (observationFailure: unknown) {
+			console.error(JSON.stringify({ message: "workflow_node_checkpoint_observation_failed",
+				executionId, nodeId, nodeRunId, attempt,
+				checkpointFailure: failure.message,
+				error: observationFailure instanceof Error ? observationFailure.message : String(observationFailure) }));
+		}
+		throw failure;
+	};
 	try {
 		const context = await loadWorkflowNodeJobContext(env, executionId, nodeId, phase, { nodeRunId, attempt });
 		const executorRef = resolveWorkflowNodeExecutorRef(context.node);
@@ -606,6 +526,16 @@ export async function handleWorkflowNodeJob(
 		const cacheHit = cacheRequest
 			? await findWorkflowPureCacheHit(env.DB, context.ownerId, cacheRequest)
 			: null;
+		let agentActivityOpen = true;
+		const sender = createWorkflowOutputCheckpointSender(async (packet) => {
+			const response = await stub.fetch("https://do/nodeProgress", {
+				method: "POST", headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ progressKind: "output_checkpoint", nodeId, nodeRunId, attempt, outputCheckpoint: packet }),
+			});
+			await requireSuccessfulDurableResponse(response, `Checkpointing workflow node ${nodeId} progress`);
+			if (response.status === 208) throw new Error(`Workflow node ${nodeId} attempt became stale while checkpointing progress`);
+		}, context.storedCheckpointOutput);
+		checkpointSender = sender;
 		if (cacheRequest && cacheHit) {
 			result = {
 				ok: true,
@@ -616,7 +546,7 @@ export async function handleWorkflowNodeJob(
 				}),
 			};
 		} else {
-			const pluginRuntimeRegistry = executorRef && hasWorkflowPluginExecutorRefPrefix(executorRef)
+			const pluginRuntimeRegistry = workflowRequiresPluginSemantics({ nodes: [context.node] })
 				? await loadPersistedWorkflowPluginRuntimeRegistry(
 					env.DB,
 					createTrustedWorkflowPluginOwnerAdapters(env),
@@ -626,24 +556,53 @@ export async function handleWorkflowNodeJob(
 				{
 					executionId,
 					...context,
-					checkpointOutputRefs: async (outputRefs) => {
-						const progressResponse = await stub.fetch("https://do/nodeProgress", {
-								method: "POST",
-								headers: { "Content-Type": "application/json" },
-								body: JSON.stringify({
-									nodeId,
-									nodeRunId,
-									attempt,
-									outputRefs: stampWorkflowNodeOutputProvenance({ outputRefs, context: provenanceContext }),
-								}),
-							});
-						await requireSuccessfulDurableResponse(
-							progressResponse,
-							`Checkpointing workflow node ${nodeId} item progress`,
-						);
-						if (progressResponse.status === 208) {
-							throw new Error(`Workflow node ${nodeId} attempt became stale while checkpointing progress`);
+					persistedInputSource: { nodeId, inputs: context.inputs, revision: crypto.createHash("md5").update(JSON.stringify(context.inputs)).digest("hex") },
+					reportAgentActivity: async (activity: WorkflowAgentActivitySnapshot) => {
+						if (!agentActivityOpen) return;
+						const activityResponse = await stub.fetch("https://do/nodeProgress", {
+							method: "POST",
+						headers: { "Content-Type": "application/json" },
+							// Hono runs on Node while this stub has Workers' RequestInit declarations;
+							// both implementations accept the platform AbortSignal at runtime.
+							signal: AbortSignal.timeout(5_000) as unknown as NonNullable<Parameters<typeof stub.fetch>[1]>["signal"],
+							body: JSON.stringify({
+								progressKind: "agent_activity",
+								nodeId,
+								nodeRunId,
+								attempt,
+								agentProgress: { version: 1, attempt, ...activity },
+							}),
+						});
+						if (activityResponse.status === 208) {
+							agentActivityOpen = false;
+							console.info(JSON.stringify({
+								message: "workflow_node_agent_activity_attempt_fenced",
+								executionId,
+								nodeId,
+								nodeRunId,
+								attempt,
+							}));
+							return;
 						}
+						if (activityResponse.status === 204) return;
+						if (activityResponse.status === 409 || activityResponse.status === 400 || activityResponse.status === 404) {
+							agentActivityOpen = false;
+							console.warn(JSON.stringify({
+								message: "workflow_node_agent_activity_rejected",
+								executionId,
+								nodeId,
+								nodeRunId,
+								attempt,
+								httpStatus: activityResponse.status,
+							}));
+							return;
+						}
+						if (activityResponse.status !== 202) {
+							throw new Error(`workflow_node_agent_activity_http_${activityResponse.status}`);
+						}
+					},
+					checkpointOutputRefs: async (outputRefs) => {
+						await sender(stampWorkflowNodeOutputProvenance({ outputRefs, context: provenanceContext }));
 					},
 					abortSignal: activeJob.signal,
 				},
@@ -652,7 +611,12 @@ export async function handleWorkflowNodeJob(
 					runAgent: (request) => runWorkflowAgentNode(env, request),
 					runJavascript: (request) => runLocalWorkflowJavascript(env, request),
 					runImage: (request) => runWorkflowImageNode(env, request),
+					materializeBlockingDiagrams: (request) => materializeWorkflowBlockingDiagrams(env, request),
 					runVideo: (request) => runWorkflowVideoNode(env, request),
+					prepareVideo: (request) => prepareWorkflowVideoNode(env, request),
+					materializeClipProductionNodes: (request) => materializeWorkflowClipProductionNodes(env, request),
+					materializeClipStagingDiagrams: (request) => materializeWorkflowClipStagingDiagrams(env, request),
+					hydrateClipReusedImageNode: (request) => hydrateWorkflowClipReusedImageNode(env, request),
 					prepareVideoProductionAssets: (request) => prepareWorkflowVideoProductionAssets(env, request),
 					readVoicePlanningFacts: (request) => readWorkflowVoicePlanningFacts(env, request),
 					runVideoEstimate: (request) => estimateWorkflowVideo(env, request),
@@ -686,39 +650,58 @@ export async function handleWorkflowNodeJob(
 							rowData: row.data,
 						});
 					},
-					readCanvasProjectContextFromFlow: async (request) => {
-						const internalContext = createWorkflowInternalContext(env, {
-							executionId,
-							runtimeNodeId: nodeId,
-							ownerId: request.ownerId,
-						});
-						const row = await freshReadFlowRow({
-							c: internalContext,
-							flowId: request.flowId,
-							requestUserId: request.ownerId,
-							devBypass: false,
-							...(request.chapterId ? { chapterId: request.chapterId } : {}),
-						});
-						return readWorkflowCanvasProjectContextFromFlowData({
-							flowId: request.flowId,
-							rowData: row.data,
-							projectContext: request.projectContext,
-						});
-					},
+					readCanvasProjectContextFromSnapshot: async (request) => readWorkflowCanvasProjectContextFromSnapshot(request),
 					searchKnowledge: (request) => searchWorkflowKnowledge(env, request),
 					readKnowledge: (request) => readWorkflowKnowledge(env, request),
 					invokeTool: (request) => invokeWorkflowTool(env, request),
 					runSubworkflow: (request) => runWorkflowSubworkflow(env, request),
+					matchProjectAsset: async (request) => {
+						const internalContext = createWorkflowInternalContext(env, {
+							executionId, runtimeNodeId: nodeId, ownerId: context.ownerId,
+						});
+						const assets = await loadVisibleWorkflowProjectAssets(internalContext,
+							context.ownerId, request.projectId);
+						return matchWorkflowProjectImage(request, assets.map(projectAssetSnapshot),
+							(input) => recallProjectEvidence(env, input, {
+								executionId,
+								executionFamilyId: context.executionFamilyId,
+								nodeId,
+								ownerId: context.ownerId,
+								flowId: context.flowId,
+								projectId: request.projectId,
+								modelKey: resolveWorkflowAgentModelKey({
+									flowVersionData: context.flowVersionData,
+									configuredModelKey: typeof context.node.data.workflowAgentModelKey === "string"
+										? context.node.data.workflowAgentModelKey : null,
+								}),
+								reasoningEffort: resolveWorkflowAgentReasoningEffort({
+									flowVersionData: context.flowVersionData,
+									configuredEffort: AgentExecutionPreferencesSchema.parse({
+										reasoningEffort: context.node.data.workflowAgentReasoningEffort,
+									}).reasoningEffort,
+								}),
+							}));
+					},
 					resolveProjectAsset: async (request) => {
 						const internalContext = createWorkflowInternalContext(env, {
 							executionId,
 							runtimeNodeId: nodeId,
 							ownerId: request.ownerId,
 						});
+						let resolverContext = request.projectContext;
+						if (request.matchedAssetVersionId) {
+							const visible = await loadVisibleWorkflowProjectAssets(internalContext,
+								request.ownerId, request.projectId);
+							const matched = visible.find((asset) => asset.id === request.assetId);
+							if (!matched) throw new Error(`Matched project asset ${request.assetId} is no longer visible`);
+							const snapshot = projectAssetSnapshot(matched);
+							resolverContext = scopeMatchedProjectImage(request.projectContext,
+								snapshot, request.matchedAssetVersionId, request.matchedAssetContentFingerprint);
+						}
 						const resolver = createRuntimeWorkflowAssetResolver({
 							c: internalContext,
 							ownerId: request.ownerId,
-							context: request.projectContext,
+							context: resolverContext,
 						});
 						const resolved = await resolver.resolveAssetResource(request.assetId, request.preferredKind);
 						await env.DB.workflow_executions.update({
@@ -753,24 +736,72 @@ export async function handleWorkflowNodeJob(
 			});
 		}
 	} catch (error: unknown) {
+		console.error(JSON.stringify({
+			message: "workflow_node_execution_exception",
+			executionId, nodeId, nodeRunId, attempt,
+			error: error instanceof Error ? error.message : String(error),
+			stack: error instanceof Error ? error.stack : null,
+		}));
+		// A failed ledger write is not an executor verdict. Release this physical
+		// worker; the durable ownership/lease recovery reconciles the same effect.
+		if (error instanceof WorkflowOutputCheckpointWriterError) await preserveCheckpointFailure(error);
+		if (error instanceof WorkflowCheckpointRecoveryConflict) throw error;
+		if (error instanceof WorkflowPersistenceError && error.recoverable) throw error;
 		result = runtimeFailure(error);
 	}
+	// The Agent runner owns recovery and its durable external-check receipt.
+	// Elapsed time cannot override that receipt or terminalize the user task.
+	const finalOutput = !result.ok && result.waitingExternal === true
+		? { ...result.outputRefs, externalCheck: result.externalCheck } : result.outputRefs;
+	if (checkpointSender) {
+		try {
+			await checkpointSender.settle();
+		} catch (error: unknown) {
+			// A settled collection result can contain accepted siblings whose queued
+			// callback never ran. Capture it in the poisoned writer without sending.
+			if (finalOutput !== undefined) await checkpointSender(finalOutput).catch(() => undefined);
+			const failure = checkpointSender.failure();
+			if (failure) await preserveCheckpointFailure(failure);
+			throw error;
+		}
+		try {
+			if (finalOutput !== undefined) await checkpointSender(finalOutput);
+			await checkpointSender.settle();
+		} catch (error: unknown) {
+			const failure = checkpointSender.failure();
+			if (failure) await preserveCheckpointFailure(failure);
+			throw error;
+		}
+	}
+	const expectedOutputRootHash = checkpointSender?.acknowledgedRootHash() ?? null;
 
 	if (!result.ok && result.waitingExternal === true) {
-		const persistedOutputRefs: WorkflowNodeOutputV1 = {
-			...result.outputRefs,
-			externalCheck: result.externalCheck,
-		};
 		const waitingResponse = await stub.fetch("https://do/nodeWaiting", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ nodeId, nodeRunId, attempt, outputRefs: persistedOutputRefs, fromExternalCheck: phase === "await_external" }),
+				body: JSON.stringify({ nodeId, nodeRunId, attempt, expectedOutputRootHash, fromExternalCheck: phase === "await_external" }),
 			});
 		await requireSuccessfulDurableResponse(
 			waitingResponse,
 			`Persisting workflow node ${nodeId} external wait receipt`,
 		);
 		if (waitingResponse.status === 208) return;
+		// A node that has not settled cannot reach the completion path, so the
+		// canvas status surface would otherwise keep the pre-wait projection for
+		// the whole wait — a funded channel wait would read as a plain running
+		// execution. Refresh from the receipt just persisted, exactly as the
+		// completion path does, and never let a projection failure alter the wait.
+		try {
+			await refreshWorkflowFamilyCanvasProjection({ env, executionId, runtimeNodeId: nodeId });
+		} catch (error: unknown) {
+			console.error(JSON.stringify({
+				message: "workflow_execution_family_projection_refresh_failed",
+				executionId,
+				nodeId,
+				phase,
+				error: error instanceof Error ? error.message : String(error),
+			}));
+		}
 		const queue = env.WORKFLOW_NODE_QUEUE;
 		if (!queue) throw new Error("WORKFLOW_NODE_QUEUE binding missing");
 		const delaySeconds = workflowExternalCheckDelaySeconds(result.externalCheck);
@@ -787,14 +818,13 @@ export async function handleWorkflowNodeJob(
 				nodeId,
 				nodeRunId,
 				attempt,
+				expectedOutputRootHash,
 				ok: result.ok,
-				...(result.ok
-					? { outputRefs: result.outputRefs }
-					: {
+				...(!result.ok
+					? {
 							errorCode: result.errorCode,
 							errorMessage: result.errorMessage,
-							...(result.outputRefs ? { outputRefs: result.outputRefs } : {}),
-						}),
+						} : {}),
 			}),
 		});
 	await requireSuccessfulDurableResponse(
@@ -812,51 +842,9 @@ export async function handleWorkflowNodeJob(
 			error: error instanceof Error ? error.message : String(error),
 		}));
 	}
-	if (completionResponse.status === 202 && !result.ok) return;
-	if (!result.ok) {
-		const abortedJobs = abortActiveWorkflowNodeJobs(
-			executionId,
-			new Error(`workflow_execution_failed_at_node:${nodeId}`),
-		);
-		if (abortedJobs > 0) {
-			console.info(JSON.stringify({
-				message: "workflow_execution_terminal_failure_jobs_aborted",
-				executionId,
-				nodeId,
-				abortedJobs,
-			}));
-		}
-		// 节点失败（含 checkpoint 409 等 DO 拒绝回传的路径）：主动剥离该执行的
-		// fan-out 中间产物，防 flow 主表污染。DO 的 handleNodeComplete 失败分支
-		// 只在 nodeRun.status==running 时可达；waiting_external 恢复中的失败回传
-		// 会被 DO 以 409 拒绝，因此这里必须兜底触发。
-		try {
-			const executionRow = await env.DB.workflow_executions.findUnique({
-				where: { id: executionId },
-				select: { flow_id: true, owner_id: true },
-			});
-			if (executionRow) {
-				await stripWorkflowFanoutNodes({
-					executionId,
-					flowId: executionRow.flow_id,
-					ownerId: executionRow.owner_id,
-					nowIso: new Date().toISOString(),
-				});
-			}
-		} catch {
-			// 清理失败不阻塞节点收尾；终态剥离由 DO 分支或幂等重试兜底。
-		}
-		try {
-			await continueRepairableWorkflowFamily({ env, executionId, nodeId });
-		} catch (error: unknown) {
-			console.error(JSON.stringify({
-				message: "workflow_execution_automatic_recovery_dispatch_failed",
-				executionId,
-				nodeId,
-				error: error instanceof Error ? error.message : String(error),
-			}));
-		}
-	}
+	// The scheduler owns execution settlement. A local action failure cannot
+	// cancel siblings or remove their intermediate outputs in this worker.
+
 	} finally {
 		stopHeartbeat?.();
 		activeJob.release();
@@ -877,7 +865,11 @@ export async function resumeWaitingWorkflowNodes(env: WorkerEnv): Promise<number
 	for (const run of waitingRuns) {
 		const outputRefs = parseWorkflowNodeOutputV1(run.output_refs);
 		const schedule = outputRefs?.externalCheck ?? null;
-		if (schedule?.mode === "signal_only") continue;
+		const migratedSchedule = schedule?.mode === "signal_only"
+			? workflowAgentNoProgressRecoveryPollSchedule(outputRefs)
+			: null;
+		if (schedule?.mode === "signal_only" && !migratedSchedule) continue;
+		const effectiveSchedule = migratedSchedule ?? schedule;
 		const job = {
 			executionId: run.execution_id,
 			nodeId: run.node_id,
@@ -885,12 +877,12 @@ export async function resumeWaitingWorkflowNodes(env: WorkerEnv): Promise<number
 			attempt: run.attempt,
 			phase: "await_external",
 		} as const;
-		if (!schedule) {
+		if (!effectiveSchedule) {
 			// Existing durable receipts are reconciled once to obtain the mandatory
 			// versioned schedule; absence never selects an arbitrary polling cadence.
 			await queue.send(job);
 		} else {
-			const delaySeconds = workflowExternalCheckDelaySeconds(schedule);
+			const delaySeconds = workflowExternalCheckDelaySeconds(effectiveSchedule);
 			if (delaySeconds === null) continue;
 			await queue.send(job, { delaySeconds });
 		}
@@ -925,6 +917,29 @@ export async function resumeQueuedWorkflowNodes(env: WorkerEnv): Promise<number>
 	return queuedRuns.length;
 }
 
+/** Queued execution rows are durable start intents, even before nodes exist. */
+export async function resumeQueuedWorkflowExecutions(env: WorkerEnv): Promise<number> {
+	const namespace = env.EXECUTION_DO;
+	if (!namespace) throw new Error("EXECUTION_DO binding missing");
+	const rows = await env.DB.workflow_executions.findMany({
+		where: { status: "queued" }, select: { id: true },
+	});
+	let dispatched = 0;
+	for (const row of rows) {
+		try {
+			const response = await namespace.get(namespace.idFromName(row.id))
+				.fetch("https://do/start", { method: "POST" });
+			await requireSuccessfulDurableResponse(response, `Starting queued workflow ${row.id}`);
+			dispatched += 1;
+		} catch (error: unknown) {
+			console.error("[workflow-dispatch] queued start remains pending", {
+				executionId: row.id, cause: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	return dispatched;
+}
+
 export function startPersistedWorkflowNodeReconciler(
 	env: WorkerEnv,
 	intervalMs = 15_000,
@@ -936,10 +951,12 @@ export function startPersistedWorkflowNodeReconciler(
 		reconciling = true;
 		void reconcileLocallyAbandonedWorkflowExecutions(env)
 			.then(async (abandoned) => {
+				const queuedExecutions = await resumeQueuedWorkflowExecutions(env);
 				const queuedNodes = await resumeQueuedWorkflowNodes(env);
 				const waitingNodes = await resumeWaitingWorkflowNodes(env);
-				if (abandoned.executions > 0 || queuedNodes > 0 || waitingNodes > 0) {
+				if (queuedExecutions > 0 || abandoned.executions > 0 || queuedNodes > 0 || waitingNodes > 0) {
 					console.info("[workflow-queue] reconciled durable workflow dispatches", {
+						queuedExecutions,
 						abandonedExecutions: abandoned.executions,
 						recoverableNodes: abandoned.recoverableNodes,
 						unsafeNodes: abandoned.unsafeNodes,
@@ -1029,6 +1046,14 @@ async function recoverPersistedWorkflowExecution(
 ): Promise<WorkflowRecoveryResult> {
 	const namespace = env.EXECUTION_DO;
 	if (!namespace) throw new Error("EXECUTION_DO binding missing");
+	if (execution.status === "running" && nodeRuns.length === 0) {
+		// The start claim committed but initialization rolled back. No executor
+		// was released: re-enter initialization with the same frozen reuse facts.
+		const response = await namespace.get(namespace.idFromName(execution.id))
+			.fetch("https://do/start", { method: "POST" });
+		await requireSuccessfulDurableResponse(response, `Recovering workflow initialization ${execution.id}`);
+		return { recovered: true, recoverableNodes: 0, unsafeNodes: 0 };
+	}
 	const hasPersistedWork = nodeRuns.some((run) => (
 		run.status === "pending"
 		|| run.status === "running"
@@ -1070,6 +1095,48 @@ async function recoverPersistedWorkflowExecution(
 		recoverableNodes: recoverableNodeIds.length,
 		unsafeNodes: unsafeNodeIds.length,
 	};
+}
+
+async function recordWorkflowRecoveryAttemptFailure(input: Readonly<{
+	env: WorkerEnv;
+	executionId: string;
+	recoveryReason: WorkflowRecoveryContract["recoveryReason"];
+	error: unknown;
+}>): Promise<void> {
+	const error = input.error instanceof Error
+		? { name: input.error.name, message: input.error.message }
+		: { name: "UnknownError", message: String(input.error) };
+	const diagnostic = {
+		protocolVersion: "tapcanvas.workflow-recovery-diagnostic/v1",
+		diagnosticType: "execution_recovery_attempt_failed",
+		executionId: input.executionId,
+		recoveryReason: input.recoveryReason,
+		error,
+	};
+	console.error(JSON.stringify({ message: "workflow_execution_recovery_attempt_failed", ...diagnostic }));
+	try {
+		await insertExecutionEvent(input.env.DB, {
+			id: crypto.randomUUID(),
+			executionId: input.executionId,
+			eventType: "node_log",
+			level: "error",
+			nodeId: null,
+			message: "A workflow recovery attempt could not be completed; this diagnostic does not change execution status.",
+			data: diagnostic,
+			nowIso: new Date().toISOString(),
+		});
+	} catch (diagnosticError: unknown) {
+		const persistenceError = diagnosticError instanceof Error
+			? { name: diagnosticError.name, message: diagnosticError.message }
+			: { name: "UnknownError", message: String(diagnosticError) };
+		console.error(JSON.stringify({
+			message: "workflow_execution_recovery_diagnostic_persist_failed",
+			executionId: input.executionId,
+			recoveryReason: input.recoveryReason,
+			error,
+			persistenceError,
+		}));
+	}
 }
 
 /**
@@ -1118,7 +1185,11 @@ export async function reconcileLocallyAbandonedWorkflowExecutions(
 		const runningNodeIds = nodeRuns
 			.filter((run) => run.status === "running")
 			.map((run) => run.node_id);
-		if (runningNodeIds.length === 0) continue;
+		// A lost completion-to-dispatch handoff can leave only pending nodes (or
+		// settled nodes with a running execution). Queue/wait owners have their own
+		// reconcilers; a frontier with neither must be rebuilt from durable facts.
+		if (runningNodeIds.length === 0 && nodeRuns.some((run) =>
+			run.status === "queued" || run.status === "waiting_external")) continue;
 		// Ownership can be acquired while the persisted status query is in flight.
 		// Recheck both the process-local driver and the append-only durable start
 		// event before classifying a running node as abandoned. Startup recovery
@@ -1139,12 +1210,23 @@ export async function reconcileLocallyAbandonedWorkflowExecutions(
 		if (typeof activeExecutionIds === "function"
 			? activeExecutionIds(execution.id)
 			: activeExecutionIds.has(execution.id)) continue;
-		const recovery = await recoverPersistedWorkflowExecution(
-			env,
-			{ ...execution, status: "running" },
-			nodeRuns,
-			{ recoveryReason: "local_abandonment", ownershipStaleBefore },
-		);
+		let recovery: WorkflowRecoveryResult;
+		try {
+			recovery = await recoverPersistedWorkflowExecution(
+				env,
+				{ ...execution, status: "running" },
+				nodeRuns,
+				{ recoveryReason: "local_abandonment", ownershipStaleBefore },
+			);
+		} catch (error: unknown) {
+			await recordWorkflowRecoveryAttemptFailure({
+				env,
+				executionId: execution.id,
+				recoveryReason: "local_abandonment",
+				error,
+			});
+			continue;
+		}
 		if (!recovery.recovered) continue;
 		recoveredExecutions += 1;
 		recoverableNodes += recovery.recoverableNodes;
@@ -1168,31 +1250,41 @@ export async function recoverInterruptedWorkflowExecutions(env: WorkerEnv): Prom
 	let recoverableNodes = 0;
 	let unsafeNodes = 0;
 	for (const execution of executions) {
-		if (execution.status === "queued") {
-			const stub = namespace.get(namespace.idFromName(execution.id));
-			const response = await stub.fetch("https://do/start", { method: "POST" });
-			await requireSuccessfulDurableResponse(response, `Starting persisted queued workflow execution ${execution.id}`);
+		try {
+			if (execution.status === "queued") {
+				const stub = namespace.get(namespace.idFromName(execution.id));
+				const response = await stub.fetch("https://do/start", { method: "POST" });
+				await requireSuccessfulDurableResponse(response, `Starting persisted queued workflow execution ${execution.id}`);
+				recoveredExecutions += 1;
+				continue;
+			}
+			const nodeRuns = await env.DB.workflow_node_runs.findMany({
+				where: { execution_id: execution.id },
+				select: { node_id: true, status: true },
+			});
+			const recovery = await recoverPersistedWorkflowExecution(
+				env,
+				{
+					id: execution.id,
+					flow_version_id: execution.flow_version_id,
+					status: execution.status === "failed" ? "failed" : "running",
+				},
+				nodeRuns,
+				{ recoveryReason: "process_startup" },
+			);
+			if (!recovery.recovered) continue;
 			recoveredExecutions += 1;
+			recoverableNodes += recovery.recoverableNodes;
+			unsafeNodes += recovery.unsafeNodes;
+		} catch (error: unknown) {
+			await recordWorkflowRecoveryAttemptFailure({
+				env,
+				executionId: execution.id,
+				recoveryReason: "process_startup",
+				error,
+			});
 			continue;
 		}
-		const nodeRuns = await env.DB.workflow_node_runs.findMany({
-			where: { execution_id: execution.id },
-			select: { node_id: true, status: true },
-		});
-		const recovery = await recoverPersistedWorkflowExecution(
-			env,
-			{
-				id: execution.id,
-				flow_version_id: execution.flow_version_id,
-				status: execution.status === "failed" ? "failed" : "running",
-			},
-			nodeRuns,
-			{ recoveryReason: "process_startup" },
-		);
-		if (!recovery.recovered) continue;
-		recoveredExecutions += 1;
-		recoverableNodes += recovery.recoverableNodes;
-		unsafeNodes += recovery.unsafeNodes;
 	}
 	return { executions: recoveredExecutions, recoverableNodes, unsafeNodes };
 }

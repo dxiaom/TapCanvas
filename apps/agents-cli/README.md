@@ -4,6 +4,10 @@
 
 不再维护旧 `agents-cli` 自研 agent loop，也没有旧运行时兼容分支。
 
+本次从 TapCanvas-pro 同步章节参考图与设计板的生产合同：独立资产逐项提交或同轮并发；单个 `completionBoundary="submission"` 仅证明该节点已受理，不能证明整章交付，也不代表图片已经生成。Agent 核对完整清单，保留已受理节点与 taskId，按实际视觉依赖等待真实 URL。设计板入口明确要求图片，只有用户明确只要占位时才只创建节点。目标仓库保留 DSH Harness 单一路径；源仓库的 `core/agent-loop`、TaskStore、Skill 候选回执与专用交付审查器已无对应模块，其修复不复制为第二套运行时。此同步不表示 DSH 已完成真实批量生图验收。
+
+节点快捷动作继续进入同一主对话链。Web 的思考程度设置通过公开请求 `reasoningEffort` 传入 Bridge，并用于当前 Harness 请求；后续续执行继承已冻结执行合同。当前引擎未实现请求级 `serviceTier` 覆盖，Web 不允许启用优先服务，不能把该设置显示为已执行。
+
 ## 安装
 
 在仓库根目录执行：
@@ -81,14 +85,43 @@ Bridge 在 Hono 事实型 prompt 之外固定注入唯一产品身份：面向�
 
 1. 注入 Hono 提供的事实型 persona/system prompt；
 2. 注册本轮明确的 TapCanvas 模型网关与模型；
-3. 每轮挂载 request-scoped MCP server；固定只包含私有 `report_delivery` 收口工具，
+3. 每轮挂载 request-scoped MCP server；包含私有 `report_delivery` / `get_delivery_evidence`（结构化节点为 `submit_structured_output`），
    以及 Hono 本轮明确授权的远程工具。
 
 ### Skills
 
 仓库 Skills 通过 `DSH_BUNDLED_SKILL_DIR` 交给 DeepSeek Harness 的 filesystem skill provider。`requiredSkills` 会作为本轮显式约束进入上下文，具体读取仍通过 Harness `skill` 工具完成。
 
+Bridge 只对本轮明确列出的 bundled `requiredSkills` 读取其 frontmatter 声明：
+`autoload-resources` 始终预读；`metadata.artifact-preload` 仅匹配调用方冻结的
+`outputArtifactType`，预读其明确列出的 SKILL.md 或 reference 正文。其它知识仍由
+Harness 按需选择。资源路径和 symlink 必须位于该 Skill 目录内；缺文件、空正文、
+非法元数据或总量超过 300,000 字符均返回 `skill_preload_failed`，不会截断或隐式跳过。
+该适配不包含产品阶段路由，不加载 Pro 的自研 loop、Palace 或默认全量 Skill 套餐。
+
 外部用户/商城 Skill 必须同时带有 `externalSkills`、`requiredSkillCalls` 和可信 `externalSkillResolverConfig`；缺解析器会显式拒绝请求，禁止把“未加载”伪报为成功。
+
+### Workflow 结构化产物
+
+已同步一键成片的章节编排、共享资产提取、逐 Clip 设计、逐 Clip writer 与配套技能；
+执行内核仍是 DeepSeek Harness，不加载旧自研 agent loop。
+
+一键成片 v135 使用章节 `tapcanvas.chapter-sequence/v4` 与生产包
+`tapcanvas.clip-production-packet/v2`：章级剧情和声音由作者冻结，Clip writer 用
+`scene + shots` 与事件引用交付；宿主只按真实引用编译。screenwriter、authoring-stages、
+prompt-writer 的当前合同与导演、角色卡、分镜参考随仓库分发，不预装个人资产、评测工作区
+或 Pro 运维配置。故事事实账本参考只在动态授权工具实际提供该能力时适用。
+
+声明 `outputContract` 的原子工作流节点挂载私有 `submit_structured_output`，以冻结 JSON Schema
+和显式字段、类型、数组长度约束检验提交。结构错误作为工具失败携带具体字段路径返回当前
+Harness turn，作者在同一执行链中修订后重新提交。成功提交的对象直接序列化为响应 `text`，
+并以 `structuredOutput` 返回；不从自然语言最终回答猜测或提取 JSON。
+缺少成功提交回执，即使 Harness 正常结束也明确失败。业务节点仍按其完整 typed-port 合同
+执行下游结构校验；Bridge 不判断创作内容语义、不制造默认内容。
+
+结构校验复用共享 schema 的本地 `$ref`、数组唯一性、冻结引用身份及事实相等、
+输入输出关系和来源区间合同。`$defs` 在 `output` 参数信封根保留一份，非法/循环引用
+以 `$ref` issue 拒收；未知引用事实仅作为可检索 observation，不成为语义质量门禁。
 
 ### 请求级工具与交付收口
 
@@ -97,9 +130,12 @@ Bridge 在 Hono 事实型 prompt 之外固定注入唯一产品身份：面向�
 交付类型和逐项成功标准；Bridge 冻结合同哈希，并在 Harness 真正结束后把精确最终正文
 绑定为 SHA-256 `final_response` evidence，构造
 `expectedDelivery -> deliveryEvidence -> deliveryVerification -> PhysicalRunExitV1`。
-缺少报告、正文为空、Harness 未正常结束或合同结构无效时显式失败。该工具只接受
-`delivery.mode=response`；画布写入、图片、视频等执行型交付不能用文本报告冒充成功，
-必须依赖已授权业务工具的真实回执与资产证据。
+缺少报告、正文为空、Harness 未正常结束或合同结构无效时显式失败。
+执行型交付使用同一工具的 artifact 参数形态：主代理先读取 `get_delivery_evidence` 中的
+真实终态 workflow output，逐项解释证据如何满足冻结 must，并引用精确 evidence ID。
+Bridge 只核对冻结合同、身份、引用、终态以及媒体 URL 的结构事实；语义判断归主代理。
+不存在的证据、未受理/尚未完成的执行、缺少媒体地址或遗漏要求均在同一 turn 拒绝报告，
+不把文字、受理回执或单独资产 URL 当成完整交付。
 
 ### 远程工具
 
@@ -137,4 +173,49 @@ pnpm --filter agents test
 
 `build` 会验证官方 `@deepseek-ai/dsh` 精确版本和可执行入口。测试覆盖请求契约、密钥隔离、延迟 schema 门禁、MCP 授权/转发、真实失败记录。
 
+生产 Bridge 镜像用本目录独立 `pnpm-lock.yaml` 做 frozen install；新增依赖必须同时更新
+根工作区锁与此锁。镜像在 builder 与 runtime 均保留 `/packages/schemas` 下 Bridge 实际
+引用的结构合同，使 `/opt/agents-cli/src/bridge` 和 `dist/bridge` 的相对导入一致。
+
 DeepSeek Harness 当前仍标记为 developer preview。TapCanvas 使用精确版本锁定；升级时必须同步升级全部 Harness 包，并重新执行 profile 握手、Bridge 测试和 Hono 集成测试，禁止只升级其中一个插件。
+
+### 持久工作流交接
+
+根代理收到 `acceptedAsync` 的 queued/running 回执且执行器明确声明
+`completionBoundary=submission`、`executionOwner=durable_executor` 时，本轮只完成提交交接，
+以 `submissionHandoff.receipts` 保留执行身份，不注册对话 continuation。媒体交付保持 pending，
+后续生产和最终验收只由持久 Workflow 执行器负责。未声明该完成边界的异步执行退出为
+`waiting_external`，等待外部证据。SSE 与会话快照
+依据交付闭包投影状态，不以 Harness turn 结束代替业务成功。执行型最终交付只接受授权
+工具返回、与冻结 contractHash 一致、覆盖全部 must 且证据 ID 完整的通用
+`expectedDelivery -> deliveryEvidence -> deliveryVerification`；单独 URL、文字或受理回执
+均不足以宣称完整视频目标完成。
+
+### 用户交付合同冻结
+
+`record_user_intent` 是 request-scoped 私有工具。主代理根据真实用户意图编写 version 2
+合同，Bridge 只校验字段结构、枚举和要求身份，按 Hono 相同的排序 JSON 规则计算纯十六进制
+SHA-256。后续远程调用自动附带顶层机器字段 `userIntentContract` 与 `userIntentContractHash`，
+与原子任务和最终交付报告共用同一冻结对象；模型不能通过工具 args 替换机器字段。
+
+改写已冻结合同必须显式提供 `authoringCorrection.previousContractHash` 与原因。
+已锁定的续轮合同，以及开始远程执行后的合同不允许改写；无法确定远程副作用时同样保持锁定。
+只读动态 schema 加载不锁定合同。工具拒绝错误后，Agent 在同一 Harness turn 修订，
+不使用默认语义或自动补齐用户要求。
+
+### 响应任务中的来源证据
+
+响应任务可能要求“先读来源、调用工具再回答”。Agent 在自检时标记该 requirement 的
+`requiresToolEvidence` 并从 `get_delivery_evidence.sourceEvidence` 选择精确
+`sourceEvidenceIds`。任何授权工具的成功读取都可作为来源证据，不按媒体工具名单限制；
+失败调用和私有自检工具不可充当来源。Bridge 只检验引用与成功状态，交付标准的语义归属
+由 Agent 判断；最终正文哈希不替代明确要求的读取回执。已完成的读取可直接复用，
+无需为了验收重复调用。普通无需取证的响应继续使用最终正文证据。
+
+供应商断流的物理中断只将当前执行标为 `suspended`，逻辑任务仍 active、交付 pending；
+仅 `chat_turn_user_interrupt` 表示用户取消。没有真实 checkpoint 时不声称自动可恢复；暂停不伪造恢复 checkpoint 或可恢复声明，
+也不重新提交媒体任务。HTTP 完成/失败回调绑定原 turn 身份，不能覆盖已中断快照或后续回合。
+
+Harness 非完成退出保留真实 `turn/end.reason.error`：上游错误使用 `deepseek_harness_provider_error`，原始错误消息进入 completion rationale、runOutcome message 和持久状态摘要；只有没有具体错误事实时才使用 `deepseek_harness_turn_incomplete`。额度不足不会被伪装成用户取消或自动换模型重试。
+
+Bridge 保留远程工具的 execution 与 operationExecutions 元数据，仅声明 sideEffect=none 的确定性读取不锁定意图契约；写入或副作用未知的调用必须先冻结意图，否则返回 user_intent_required 且不发送远程请求，允许主代理在同轮修正后重试。原子结构化工作流动作继续使用已受理的 outputContract。

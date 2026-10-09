@@ -272,7 +272,7 @@ describe("equipped workflow trigger payload normalization", () => {
 		});
 	});
 
-	it("builds a stable versioned workflow receipt for durable continuation", async () => {
+	it("builds a stable workflow receipt owned by the durable executor", async () => {
 		const {
 			buildWorkflowExecutionAgentSummary,
 			buildWorkflowExecutionReceipt,
@@ -291,6 +291,8 @@ describe("equipped workflow trigger payload normalization", () => {
 			executionFamilyId: "workflow-execution-root",
 			status: "queued",
 			acceptedAsync: true,
+			completionBoundary: "submission",
+			executionOwner: "durable_executor",
 			inspection: {
 				toolName: "tapcanvas_workflow_execution_inspect",
 				familyArgs: { executionId: "workflow-execution-1", view: "family" },
@@ -633,7 +635,8 @@ describe("registerPublicAgentsToolBridgeRoutes – equipped workflow catalog", (
 		expect(schemaBody.data?.parameters?.properties?.attachmentId).toBeUndefined();
 		expect(schemaBody.data?.parameters?.required).toEqual(["idempotencyKey"]);
 		expect(schemaBody.data?.parameters?.properties?.concurrency).toBeUndefined();
-		expect(schemaBody.data?.parameters?.oneOf?.[0]?.properties?.triggerPayload).toBeUndefined();
+		// A workflow without an inline/group source exposes optional trigger facts only; no source is required.
+		expect(schemaBody.data?.parameters?.oneOf?.[0]?.properties?.triggerPayload?.required).toBeUndefined();
 	});
 });
 
@@ -1441,6 +1444,10 @@ describe("registerPublicAgentsToolBridgeRoutes – execution scope", () => {
 
 		expect(response.status).toBe(200);
 		expect(body.data).toMatchObject({
+			protocolVersion: "tapcanvas.workflow-execution-receipt/v1",
+			executionId: EXECUTION_ID,
+			acceptedAsync: true,
+			terminal: false,
 			view: "family",
 			family: {
 				executionFamilyId: "execution-family-1",
@@ -1769,11 +1776,7 @@ describe("registerPublicAgentsToolBridgeRoutes – caller-bound critic model", (
 		videoModel: "doubao-seedance-2-0-260128",
 		durationOptions: [5, 10, 15],
 		maxDurationSeconds: 15,
-		referenceImagePolicy: {
-			countUnit: "unique_url",
-			maximumTotalImages: 9,
-			maximumBusinessImages: 9,
-		},
+
 		referenceAudioPolicy: {
 			minimumDurationSeconds: 1.8,
 			maximumDurationSeconds: 30.2,
